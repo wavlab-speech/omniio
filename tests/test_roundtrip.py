@@ -100,6 +100,46 @@ class TestAudioRoundtrip:
         rms_diff = np.sqrt(np.mean((original_audio - result.array) ** 2))
         assert rms_diff < 5e-5
 
+    def test_flac_perfect_from_16bit_source(self, temp_dir):
+        """Test that FLAC preserves 16-bit PCM perfectly (truly lossless)."""
+        # Generate test signal
+        sample_rate = 44100
+        duration = 0.3
+        num_samples = int(sample_rate * duration)
+
+        t = np.linspace(0, duration, num_samples)
+        original_audio_float = 0.7 * np.sin(2 * np.pi * 440 * t).astype(np.float32).reshape(-1, 1)
+
+        # Write original as 16-bit PCM WAV (our "source" format)
+        source_path = temp_dir / "source_16bit.wav"
+        sf.write(source_path, original_audio_float, sample_rate, subtype='PCM_16')
+
+        # Read back the 16-bit version (this is our true original)
+        original_16bit, sr = sf.read(source_path, dtype='float32', always_2d=True)
+
+        # Now convert to FLAC
+        raw_bytes, metadata = audio_write(
+            str(source_path),
+            "test_16bit",
+            target_format="flac"
+        )
+
+        # Create archive
+        archive_path = temp_dir / "archive.bin"
+        with open(archive_path, 'wb') as f:
+            f.write(raw_bytes)
+
+        # Read back from FLAC
+        result = audio_read_local(archive_path, 0, len(raw_bytes))
+
+        # Should be EXACTLY the same (no quantization error)
+        # because we started with 16-bit, compressed to FLAC, and decompressed back to 16-bit
+        assert result.sample_rate == sample_rate
+        assert np.allclose(original_16bit, result.array, atol=1e-7)  # Essentially perfect
+
+        # Should be bit-for-bit identical
+        assert np.array_equal(original_16bit, result.array)
+
     def test_wav_different_bit_depths(self, temp_dir):
         """Test that different bit depths preserve appropriate precision."""
         sample_rate = 16000
