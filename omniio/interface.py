@@ -1,7 +1,7 @@
 import os
 from omniio.definitions import ArchiveRead, AudioRead, TextRead
 from omniio.audio.read import audio_read_local, audio_read_remote
-from omniio.text.read import text_read
+from omniio.text.read import text_read_local, text_read_remote
 
 def audio_read(
     archive_path: str, 
