@@ -6,7 +6,6 @@ Generic binary blob
 import collections
 import os
 import shutil
-import tempfile
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -22,14 +21,14 @@ def _worker_process(
     worker_id: int,
     items_with_ids: List[Tuple[Any, str]],
     modality: str,
-    temp_dir: str,
+    shard_dir: str,
     existing_ids: Set[str],
     overwrite: bool,
     modality_kwargs: dict,
 ) -> Tuple[int, str, str, int]:
     """
     Worker function that runs in a separate process.
-    Writes items to a temp bin file and temp metadata parquet file.
+    Writes items to a shard bin file and shard metadata parquet file in shard_dir.
     Checks each item's id against existing_ids before writing.
 
     Returns:
@@ -40,8 +39,8 @@ def _worker_process(
     """
     write_fn = modality_writer[modality]
 
-    bin_path = os.path.join(temp_dir, f"shard_{worker_id}.bin")
-    meta_path = os.path.join(temp_dir, f"shard_{worker_id}.parquet")
+    bin_path = os.path.join(shard_dir, f"shard_{worker_id}.bin")
+    meta_path = os.path.join(shard_dir, f"shard_{worker_id}.parquet")
 
     metadata_rows = []
     offset = 0
@@ -275,7 +274,8 @@ class Blob:
             chunks[i % effective_workers].append((item, item_id))
         chunks = [c for c in chunks if c]
 
-        temp_dir = tempfile.mkdtemp(prefix="blob_append_")
+        log_dir = self.archive_path.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
 
         try:
             completed_results: List[Tuple[int, str, str, int]] = []
@@ -286,7 +286,7 @@ class Blob:
                 for wid, chunk in enumerate(chunks):
                     try:
                         result = _worker_process(
-                            wid, chunk, self.modality, temp_dir,
+                            wid, chunk, self.modality, str(log_dir),
                             existing_ids, overwrite, modality_kwargs,
                         )
                         completed_results.append(result)
@@ -300,7 +300,7 @@ class Blob:
                     for wid, chunk in enumerate(chunks):
                         fut = pool.submit(
                             _worker_process,
-                            wid, chunk, self.modality, temp_dir,
+                            wid, chunk, self.modality, str(log_dir),
                             existing_ids, overwrite, modality_kwargs,
                         )
                         futures[fut] = wid
@@ -324,7 +324,7 @@ class Blob:
                 ) from first_error
 
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(log_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------ #
     # Shard concatenation
