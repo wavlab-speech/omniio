@@ -36,10 +36,10 @@ def _probe_file(path: str) -> dict:
             info["height"] = vs.height
             info["fps"] = float(vs.average_rate) if vs.average_rate else None
             info["video_codec"] = vs.codec_context.name
-            info["gop_size"] = vs.codec_context.gop_size
+            # Note: gop_size is only available on encoders, not decoders
         if aus:
             info["sample_rate"] = aus.rate
-            info["audio_channels"] = aus.channels
+            info["audio_channels"] = aus.codec_context.channels
             info["audio_codec"] = aus.codec_context.name
 
         # Detect container from first bytes
@@ -123,7 +123,7 @@ def video_write(
             "format": "mp4",
             "video_codec": "h264",
             "audio_codec": info.get("audio_codec"),
-            "gop_size": info.get("gop_size"),
+            "gop_size": None,  # Cannot determine from decoder
         }
         return raw_bytes, metadata
 

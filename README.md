@@ -1,4 +1,4 @@
-# OmniIO
+# Omni-IO
 
 Efficient Python library for reading and writing multimedia data (audio, video, text) from binary archive blobs with support for both local and remote HTTP range requests.
 
