@@ -445,6 +445,94 @@ class TestConcatShards:
                     assert ranges[j][0] >= ranges[j - 1][1], \
                         f"{label}: overlapping offsets in bin {bi}: {ranges[j-1]} vs {ranges[j]}"
 
+    def test_single_process_bin_split_within_append(self, temp_dir, sample_audio_wav):
+        """Single append() call with max_bin_size=1 forces a new bin after every item.
+
+        Specifically exercises the new rollover code path in the single-process path.
+        With 3 items and max_bin_size=1 each item lands in its own bin (the first item
+        always writes regardless; subsequent items trigger cur_bin_size > 0 check).
+        Verifies that:
+        - multiple bin files are created within one append() call
+        - start_byte resets to 0 in each new bin
+        - raw bytes for every item match a no-split reference
+        """
+        wav_path, _, _ = sample_audio_wav
+        items = [str(wav_path)] * 3
+        ids = ["item_0", "item_1", "item_2"]
+        kwargs = dict(target_format="wav")
+
+        # Reference: no splitting (large max_bin_size)
+        ref = Blob(archive_dir=str(temp_dir / "ref"), modality="audio")
+        ref.append(items=items, ids=ids, num_workers=0, **kwargs)
+
+        for label, reshard in [("reshard", True), ("fast", False)]:
+            blob = Blob(
+                archive_dir=str(temp_dir / label),
+                modality="audio",
+                max_bin_size=1,  # forces split after every item
+            )
+            blob.append(items=items, ids=ids, num_workers=0, reshard=reshard, **kwargs)
+
+            meta = blob.get_metadata().to_pydict()
+            assert len(meta["id"]) == 3
+
+            # Each item should be in its own bin
+            bin_indices = sorted(set(meta["bin_index"]))
+            assert len(bin_indices) == 3, \
+                f"{label}: expected 3 separate bins, got {bin_indices}"
+
+            # Every bin's first (and only) item must have start_byte == 0
+            by_bin = {}
+            for i in range(3):
+                by_bin.setdefault(meta["bin_index"][i], []).append(i)
+            for bin_rows in by_bin.values():
+                assert meta["start_byte"][bin_rows[0]] == 0, \
+                    f"{label}: start_byte should reset to 0 in new bin"
+
+            # Bytes must match the reference (no-split) blob exactly
+            for item_id in ids:
+                assert _read_entry_bytes(blob, item_id) == _read_entry_bytes(ref, item_id), \
+                    f"{label}: bytes differ from reference for {item_id}"
+
+    def test_parallel_workers_bin_split_within_append(self, temp_dir, sample_audio_wav):
+        """Multi-worker append() with max_bin_size=1 forces each worker to produce
+        multiple sub-bins (shard_<wid>_<bid> files).
+
+        With num_workers=2 and 4 items, each worker gets 2 items and produces 2
+        sub-bins.  Verifies that all 4 items land in separate bins and bytes match
+        a no-split reference.
+        """
+        wav_path, _, _ = sample_audio_wav
+        items = [str(wav_path)] * 4
+        ids = ["item_0", "item_1", "item_2", "item_3"]
+        kwargs = dict(target_format="wav")
+
+        # Reference: single worker, no splitting
+        ref = Blob(archive_dir=str(temp_dir / "ref"), modality="audio")
+        ref.append(items=items, ids=ids, num_workers=0, **kwargs)
+
+        for label, reshard in [("reshard", True), ("fast", False)]:
+            blob = Blob(
+                archive_dir=str(temp_dir / label),
+                modality="audio",
+                max_bin_size=1,
+            )
+            blob.append(
+                items=items, ids=ids, num_workers=2, reshard=reshard, **kwargs
+            )
+
+            meta = blob.get_metadata().to_pydict()
+            assert len(meta["id"]) == 4
+
+            bin_indices = set(meta["bin_index"])
+            assert len(bin_indices) == 4, \
+                f"{label}: expected 4 separate bins, got {sorted(bin_indices)}"
+
+            # Bytes must match the reference exactly
+            for item_id in ids:
+                assert _read_entry_bytes(blob, item_id) == _read_entry_bytes(ref, item_id), \
+                    f"{label}: bytes differ from reference for {item_id}"
+
 
 class TestBlobUtilities:
     """Test Blob utility methods."""

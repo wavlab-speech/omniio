@@ -6,6 +6,8 @@ Generic binary blob
 import collections
 import os
 import shutil
+import threading
+import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -27,26 +29,42 @@ def _worker_process(
     existing_ids: Set[str],
     allow_duplicate_ids: bool,
     modality_kwargs: dict,
-) -> Tuple[int, str, str, int]:
+    max_bin_size: int,
+    progress_file: Optional[str] = None,
+) -> Tuple[int, List[Tuple[str, str, int]]]:
     """
     Worker function that runs in a separate process.
-    Writes items to a shard bin file and shard metadata parquet file in shard_dir.
-    Checks each item's id against existing_ids before writing.
+    Writes items to one or more shard bin files in shard_dir, splitting into a
+    new file when max_bin_size is exceeded.  Files are named
+    shard_<worker_id>_<bin_id>.bin / .parquet.
+
+    Worker 0 optionally writes its per-item count to progress_file so the
+    main process can approximate overall progress.
 
     Returns:
-        (worker_id, bin_path, metadata_path, num_processed)
+        (worker_id, [(bin_path, meta_path, n_rows), ...])
     """
     import warnings
 
     write_fn = modality_writer[modality]
 
-    bin_path = os.path.join(shard_dir, f"shard_{worker_id}.bin")
-    meta_path = os.path.join(shard_dir, f"shard_{worker_id}.parquet")
+    def _make_paths(bid: int) -> Tuple[str, str]:
+        bp = os.path.join(shard_dir, f"shard_{worker_id}_{bid}.bin")
+        mp = os.path.join(shard_dir, f"shard_{worker_id}_{bid}.parquet")
+        return bp, mp
 
-    metadata_rows = []
+    sub_results: List[Tuple[str, str, int]] = []
+    bin_id = 0
+    bin_path, meta_path = _make_paths(bin_id)
+
+    metadata_rows: list = []
     offset = 0
+    cur_bin_size = 0
+    n_written = 0
+    _last_progress_write = 0.0
 
-    with open(bin_path, "wb") as f:
+    f = open(bin_path, "wb")
+    try:
         for item, item_id in items_with_ids:
             if item_id in existing_ids and not allow_duplicate_ids:
                 warnings.warn(
@@ -56,21 +74,52 @@ def _worker_process(
                 continue
 
             raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+            n_bytes = len(raw_bytes)
+
+            # Roll over to a new bin when the current one is non-empty and full
+            if cur_bin_size > 0 and cur_bin_size + n_bytes > max_bin_size:
+                f.close()
+                if metadata_rows:
+                    table = pa.Table.from_pylist(metadata_rows)
+                    pq.write_table(table, meta_path)
+                    sub_results.append((bin_path, meta_path, len(metadata_rows)))
+                else:
+                    os.remove(bin_path)
+                bin_id += 1
+                bin_path, meta_path = _make_paths(bin_id)
+                f = open(bin_path, "wb")
+                metadata_rows = []
+                offset = 0
+                cur_bin_size = 0
 
             f.write(raw_bytes)
             meta_dict["id"] = item_id
             meta_dict["start_byte"] = offset
-            meta_dict["end_byte"] = offset + len(raw_bytes)
+            meta_dict["end_byte"] = offset + n_bytes
             meta_dict["bin_index"] = -1  # placeholder, resolved during concat
             metadata_rows.append(meta_dict)
-            offset += len(raw_bytes)
+            offset += n_bytes
+            cur_bin_size += n_bytes
+            n_written += 1
 
-    # Write metadata shard as parquet via pyarrow
+            if progress_file is not None:
+                now = time.time()
+                if now - _last_progress_write >= 0.5:
+                    with open(progress_file, "w") as pf:
+                        pf.write(str(n_written))
+                    _last_progress_write = now
+    finally:
+        f.close()
+
+    # Flush final bin
     if metadata_rows:
         table = pa.Table.from_pylist(metadata_rows)
         pq.write_table(table, meta_path)
+        sub_results.append((bin_path, meta_path, len(metadata_rows)))
+    elif os.path.exists(bin_path):
+        os.remove(bin_path)
 
-    return worker_id, bin_path, meta_path, len(metadata_rows)
+    return worker_id, sub_results
 
 
 class Blob:
@@ -283,48 +332,109 @@ class Blob:
         log_dir.mkdir(exist_ok=True)
 
         try:
-            completed_results: List[Tuple[int, str, str, int]] = []
+            # Each entry: (worker_id, [(bin_path, meta_path, n_rows), ...])
+            completed_results: List[Tuple[int, List[Tuple[str, str, int]]]] = []
             first_error: Optional[Exception] = None
 
             pbar = tqdm(total=len(items), desc="appending", disable=not progress)
 
             if num_workers <= 0:
                 # ---- single-process path (per-item progress) ----
+                import warnings as _warnings
+
                 write_fn = modality_writer[self.modality]
-                bin_path = os.path.join(str(log_dir), "shard_0.bin")
-                meta_path = os.path.join(str(log_dir), "shard_0.parquet")
-                metadata_rows = []
+
+                def _sp_paths(bid: int) -> Tuple[str, str]:
+                    return (
+                        os.path.join(str(log_dir), f"shard_0_{bid}.bin"),
+                        os.path.join(str(log_dir), f"shard_0_{bid}.parquet"),
+                    )
+
+                sub_results: List[Tuple[str, str, int]] = []
+                sp_bin_id = 0
+                bin_path, meta_path = _sp_paths(0)
+                metadata_rows: list = []
                 offset = 0
-                n_written = 0
+                cur_bin_size = 0
+
                 try:
-                    with open(bin_path, "wb") as f:
+                    f = open(bin_path, "wb")
+                    try:
                         for item, item_id in zip(items, ids):
                             if item_id in existing_ids and not allow_duplicate_ids:
-                                import warnings
-                                warnings.warn(
+                                _warnings.warn(
                                     f"Skipping duplicate id already in archive: {item_id}. "
                                     "Pass allow_duplicate_ids=True to write it anyway."
                                 )
                                 pbar.update(1)
                                 continue
                             raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+                            n_bytes = len(raw_bytes)
+
+                            if cur_bin_size > 0 and cur_bin_size + n_bytes > self.max_bin_size:
+                                f.close()
+                                if metadata_rows:
+                                    table = pa.Table.from_pylist(metadata_rows)
+                                    pq.write_table(table, meta_path)
+                                    sub_results.append((bin_path, meta_path, len(metadata_rows)))
+                                else:
+                                    os.remove(bin_path)
+                                sp_bin_id += 1
+                                bin_path, meta_path = _sp_paths(sp_bin_id)
+                                f = open(bin_path, "wb")
+                                metadata_rows = []
+                                offset = 0
+                                cur_bin_size = 0
+
                             f.write(raw_bytes)
                             meta_dict["id"] = item_id
                             meta_dict["start_byte"] = offset
-                            meta_dict["end_byte"] = offset + len(raw_bytes)
+                            meta_dict["end_byte"] = offset + n_bytes
                             meta_dict["bin_index"] = -1
                             metadata_rows.append(meta_dict)
-                            offset += len(raw_bytes)
-                            n_written += 1
+                            offset += n_bytes
+                            cur_bin_size += n_bytes
                             pbar.update(1)
+                    finally:
+                        f.close()
+
                     if metadata_rows:
                         table = pa.Table.from_pylist(metadata_rows)
                         pq.write_table(table, meta_path)
-                    completed_results.append((0, bin_path, meta_path, n_written))
+                        sub_results.append((bin_path, meta_path, len(metadata_rows)))
+                    elif os.path.exists(bin_path):
+                        os.remove(bin_path)
+
+                    completed_results.append((0, sub_results))
                 except Exception as exc:
                     first_error = exc
             else:
-                # ---- multi-process path (per-chunk progress) ----
+                # ---- multi-process path (worker-0 progress approximation) ----
+                progress_file = str(log_dir / "worker0_progress.txt")
+                num_chunks = len(chunks)
+
+                # Background thread polls worker 0's progress file and scales
+                # by num_chunks to approximate total progress.
+                stop_poll = threading.Event()
+                last_reported = [0]
+
+                def _poll_progress():
+                    while not stop_poll.is_set():
+                        try:
+                            with open(progress_file) as _pf:
+                                w0_count = int(_pf.read().strip())
+                            estimated = min(w0_count * num_chunks, len(items))
+                            delta = estimated - last_reported[0]
+                            if delta > 0:
+                                pbar.update(delta)
+                                last_reported[0] = estimated
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+
+                poll_thread = threading.Thread(target=_poll_progress, daemon=True)
+                poll_thread.start()
+
                 futures = {}
                 with ProcessPoolExecutor(max_workers=num_workers) as pool:
                     for wid, chunk in enumerate(chunks):
@@ -332,6 +442,8 @@ class Blob:
                             _worker_process,
                             wid, chunk, self.modality, str(log_dir),
                             existing_ids, allow_duplicate_ids, modality_kwargs,
+                            self.max_bin_size,
+                            progress_file if wid == 0 else None,
                         )
                         futures[fut] = wid
 
@@ -339,10 +451,17 @@ class Blob:
                         try:
                             result = fut.result()
                             completed_results.append(result)
-                            pbar.update(result[3])
                         except Exception as exc:
                             if first_error is None:
                                 first_error = exc
+
+                stop_poll.set()
+                poll_thread.join()
+
+                # Bring pbar to 100% (approximation may not reach exactly total)
+                remaining = len(items) - last_reported[0]
+                if remaining > 0:
+                    pbar.update(remaining)
 
             pbar.close()
 
@@ -368,7 +487,7 @@ class Blob:
 
     def _concat_shards(
         self,
-        results: List[Tuple[int, str, str, int]],
+        results: List[Tuple[int, List[Tuple[str, str, int]]]],
     ):
         """
         Merge worker shard files into the main archive.
@@ -380,6 +499,10 @@ class Blob:
             return
 
         results.sort(key=lambda r: r[0])
+        # Flatten sub-bins in worker order
+        flat: List[Tuple[str, str, int]] = []
+        for _wid, sub_bins in results:
+            flat.extend(sub_bins)
 
         cur_bin_index, cur_bin_size = self._get_current_bin_info()
 
@@ -388,7 +511,7 @@ class Blob:
         if self.data is not None and self.data.num_rows > 0:
             meta_tables.append(self.data)
 
-        for _wid, shard_bin_path, shard_meta_path, n_rows in results:
+        for shard_bin_path, shard_meta_path, n_rows in flat:
             if n_rows == 0:
                 continue
 
@@ -449,7 +572,7 @@ class Blob:
 
     def _concat_shards_fast(
         self,
-        results: List[Tuple[int, str, str, int]],
+        results: List[Tuple[int, List[Tuple[str, str, int]]]],
     ):
         """
         Merge worker shard files into the archive without resharding.
@@ -463,6 +586,10 @@ class Blob:
             return
 
         results.sort(key=lambda r: r[0])
+        # Flatten sub-bins in worker order
+        flat: List[Tuple[str, str, int]] = []
+        for _wid, sub_bins in results:
+            flat.extend(sub_bins)
 
         # Find the next available bin index
         cur_bin_index, _ = self._get_current_bin_info()
@@ -475,7 +602,7 @@ class Blob:
         if self.data is not None and self.data.num_rows > 0:
             meta_tables.append(self.data)
 
-        for _wid, shard_bin_path, shard_meta_path, n_rows in results:
+        for shard_bin_path, shard_meta_path, n_rows in flat:
             if n_rows == 0:
                 continue
 
