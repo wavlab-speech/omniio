@@ -379,6 +379,12 @@ class Blob:
                 [cur_bin_index] * shard_meta.num_rows, type=pa.int64()
             )
 
+            # Add path column with absolute path to bin file
+            bin_path = str(dest_bin.absolute())
+            path_col = pa.array(
+                [bin_path] * shard_meta.num_rows, type=pa.string()
+            )
+
             shard_meta = shard_meta.set_column(
                 shard_meta.schema.get_field_index("start_byte"), "start_byte", shifted_start
             )
@@ -388,6 +394,14 @@ class Blob:
             shard_meta = shard_meta.set_column(
                 shard_meta.schema.get_field_index("bin_index"), "bin_index", bin_index_col
             )
+
+            # Add or update path column
+            if "path" in shard_meta.column_names:
+                shard_meta = shard_meta.set_column(
+                    shard_meta.schema.get_field_index("path"), "path", path_col
+                )
+            else:
+                shard_meta = shard_meta.append_column("path", path_col)
 
             meta_tables.append(shard_meta)
             cur_bin_size += shard_bin_size

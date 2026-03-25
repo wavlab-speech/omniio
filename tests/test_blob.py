@@ -4,7 +4,7 @@ import pytest
 import pyarrow as pa
 
 from omniio.blob.blob import Blob
-
+from pathlib import Path
 
 class TestBlobInit:
     """Test Blob initialization."""
@@ -249,6 +249,70 @@ class TestBlobMetadata:
         existing = blob._existing_ids()
 
         assert "audio_001" in existing
+
+    def test_metadata_has_path_column(self, temp_dir, sample_audio_wav):
+        """Test that metadata includes path column pointing to bin files."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        metadata = blob.get_metadata()
+
+        # Check path column exists
+        assert "path" in metadata.column_names
+
+        # Check path points to actual bin file
+        path = metadata.column("path")[0].as_py()
+        assert path.endswith(".bin")
+        assert Path(path).exists()
+
+        # Verify we can use the path to read data
+        from omniio.interface import audio_read
+        row = metadata.to_pandas().iloc[0]
+        result = audio_read(
+            row['path'],
+            row['start_byte'],
+            row['end_byte'] - row['start_byte']
+        )
+        assert result.array is not None
+
+    def test_path_column_multiple_bins(self, temp_dir, sample_audio_wav):
+        """Test path column with multiple bin files."""
+        archive_dir = temp_dir / "test_archive"
+        # Small max_bin_size to force multiple bins
+        blob = Blob(
+            archive_dir=str(archive_dir),
+            modality="audio",
+            max_bin_size=1024  # Very small, will create multiple bins
+        )
+
+        audio_path, _, _ = sample_audio_wav
+        # Append multiple times to create multiple bins
+        for i in range(3):
+            blob.append(
+                items=[str(audio_path)],
+                ids=[f"audio_{i:03d}"],
+                num_workers=0,
+                target_format="wav"
+            )
+
+        metadata = blob.get_metadata()
+
+        # Should have multiple unique paths
+        paths = set(metadata.column("path").to_pylist())
+        assert len(paths) > 0  # At least one bin file
+
+        # All paths should exist
+        for path in paths:
+            assert Path(path).exists()
+            assert path.endswith(".bin")
 
 
 class TestBlobUtilities:
