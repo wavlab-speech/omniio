@@ -51,6 +51,10 @@ setup(
             "flake8>=5.0.0",
             "mypy>=0.990",
         ],
+        "huggingface": [
+            "datasets>=2.0.0",
+            "huggingface-hub>=0.19.0",
+        ],
     },
     keywords="multimedia audio video text archive blob io",
     project_urls={
