@@ -40,8 +40,6 @@ def text_read(
             archive_path,
             start_offset,
             file_size,
-            start_time,
-            end_time
         )
 
     else:
@@ -49,6 +47,4 @@ def text_read(
             archive_path,
             start_offset,
             file_size,
-            start_time,
-            end_time
         )

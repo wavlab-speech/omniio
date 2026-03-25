@@ -3,7 +3,8 @@ video/write.py — Encode video (+ optional audio) to MP4 H.264+AAC bytes.
 """
 
 import io
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
+from pathlib import Path
 
 import av
 import numpy as np
@@ -58,7 +59,7 @@ def _is_mp4_h264_aac(info: dict) -> bool:
 
 
 def video_write(
-    video_path: str,
+    video_path: Union[str, Path],
     item_id: str,
     target_fps: Optional[int] = None,
     target_height: Optional[int] = None,
@@ -76,7 +77,7 @@ def video_write(
     fps change is requested, return the file bytes as-is.
 
     Args:
-        video_path:    Path to source video file.
+        video_path:    Path to source video file (str or Path).
         item_id:       Unique identifier for this sample.
         target_fps:    Target frame rate (None = keep original).
         target_height: Target height in pixels (None = keep original).
@@ -89,6 +90,9 @@ def video_write(
     Returns:
         (raw_bytes, metadata_dict)
     """
+    # Convert Path to string
+    video_path = str(video_path)
+
     info = _probe_file(video_path)
 
     src_fps = info.get("fps")
@@ -150,7 +154,7 @@ def video_write(
             out_audio = None
             if in_audio:
                 out_audio = out_container.add_stream("aac", rate=in_audio.rate)
-                out_audio.channels = in_audio.channels
+                out_audio.layout = in_audio.layout.name
                 out_audio.bit_rate = audio_bitrate
 
             # -- decode / encode loop --

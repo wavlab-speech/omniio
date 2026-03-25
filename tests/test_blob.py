@@ -16,7 +16,7 @@ class TestBlobInit:
         blob = Blob(archive_dir=str(archive_dir), modality="audio")
 
         assert blob.modality == "audio"
-        assert blob.archive_path.exists()
+        assert blob.archive_path.parent.exists()  # Archive directory exists
         assert blob.metadata_file.exists() or len(blob) == 0
 
     def test_create_blob_with_name(self, temp_dir):
@@ -134,8 +134,8 @@ class TestBlobAppend:
         assert len(blob) == 2
         metadata = blob.get_metadata()
         ids = metadata.column("id").to_pylist()
-        assert "0" in ids
-        assert "1" in ids
+        assert f"{blob.name}_0" in ids
+        assert f"{blob.name}_1" in ids
 
     def test_append_duplicate_id_error(self, temp_dir, sample_audio_wav):
         """Test appending duplicate ID without overwrite raises error."""

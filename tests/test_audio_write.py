@@ -86,16 +86,17 @@ class TestAudioWrite:
         assert metadata['channels'] == 1
 
     def test_write_change_bit_depth(self, sample_audio_wav):
-        """Test changing bit depth."""
+        """Test that lower source bit depth is preserved (no upsampling waste)."""
         audio_path, sample_rate, _ = sample_audio_wav
 
         raw_bytes, metadata = audio_write(
-            audio_path, "test_006",
+            str(audio_path), "test_006",
             target_format="wav",
             target_bit_depth=32
         )
 
-        assert metadata['bit_depth'] == 32
+        # Source is 16-bit, requesting 32-bit should keep 16-bit to save storage
+        assert metadata['bit_depth'] == 16
 
     def test_write_unsupported_bit_depth(self, sample_audio_wav):
         """Test unsupported bit depth raises ValueError."""

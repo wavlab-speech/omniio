@@ -73,11 +73,11 @@ def sample_audio_webm(temp_dir):
 
     with av.open(str(audio_path), mode='w', format='webm') as container:
         stream = container.add_stream('libopus', rate=sample_rate)
-        stream.channels = 2
+        stream.layout = 'stereo'
 
         frame = av.AudioFrame.from_ndarray(
-            audio_int16.T,
-            format='s16',
+            np.ascontiguousarray(audio_int16.T),
+            format='s16p',  # Use planar format for multi-channel
             layout='stereo'
         )
         frame.rate = sample_rate
@@ -111,7 +111,7 @@ def sample_video_mp4(temp_dir):
 
         # Audio stream
         audio_stream = container.add_stream('aac', rate=44100)
-        audio_stream.channels = 2
+        audio_stream.layout = 'stereo'
 
         # Generate video frames
         for i in range(num_frames):
@@ -137,8 +137,8 @@ def sample_video_mp4(temp_dir):
         audio_int16 = (audio * 32767).astype(np.int16)
 
         audio_frame = av.AudioFrame.from_ndarray(
-            audio_int16.T,
-            format='s16',
+            np.ascontiguousarray(audio_int16.T),
+            format='s16p',  # Use planar format for multi-channel
             layout='stereo'
         )
         audio_frame.rate = 44100

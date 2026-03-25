@@ -1,4 +1,5 @@
 from typing import Optional, Tuple, Union
+from pathlib import Path
 import zstandard as zstd
 
 def _compress_text_data(
@@ -88,7 +89,7 @@ def _process_single_text_file_static(
         return None
 
 def text_write(
-    path_or_string: str,
+    path_or_string: Union[str, Path],
     item_id: str,
     is_path: str,
     compression_level: int,
@@ -98,9 +99,9 @@ def text_write(
     raw bytes + metadata dict.
 
     Args:
-        path_or_string:    Path to the source file or raw text string.
+        path_or_string:    Path to the source file (str or Path) or raw text string.
         item_id:           Unique identifier for this sample.
-        is_path:           Read the file corresponding to the path 
+        is_path:           Read the file corresponding to the path
                             (dont treat as string).
         compression_level: Z-standard compresion level (1-19)
 
@@ -108,7 +109,9 @@ def text_write(
         (raw_bytes, metadata_dict)
     """
 
+    # Convert Path to string if is_path is True
     if is_path:
+        path_or_string = str(path_or_string)
         data, original_size, compressed_size = _process_single_text_file_static(path_or_string, compression_level)
         original_path = path_or_string
     else:

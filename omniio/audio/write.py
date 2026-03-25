@@ -1,8 +1,10 @@
 import io
+import os
 import av
 import numpy as np
 import soundfile as sf
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
+from pathlib import Path
 
 
 BIT_DEPTH_TO_SUBTYPE = {
@@ -55,15 +57,16 @@ def _write_webm(data: np.ndarray, sample_rate: int) -> bytes:
 
     with av.open(buf, mode="w", format="webm") as container:
         stream = container.add_stream("libopus", rate=48000)
-        stream.channels = data.shape[1]
+        layout = "stereo" if data.shape[1] == 2 else "mono"
+        stream.layout = layout
 
         # Convert float64 -> s16 interleaved for the encoder
         samples_s16 = np.clip(data * 32767, -32768, 32767).astype(np.int16)
 
         frame = av.AudioFrame.from_ndarray(
-            samples_s16.T,  # (channels, frames)
-            format="s16",
-            layout="stereo" if data.shape[1] == 2 else "mono",
+            np.ascontiguousarray(samples_s16.T),  # (channels, frames) - must be C-contiguous
+            format="s16p",  # Use planar format for multi-channel
+            layout=layout,
         )
         frame.rate = sample_rate
         frame.pts = 0
@@ -91,7 +94,7 @@ def _get_webm_info(audio_path: str) -> dict:
 
 
 def audio_write(
-    audio_path: str,
+    audio_path: Union[str, Path],
     item_id: str,
     target_format: Optional[str] = None,
     target_bit_depth: Optional[int] = None,
@@ -103,7 +106,7 @@ def audio_write(
     Uses soundfile for FLAC/WAV and PyAV for WebM/Opus.
 
     Args:
-        audio_path:       Path to the source audio file.
+        audio_path:       Path to the source audio file (str or Path).
         item_id:          Unique identifier for this sample.
         target_format:    Desired output format ('flac', 'wav', 'webm').
                           If None, keeps the original format.
@@ -113,6 +116,9 @@ def audio_write(
     Returns:
         (raw_bytes, metadata_dict)
     """
+
+    # Convert Path to string
+    audio_path = str(audio_path)
 
     # --- Detect source format ----------------------------------------
     src_is_webm = audio_path.lower().endswith((".webm", ".opus"))

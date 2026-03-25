@@ -256,13 +256,13 @@ class Blob:
             **modality_kwargs: Forwarded to the modality write_fn.
         """
         if ids is None:
-            ids = [str(i) for i in range(len(self), len(self) + len(items))]
+            ids = [f"{self.name}_{i}" for i in range(len(self), len(self) + len(items))]
         else:
             assert len(items) == len(ids), "items and ids must be the same length"
 
         # --- Check uniqueness of incoming ids -------------------------
-        seen = set(items)
-        if len(seen) != len(items):
+        seen = set(ids)
+        if len(seen) != len(ids):
             raise ValueError(f"Duplicate id in input")
 
         # --- Snapshot existing ids for workers ------------------------
