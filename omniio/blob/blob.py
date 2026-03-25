@@ -11,6 +11,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
 
+from tqdm import tqdm
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -231,6 +233,7 @@ class Blob:
         ids: List[str] = None,
         num_workers: int = 0,
         overwrite: bool = False,
+        progress: bool = True,
         **modality_kwargs,
     ):
         """
@@ -281,20 +284,46 @@ class Blob:
             completed_results: List[Tuple[int, str, str, int]] = []
             first_error: Optional[Exception] = None
 
+            pbar = tqdm(total=len(items), desc="appending", disable=not progress)
+
             if num_workers <= 0:
-                # ---- single-process path ----
-                for wid, chunk in enumerate(chunks):
-                    try:
-                        result = _worker_process(
-                            wid, chunk, self.modality, str(log_dir),
-                            existing_ids, overwrite, modality_kwargs,
-                        )
-                        completed_results.append(result)
-                    except Exception as exc:
-                        first_error = exc
-                        break
+                # ---- single-process path (per-item progress) ----
+                write_fn = modality_writer[self.modality]
+                bin_path = os.path.join(str(log_dir), "shard_0.bin")
+                meta_path = os.path.join(str(log_dir), "shard_0.parquet")
+                metadata_rows = []
+                offset = 0
+                n_written = 0
+                try:
+                    with open(bin_path, "wb") as f:
+                        for item, item_id in zip(items, ids):
+                            if item_id in existing_ids:
+                                if overwrite:
+                                    pbar.update(1)
+                                    continue
+                                else:
+                                    raise ValueError(
+                                        f"Duplicate id already in archive: {item_id}. "
+                                        "Pass overwrite=True to skip duplicates."
+                                    )
+                            raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+                            f.write(raw_bytes)
+                            meta_dict["id"] = item_id
+                            meta_dict["start_byte"] = offset
+                            meta_dict["end_byte"] = offset + len(raw_bytes)
+                            meta_dict["bin_index"] = -1
+                            metadata_rows.append(meta_dict)
+                            offset += len(raw_bytes)
+                            n_written += 1
+                            pbar.update(1)
+                    if metadata_rows:
+                        table = pa.Table.from_pylist(metadata_rows)
+                        pq.write_table(table, meta_path)
+                    completed_results.append((0, bin_path, meta_path, n_written))
+                except Exception as exc:
+                    first_error = exc
             else:
-                # ---- multi-process path ----
+                # ---- multi-process path (per-chunk progress) ----
                 futures = {}
                 with ProcessPoolExecutor(max_workers=num_workers) as pool:
                     for wid, chunk in enumerate(chunks):
@@ -309,9 +338,12 @@ class Blob:
                         try:
                             result = fut.result()
                             completed_results.append(result)
+                            pbar.update(result[3])
                         except Exception as exc:
                             if first_error is None:
                                 first_error = exc
+
+            pbar.close()
 
             # --- Concatenate shards onto the archive ------------------
             self._concat_shards(completed_results)
