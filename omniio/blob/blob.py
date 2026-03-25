@@ -25,7 +25,7 @@ def _worker_process(
     modality: str,
     shard_dir: str,
     existing_ids: Set[str],
-    overwrite: bool,
+    allow_duplicate_ids: bool,
     modality_kwargs: dict,
 ) -> Tuple[int, str, str, int]:
     """
@@ -35,10 +35,9 @@ def _worker_process(
 
     Returns:
         (worker_id, bin_path, metadata_path, num_processed)
-
-    Raises:
-        ValueError if a duplicate id is found and overwrite is False.
     """
+    import warnings
+
     write_fn = modality_writer[modality]
 
     bin_path = os.path.join(shard_dir, f"shard_{worker_id}.bin")
@@ -49,14 +48,12 @@ def _worker_process(
 
     with open(bin_path, "wb") as f:
         for item, item_id in items_with_ids:
-            if item_id in existing_ids:
-                if overwrite:
-                    continue
-                else:
-                    raise ValueError(
-                        f"Duplicate id already in archive: {item_id}. "
-                        "Pass overwrite=True to skip duplicates."
-                    )
+            if item_id in existing_ids and not allow_duplicate_ids:
+                warnings.warn(
+                    f"Skipping duplicate id already in archive: {item_id}. "
+                    "Pass allow_duplicate_ids=True to write it anyway."
+                )
+                continue
 
             raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
 
@@ -232,8 +229,9 @@ class Blob:
         items: List[Any],
         ids: List[str] = None,
         num_workers: int = 0,
-        overwrite: bool = False,
+        allow_duplicate_ids: bool = False,
         progress: bool = True,
+        reshard: bool = False,
         **modality_kwargs,
     ):
         """
@@ -241,9 +239,7 @@ class Blob:
 
         Each worker writes to its own temp bin + metadata shard.  After all
         workers finish (or on error, after all workers finish their current
-        item), the shards are concatenated onto the main archive *without*
-        reading entire bin files into memory — only file sizes are read to
-        shift byte offsets.
+        item), the shards are merged into the main archive.
 
         Duplicate-id checking against the existing archive happens inside
         each worker process, so the full id set is serialized once to each
@@ -253,8 +249,14 @@ class Blob:
             items:       List of raw items matching the modality.
             ids:         Unique string id per item.  Must be same length as items.
             num_workers: 0 means single-process (no pool). >0 spawns a pool.
-            overwrite:   If True, silently skip items whose id already exists
-                         in the archive.  If False, raise on duplicates.
+            allow_duplicate_ids: If False (default), items whose id already
+                         exists in the archive are skipped with a warning.
+                         If True, the item is written regardless.
+            reshard:     If True, shard bins are streamed and concatenated into
+                         the existing blob files (respecting max_bin_size).
+                         If False (default), each shard bin is simply moved into
+                         the archive as its own blob file — much faster, at the
+                         cost of producing more bin files.
             **modality_kwargs: Forwarded to the modality write_fn.
         """
         if ids is None:
@@ -297,15 +299,14 @@ class Blob:
                 try:
                     with open(bin_path, "wb") as f:
                         for item, item_id in zip(items, ids):
-                            if item_id in existing_ids:
-                                if overwrite:
-                                    pbar.update(1)
-                                    continue
-                                else:
-                                    raise ValueError(
-                                        f"Duplicate id already in archive: {item_id}. "
-                                        "Pass overwrite=True to skip duplicates."
-                                    )
+                            if item_id in existing_ids and not allow_duplicate_ids:
+                                import warnings
+                                warnings.warn(
+                                    f"Skipping duplicate id already in archive: {item_id}. "
+                                    "Pass allow_duplicate_ids=True to write it anyway."
+                                )
+                                pbar.update(1)
+                                continue
                             raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
                             f.write(raw_bytes)
                             meta_dict["id"] = item_id
@@ -330,7 +331,7 @@ class Blob:
                         fut = pool.submit(
                             _worker_process,
                             wid, chunk, self.modality, str(log_dir),
-                            existing_ids, overwrite, modality_kwargs,
+                            existing_ids, allow_duplicate_ids, modality_kwargs,
                         )
                         futures[fut] = wid
 
@@ -346,7 +347,10 @@ class Blob:
             pbar.close()
 
             # --- Concatenate shards onto the archive ------------------
-            self._concat_shards(completed_results)
+            if reshard:
+                self._concat_shards(completed_results)
+            else:
+                self._concat_shards_fast(completed_results)
 
             if first_error is not None:
                 raise RuntimeError(
@@ -437,6 +441,69 @@ class Blob:
 
             meta_tables.append(shard_meta)
             cur_bin_size += shard_bin_size
+
+        if meta_tables:
+            combined = pa.concat_tables(meta_tables, promote_options="default")
+            pq.write_table(combined, self.metadata_file)
+            self.data = combined
+
+    def _concat_shards_fast(
+        self,
+        results: List[Tuple[int, str, str, int]],
+    ):
+        """
+        Merge worker shard files into the archive without resharding.
+
+        Each shard bin is moved (renamed) into the archive directory as its
+        own blob file.  Byte offsets within each shard are already correct
+        (0-based from the start of that shard), so no shifting is needed.
+        Only the parquet metadata tables are concatenated.
+        """
+        if not results:
+            return
+
+        results.sort(key=lambda r: r[0])
+
+        # Find the next available bin index
+        cur_bin_index, _ = self._get_current_bin_info()
+        # If a bin file already exists at cur_bin_index, next shard goes after it
+        if self._get_bin_file_path(cur_bin_index).exists():
+            cur_bin_index += 1
+
+        meta_tables: List[pa.Table] = []
+
+        if self.data is not None and self.data.num_rows > 0:
+            meta_tables.append(self.data)
+
+        for _wid, shard_bin_path, shard_meta_path, n_rows in results:
+            if n_rows == 0:
+                continue
+
+            dest_bin = self._get_bin_file_path(cur_bin_index)
+            shutil.move(shard_bin_path, dest_bin)
+
+            shard_meta = pq.read_table(shard_meta_path)
+
+            bin_index_col = pa.array(
+                [cur_bin_index] * shard_meta.num_rows, type=pa.int64()
+            )
+            bin_path = str(dest_bin.absolute())
+            path_col = pa.array(
+                [bin_path] * shard_meta.num_rows, type=pa.string()
+            )
+
+            shard_meta = shard_meta.set_column(
+                shard_meta.schema.get_field_index("bin_index"), "bin_index", bin_index_col
+            )
+            if "path" in shard_meta.column_names:
+                shard_meta = shard_meta.set_column(
+                    shard_meta.schema.get_field_index("path"), "path", path_col
+                )
+            else:
+                shard_meta = shard_meta.append_column("path", path_col)
+
+            meta_tables.append(shard_meta)
+            cur_bin_index += 1
 
         if meta_tables:
             combined = pa.concat_tables(meta_tables, promote_options="default")

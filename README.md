@@ -11,6 +11,26 @@ Efficient Python library for reading and writing multimedia data (audio, video, 
 - **Parallel processing**: Multi-process append operations for fast archive creation
 - **Streaming operations**: Memory-efficient handling of large multimedia files
 
+## Why Omni-IO?
+
+Most multimedia datasets outgrow naive storage approaches quickly. Omni-IO is designed for the scale and access patterns that matter in practice.
+
+**Raw files on disk** work fine for small datasets, but millions of small audio or text files create serious filesystem overhead — inode exhaustion, slow directory scans, and poor I/O throughput when files are scattered across disk. Omni-IO packs everything into a small number of large `.bin` files, eliminating per-file metadata overhead and enabling sequential I/O patterns that storage systems are optimized for. This also makes mass storage scans and transfer extremely fast, as it minimizes the number of accessed files.
+
+**WebDataset** solves the small-files problem with sequential tar shards, but trades away random access. Filtering a WebDataset by label, duration, or speaker requires scanning the entire dataset. Resuming mid-shard is awkward, and any preprocessing that requires re-ordering data means re-sharding. Omni-IO stores byte offsets in a Parquet file, so any item can be fetched in O(1) with a single range read — filter by any metadata column, shuffle freely, and access only what you need.
+
+**HuggingFace Datasets** caches data locally and works well for text, but storing raw audio or video means either re-encoding everything into Arrow's columnar format (lossy or bloated) or falling back to large file caches that are opaque and hard to manage. Omni-IO keeps data in its native compressed format (FLAC, WebM, zstd) inside the blob, so storage is compact and the encoding pipeline is explicit.
+
+**Storing audio/video directly in Parquet** is tempting since Parquet already handles metadata well, but Arrow's binary columns are not designed for large variable-length blobs. Each audio or video sample gets embedded as a `LargeBinary` value, which defeats columnar compression, inflates row-group sizes, and causes the Parquet reader to load entire row groups into memory even when you only need one sample. Parquet also lacks any concept of seeking within a stored value, so time-based slicing requires decoding the whole blob after retrieval. Omni-IO separates concerns cleanly: Parquet holds only lightweight columnar metadata (byte offsets, sample rates, durations), while the binary data lives in flat `.bin` files that support direct seek-and-read.
+
+**Numpy array dumps** (`.npy`/`.npz`) store decoded, uncompressed PCM data, which means a 10-hour audio dataset that fits in ~3 GB as FLAC balloons to 50+ GB as float32 arrays. They also fix a single sample rate and channel count at write time, making mixed-format datasets impossible. There is no metadata layer, so filtering by duration or speaker ID requires loading and inspecting every file. Omni-IO stores audio in its native compressed format and decodes on demand, keeping storage compact while retaining all format metadata in queryable Parquet columns.
+
+**Kaldiio** is a widely used solution in speech processing, but it stores features exclusively as float32 arrays — there is no support for compressed audio formats, video, or text. This locks users into pre-extracting features before archiving, which forecloses any future re-extraction with different parameters. Archives are also local-only; there is no mechanism for remote access.
+
+**Lhotse** is a mature speech data toolkit with excellent manifests and cutting operations, but its storage backend ultimately relies on either raw files on disk or external formats like Kaldi archives. Lhotse manages *where* files are, but doesn't consolidate *how* they are stored — you still end up with millions of individual audio files and all the filesystem overhead that entails. Omni-IO handles both the metadata layer and the packed binary storage, and adds first-class remote access without requiring a separate serving layer.
+
+**The key differentiator: the same Parquet metadata file works for both local and remote access.** Point Omni-IO at a local `.bin` file for training runs, or swap in an HTTPS URL for the same archive hosted on object storage — the API is identical. This means you can build and validate an archive locally, upload the bin files to S3 or GCS, and read from them remotely without any code changes. HTTP range requests fetch only the bytes needed for each sample, so remote reads are as efficient as local ones.
+
 ## Installation
 
 ```bash
