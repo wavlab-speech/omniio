@@ -26,12 +26,6 @@ Most multimedia datasets outgrow naive storage approaches quickly. Omni-IO is de
 ## Installation
 
 ```bash
-pip install omniio
-```
-
-### Development Installation
-
-```bash
 git clone https://github.com/wavlab-speech/omniio.git
 cd omniio
 pip install -e .
