@@ -23,3 +23,10 @@ class VideoRead(ArchiveRead):
     width: int = None
     audio_array: np.ndarray = None
     video_array: np.ndarray = None
+
+@dataclass
+class ImageRead(ArchiveRead):
+    height: int = None
+    width: int = None
+    channels: int = None
+    array: np.ndarray = None

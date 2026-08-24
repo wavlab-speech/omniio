@@ -39,6 +39,7 @@ dependencies = [
     "requests>=2.28.0",
     "zstandard>=0.19.0",
     "pyarrow>=10.0.0",
+    "Pillow>=9.0.0",
 ]
 
 [project.optional-dependencies]
@@ -58,7 +59,7 @@ Repository = "https://github.com/wavlab-speech/omniio"
 "Bug Tracker" = "https://github.com/wavlab-speech/omniio/issues"
 
 [tool.setuptools]
-packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob"]
+packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image"]
 
 [tool.setuptools.package-data]
 omniio = ["py.typed"]

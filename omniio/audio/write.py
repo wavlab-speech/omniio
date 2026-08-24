@@ -94,28 +94,76 @@ def _get_webm_info(audio_path: str) -> dict:
 
 
 def audio_write(
-    audio_path: Union[str, Path],
+    audio_path: Union[str, Path, Tuple[np.ndarray, int]],
     item_id: str,
     target_format: Optional[str] = None,
     target_bit_depth: Optional[int] = None,
 ) -> Tuple[bytes, dict]:
     """
-    Read an audio file, optionally convert format/bit depth, and return
-    raw bytes + metadata dict.
+    Read an audio file (or in-memory array), optionally convert format/bit depth,
+    and return raw bytes + metadata dict.
 
     Uses soundfile for FLAC/WAV and PyAV for WebM/Opus.
 
     Args:
-        audio_path:       Path to the source audio file (str or Path).
+        audio_path:       Path to the source audio file (str or Path), or a
+                          (numpy_array, sample_rate) tuple for in-memory audio.
+                          Array shape must be (frames,) or (frames, channels).
         item_id:          Unique identifier for this sample.
         target_format:    Desired output format ('flac', 'wav', 'webm').
-                          If None, keeps the original format.
+                          If None, keeps the original format (flac for array input).
         target_bit_depth: Desired bit depth (e.g. 16, 24, 32).
                           Ignored when target format is webm/opus.
 
     Returns:
         (raw_bytes, metadata_dict)
     """
+
+    # --- Handle in-memory (array, sample_rate) input -----------------
+    if isinstance(audio_path, tuple):
+        data_in, sr_in = audio_path
+        data = np.asarray(data_in, dtype=np.float64)
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
+        sr = int(sr_in)
+
+        if target_format is None:
+            target_format = "flac"
+        if target_bit_depth is None:
+            target_bit_depth = 16
+
+        target_format = target_format.lower()
+        target_is_webm = target_format in PYAV_FORMATS
+
+        if target_is_webm:
+            raw_bytes = _write_webm(data, sr)
+            metadata = {
+                "sample_rate": 48000,
+                "channels": data.shape[1],
+                "samples": data.shape[0],
+                "format": "webm",
+                "bit_depth": None,
+                "duration": data.shape[0] / 48000,
+            }
+        else:
+            target_subtype = BIT_DEPTH_TO_SUBTYPE.get(target_bit_depth)
+            if target_subtype is None:
+                raise ValueError(
+                    f"Unsupported target bit depth: {target_bit_depth}. "
+                    f"Supported: {sorted(BIT_DEPTH_TO_SUBTYPE.keys())}"
+                )
+            buf = io.BytesIO()
+            sf.write(buf, data, sr, format=target_format.upper(), subtype=target_subtype)
+            raw_bytes = buf.getvalue()
+            metadata = {
+                "sample_rate": sr,
+                "channels": data.shape[1],
+                "samples": data.shape[0],
+                "format": target_format,
+                "bit_depth": target_bit_depth,
+                "duration": data.shape[0] / sr,
+            }
+        return raw_bytes, metadata
 
     # Convert Path to string
     audio_path = str(audio_path)

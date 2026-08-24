@@ -1,9 +1,10 @@
 import os
 from typing import Optional
-from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead
+from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead, ImageRead
 from omniio.audio.read import audio_read_local, audio_read_remote
 from omniio.text.read import text_read_local, text_read_remote
 from omniio.video.read import video_read_local, video_read_remote
+from omniio.image.read import image_read_local, image_read_remote
 
 def audio_read(
     archive_path: str, 
@@ -95,3 +96,13 @@ def video_read(
             start_time,
             end_time
         )
+
+def image_read(
+    archive_path: str,
+    start_offset: int,
+    file_size: int,
+) -> ImageRead:
+    if os.path.exists(archive_path):
+        return image_read_local(archive_path, start_offset, file_size)
+    else:
+        return image_read_remote(archive_path, start_offset, file_size)
