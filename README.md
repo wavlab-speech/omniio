@@ -11,6 +11,8 @@ Efficient Python library for reading and writing multimedia data (audio, video, 
 - **Parallel processing**: Multi-process append operations for fast archive creation
 - **Streaming operations**: Memory-efficient handling of large multimedia files
 
+- **Kaldi ark/scp compatibility** via `omniio.kaldi`, an MIT-licensed drop-in for `kaldiio`
+
 ## Why Omni-IO?
 
 Most multimedia datasets outgrow naive storage approaches quickly. Omni-IO is designed for the scale and access patterns that matter in practice.
@@ -148,6 +150,55 @@ raw_bytes, metadata = text_write(
 print(f"Original size: {metadata['original_size']} bytes")
 print(f"Compressed size: {metadata['compressed_size']} bytes")
 ```
+
+## Kaldi ark/scp Compatibility
+
+`omniio.kaldi` reads and writes Kaldi `ark`/`scp` archives, so a project that
+only needs Kaldi I/O can drop its `kaldiio` dependency:
+
+```python
+from omniio import kaldi as kaldiio   # same names, same signatures
+
+with kaldiio.ReadHelper("scp:feats.scp") as reader:
+    for utt_id, feats in reader:
+        ...
+
+with kaldiio.WriteHelper("ark,scp:feats.ark,feats.scp") as writer:
+    writer["utt1"] = feats                  # float32/float64 matrix or vector
+
+kaldiio.save_ark("wav.ark", {"utt1": (16000, wave)}, scp="wav.scp")
+array = kaldiio.load_mat("feats.ark:1234")  # random access via an scp entry
+```
+
+Exported: `ReadHelper`, `WriteHelper`, `load_ark`, `load_scp`,
+`load_scp_sequential`, `load_mat`, `save_ark`, `save_mat`, `open_like_kaldi`,
+`parse_wspecifier`, `parse_rspecifier`, `LazyLoader`.
+
+Supported on-disk formats:
+
+| Form | Notes |
+|---|---|
+| `FM`/`DM`, `FV`/`DV` | float32/float64 matrices and vectors |
+| `CM`/`CM2`/`CM3` | compressed matrices, all seven `compression_method` values |
+| `std::vector<int32>` | alignments |
+| `WaveHolder` (bare RIFF) | decoded at its native PCM width |
+| `AUDIO`-framed blobs | the extended archive layout, any container `soundfile` can decode |
+| text (`ark,t:`) | matrices and vectors |
+
+Also supported: `segments` files, `scp` random access with a bounded file
+descriptor cache (`max_cache_fd`), and Kaldi extended filenames including pipes
+(`sox ... |`, `| gzip -c > x.gz`), `-` for stdin/stdout, and `.gz`.
+
+Archives written here are byte-identical to Kaldi's own. Two deliberate
+divergences from `kaldiio` are documented in `omniio/kaldi/compression.py`:
+`kSpeechFeature` compression of matrices with fewer than five rows follows
+Kaldi rather than `kaldiio`'s wrapping arithmetic, and the fixed-range methods
+`kOneByteUnsignedInteger`/`kOneByteZeroOne` clip out-of-range input instead of
+letting it wrap.
+
+This code is written against the format description in Kaldi itself
+(Apache-2.0) and carries omniio's MIT license; `kaldiio` is not a dependency
+and none of its code is used.
 
 ## Archive Structure
 

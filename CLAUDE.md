@@ -16,6 +16,7 @@ The library is organized by data modality, with each supporting read and write o
 - **video/**: Video file I/O (MP4 with audio streams)
 - **text/**: Text file I/O (zstandard compressed)
 - **blob/**: Binary archive management with PyArrow metadata
+- **kaldi/**: Kaldi `ark`/`scp` compatibility layer (a drop-in for `kaldiio`)
 
 ### Core Components
 
@@ -149,6 +150,25 @@ raw_bytes, metadata = text_write(
 )
 # Returns compressed bytes and metadata with original_size, compressed_size
 ```
+
+## Kaldi Compatibility Layer
+
+`omniio/kaldi/` is independent of the blob machinery -- it depends only on
+numpy and (for audio payloads) soundfile.
+
+- **compression.py**: the `CompressedMatrix` codec (`CM`/`CM2`/`CM3`). Encode
+  and decode formulas are float32 with a specific operation ordering; changing
+  the grouping changes the last bit and breaks byte-compatibility.
+- **matio.py**: object codec plus `load_ark`/`load_scp`/`load_mat`/`save_ark`/
+  `save_mat` and the `LazyLoader` mapping.
+- **highlevel.py**: `ReadHelper`/`WriteHelper` and `segments` support.
+- **specifier.py**, **stream.py**: rspecifier/wspecifier parsing and Kaldi
+  extended filenames (pipes, `-`, `.gz`).
+
+`tests/test_kaldi.py` runs without `kaldiio`. `tests/test_kaldi_interop.py`
+skips unless `kaldiio` happens to be installed, and then asserts byte-identical
+output in both directions. `kaldiio` must never become a dependency: its
+license forbids redistribution, which is the reason this module exists.
 
 ## Dependencies
 
