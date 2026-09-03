@@ -74,6 +74,15 @@ def _global_header(matrix, method):
     if method in (kSpeechFeature, kTwoByteAuto, kOneByteAuto):
         min_value = float(matrix.min())
         max_value = float(matrix.max())
+        # min()/max() propagate NaN and inf into the global header, from which
+        # every element decodes to NaN -- one bad frame would silently destroy
+        # the whole matrix. Kaldi asserts here; so do we, but with a message.
+        if not (np.isfinite(min_value) and np.isfinite(max_value)):
+            raise ValueError(
+                "Cannot compress a matrix containing NaN or inf: the value "
+                "range is stored once for the whole matrix, so a single "
+                "non-finite element makes every element decode to NaN."
+            )
         if max_value == min_value:
             max_value = min_value + (1.0 + abs(min_value))
         range_ = max_value - min_value

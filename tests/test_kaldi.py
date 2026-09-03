@@ -6,6 +6,7 @@ The golden byte strings below were checked against Kaldi's own on-disk layout;
 
 import io
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -539,3 +540,99 @@ def test_unknown_attribute_still_raises():
 
     with pytest.raises(AttributeError, match="no attribute"):
         omniio.definitely_not_a_module
+
+
+# --------------------------------------------------------------------------
+# regressions
+# --------------------------------------------------------------------------
+
+
+def test_segments_end_of_recording(tmp_path, wav):
+    """Kaldi's segments format uses end <= 0 for "to the end of the recording"."""
+    ark = str(tmp_path / "s.ark")
+    scp = str(tmp_path / "s.scp")
+    seg = tmp_path / "segments"
+    kaldi.save_ark(ark, {"rec1": (16000, wav)}, scp=scp)
+    seg.write_text("utt_a rec1 0.1 -1\nutt_b rec1 0.2 0\n")
+
+    with kaldi.ReadHelper("scp:" + scp, segments=str(seg)) as r:
+        got = dict(r)
+    assert np.array_equal(got["utt_a"][1], wav[1600:])
+    assert np.array_equal(got["utt_b"][1], wav[3200:])
+
+
+def test_two_dim_integer_array_is_refused(tmp_path):
+    """Silently writing it as float32 would lose exactness above 2**24."""
+    array = np.array([[16777217, 16777219]], dtype=np.int32)
+    with pytest.raises(ValueError, match="no integer matrix type"):
+        kaldi.save_ark(str(tmp_path / "a.ark"), {"u": array})
+
+    # 1-dim integer arrays are still fine: those Kaldi does have a type for.
+    kaldi.save_ark(str(tmp_path / "b.ark"), {"u": array[0]})
+    assert np.array_equal(dict(kaldi.load_ark(str(tmp_path / "b.ark")))["u"], array[0])
+
+
+@pytest.mark.parametrize("endian", ["<", ">"])
+def test_endian_roundtrip(tmp_path, feats, endian):
+    p = str(tmp_path / "e.ark")
+    kaldi.save_ark(p, {"u": feats, "v": np.arange(4, dtype=np.int32)}, endian=endian)
+    got = dict(kaldi.load_ark(p, endian=endian))
+    assert np.array_equal(got["u"], feats)
+    assert np.array_equal(got["v"], np.arange(4))
+
+
+def test_stale_scp_offset_raises_read_error(tmp_path, feats):
+    """A wrong offset must not surface as UnicodeDecodeError or MemoryError."""
+    p = str(tmp_path / "a.ark")
+    kaldi.save_ark(p, {"u1": feats, "u2": feats})
+    size = os.path.getsize(p)
+    for offset in (7, 40, size // 2):
+        with pytest.raises(kaldi.ReadError):
+            kaldi.load_mat("{}:{}".format(p, offset))
+
+
+def test_absurd_dimensions_raise_read_error(tmp_path):
+    p = tmp_path / "huge.ark"
+    dim = (2**30).to_bytes(4, "little")
+    p.write_bytes(b"u \x00BFM \x04" + dim + b"\x04" + dim)
+    with pytest.raises(kaldi.ReadError, match="Unexpected end"):
+        kaldi.load_mat("{}:2".format(p))
+
+    q = tmp_path / "huge_vec.ark"
+    q.write_bytes(b"u \x00B\x04" + (2**31 - 1).to_bytes(4, "little"))
+    with pytest.raises(kaldi.ReadError):
+        kaldi.load_mat("{}:2".format(q))
+
+
+def test_scp_for_an_unnamed_stream_is_refused(feats):
+    """Every line would point at a path that cannot be opened."""
+    with pytest.raises(ValueError, match="no file name"):
+        kaldi.save_ark(io.BytesIO(), {"u1": feats}, scp=io.StringIO())
+
+    # Without an scp there is nothing to point anywhere, so this stays allowed.
+    buf = io.BytesIO()
+    kaldi.save_ark(buf, {"u1": feats})
+    assert buf.getvalue().startswith(b"u1 \x00BFM ")
+
+
+def test_non_finite_values_are_refused_by_compression(tmp_path, feats):
+    for bad in (np.nan, np.inf, -np.inf):
+        broken = feats.copy()
+        broken[3, 2] = bad
+        with pytest.raises(ValueError, match="NaN or inf"):
+            with kaldi.WriteHelper("ark:" + str(tmp_path / "c.ark"), compression_method=2) as w:
+                w["u"] = broken
+
+
+def test_alias_does_not_shadow_an_existing_package(monkeypatch):
+    """An _ALIASES entry added before its package moves must not break it."""
+    import importlib
+
+    import omniio
+
+    monkeypatch.setitem(omniio._ALIASES, "omniio.text", "omniio.modalities.text")
+    for name in [n for n in list(sys.modules) if n.startswith("omniio.text")]:
+        monkeypatch.delitem(sys.modules, name)
+
+    # The target does not exist, so the real omniio/text/ must still be found.
+    assert importlib.import_module("omniio.text.read") is not None

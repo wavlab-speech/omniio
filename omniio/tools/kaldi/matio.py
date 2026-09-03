@@ -27,6 +27,7 @@ itself.
 import collections
 import collections.abc
 import io
+import os
 
 import numpy as np
 
@@ -57,7 +58,29 @@ def _peek(fd, n):
     return buf
 
 
+def _remaining(fd):
+    """Bytes left in ``fd``, or ``None`` when that cannot be known cheaply."""
+    try:
+        if not fd.seekable():
+            return None
+        pos = fd.tell()
+        end = fd.seek(0, os.SEEK_END)
+        fd.seek(pos)
+        return end - pos
+    except (AttributeError, OSError, io.UnsupportedOperation, ValueError):
+        return None
+
+
 def _read_exact(fd, n, what):
+    # Check before reading. A record header read at a stale scp offset yields
+    # arbitrary dimensions, and fd.read() allocates the full request, so
+    # without this a wrong offset is a MemoryError rather than a ReadError.
+    left = _remaining(fd)
+    if left is not None and n > left:
+        raise ReadError(
+            "Unexpected end of archive while reading {} ({} bytes needed, "
+            "{} left)".format(what, n, left)
+        )
     buf = fd.read(n)
     if len(buf) != n:
         raise ReadError(
@@ -68,10 +91,15 @@ def _read_exact(fd, n, what):
 
 
 def _read_sized_int(fd, endian):
-    """Read Kaldi's ``\\N``-prefixed integer; returns ``(value, bytes_read)``."""
+    """Read Kaldi's ``\\N``-prefixed integer; returns ``(value, bytes_read)``.
+
+    The width byte says how many bytes follow, so the value has to be widened
+    on the side the endianness puts the low-order bytes -- padding on the wrong
+    side scales it by 2**(8*pad).
+    """
     width = _read_exact(fd, 1, "integer size")[0]
     raw = _read_exact(fd, width, "integer")
-    return int(np.frombuffer(raw.ljust(8, b"\x00"), dtype=endian + "u8")[0]), 1 + width
+    return int.from_bytes(raw, "big" if endian == ">" else "little"), 1 + width
 
 
 def _read_token(fd):
@@ -104,11 +132,15 @@ def _read_binary_object(fd, endian):
         # ``std::vector<int32>``: no token, just the \4-prefixed length.
         dim, n = _read_sized_int(fd, endian)
         size += n
-        values = np.empty(dim, dtype=np.int32)
-        for i in range(dim):
-            values[i], n = _read_sized_int(fd, endian)
+        # Collected rather than preallocated: ``dim`` comes straight off the
+        # wire, and np.empty would honour a corrupt one before the first read
+        # could fail.
+        values = []
+        for _ in range(dim):
+            value, n = _read_sized_int(fd, endian)
+            values.append(value)
             size += n
-        return values, size
+        return np.array(values, dtype=np.int32), size
 
     token, n = _read_token(fd)
     size += n
@@ -206,7 +238,14 @@ def _read_text_object(fd, endian):
         if b"]" in line:
             break
     raw = b"".join(chunks)
-    text = raw.decode()
+    try:
+        text = raw.decode()
+    except UnicodeDecodeError as e:
+        raise ReadError(
+            "Not a Kaldi object: no binary marker, no audio magic, and not "
+            "decodable as text. An scp offset left over from an earlier "
+            "version of the archive looks exactly like this."
+        ) from e
     if "[" not in text or "]" not in text:
         raise ReadError("Malformed text-format object: {!r}".format(text[:80]))
 
@@ -460,6 +499,15 @@ def _encode_object(value, endian, compression_method, write_function, write_kwar
         token, payload = compression.compress(array, compression_method, endian)
         return BINARY_MARKER + token.encode() + b" " + payload
 
+    if array.dtype.kind in "iu" and array.ndim == 2:
+        # Kaldi has no integer matrix type, and float32 cannot hold int32
+        # exactly above 2**24, so writing one as FM would corrupt it silently.
+        raise ValueError(
+            "Kaldi archives have no integer matrix type, so a 2-dim {} array "
+            "cannot be written. Cast it to float32/float64 if the loss of "
+            "exactness is acceptable, or write one row per key.".format(array.dtype)
+        )
+
     if array.dtype.kind in "iu" and array.ndim == 1:
         out = [BINARY_MARKER, _sized_int(array.shape[0], endian)]
         out.extend(_sized_int(int(v), endian) for v in array)
@@ -521,7 +569,13 @@ class _ArkWriter:
         mode = "ab" if append else "wb"
         self._ark = open_like_kaldi(ark, mode) if self._own_ark else ark
         self._scp = open_like_kaldi(scp, "a" if append else "w") if self._own_scp else scp
-        self._ark_name = ark if self._own_ark else getattr(ark, "name", "<stream>")
+        self._ark_name = ark if self._own_ark else getattr(ark, "name", None)
+        if self._scp is not None and not isinstance(self._ark_name, str):
+            raise ValueError(
+                "Cannot write an scp for an archive object with no file name: "
+                "every scp line would point at an unopenable path. Pass a path "
+                "for the ark, or drop the scp."
+            )
         self._text = text
         self._endian = endian
         self._compression_method = compression_method

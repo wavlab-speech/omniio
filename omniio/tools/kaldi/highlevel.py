@@ -65,7 +65,10 @@ class _SegmentedReader:
                 cached_rec, cached = rec, value
             rate, array = cached
             begin = int(start * rate)
-            stop = int(end * rate)
+            # Kaldi's segments format uses a non-positive end time to mean "to
+            # the end of the recording". Passing it through as a slice bound
+            # would index from the end instead and silently drop audio.
+            stop = int(end * rate) if end > 0 else len(array)
             yield utt, (rate, array[begin:stop])
 
 
