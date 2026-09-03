@@ -74,15 +74,6 @@ def _global_header(matrix, method):
     if method in (kSpeechFeature, kTwoByteAuto, kOneByteAuto):
         min_value = float(matrix.min())
         max_value = float(matrix.max())
-        # min()/max() propagate NaN and inf into the global header, from which
-        # every element decodes to NaN -- one bad frame would silently destroy
-        # the whole matrix. Kaldi asserts here; so do we, but with a message.
-        if not (np.isfinite(min_value) and np.isfinite(max_value)):
-            raise ValueError(
-                "Cannot compress a matrix containing NaN or inf: the value "
-                "range is stored once for the whole matrix, so a single "
-                "non-finite element makes every element decode to NaN."
-            )
         if max_value == min_value:
             max_value = min_value + (1.0 + abs(min_value))
         range_ = max_value - min_value
@@ -185,6 +176,18 @@ def compress(matrix, method=kAutomaticMethod, endian="<"):
         )
     if matrix.size == 0:
         raise ValueError("Refusing to compress an empty matrix")
+    # Checked here rather than in _global_header so that it covers the
+    # fixed-range methods too, which never look at the data's own min/max.
+    # Quantisation has no representable value for NaN and silently maps inf to
+    # a range endpoint; for the data-derived methods a single bad element
+    # additionally poisons the global header and makes every element decode to
+    # NaN.
+    if not np.isfinite(matrix).all():
+        raise ValueError(
+            "Cannot compress a matrix containing NaN or inf: quantisation has "
+            "no representable value for them, and for the automatic methods "
+            "one non-finite element makes every element decode to NaN."
+        )
 
     fmt, min_value, range_ = _global_header(matrix, method)
     num_rows, num_cols = matrix.shape

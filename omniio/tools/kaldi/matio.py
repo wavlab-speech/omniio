@@ -27,7 +27,6 @@ itself.
 import collections
 import collections.abc
 import io
-import os
 
 import numpy as np
 
@@ -58,30 +57,25 @@ def _peek(fd, n):
     return buf
 
 
-def _remaining(fd):
-    """Bytes left in ``fd``, or ``None`` when that cannot be known cheaply."""
-    try:
-        if not fd.seekable():
-            return None
-        pos = fd.tell()
-        end = fd.seek(0, os.SEEK_END)
-        fd.seek(pos)
-        return end - pos
-    except (AttributeError, OSError, io.UnsupportedOperation, ValueError):
-        return None
+#: Upper bound on a single ``fd.read``. Sizes come off the wire, so a stale scp
+#: offset can ask for an absurd one; reading up to this much at a time lets the
+#: first short read reject it instead of allocating first.
+_READ_CHUNK = 1 << 23  # 8 MiB
 
 
 def _read_exact(fd, n, what):
-    # Check before reading. A record header read at a stale scp offset yields
-    # arbitrary dimensions, and fd.read() allocates the full request, so
-    # without this a wrong offset is a MemoryError rather than a ReadError.
-    left = _remaining(fd)
-    if left is not None and n > left:
-        raise ReadError(
-            "Unexpected end of archive while reading {} ({} bytes needed, "
-            "{} left)".format(what, n, left)
-        )
-    buf = fd.read(n)
+    if n <= _READ_CHUNK:
+        buf = fd.read(n)
+    else:
+        parts = []
+        got = 0
+        while got < n:
+            chunk = fd.read(min(_READ_CHUNK, n - got))
+            if not chunk:
+                break
+            parts.append(chunk)
+            got += len(chunk)
+        buf = b"".join(parts)
     if len(buf) != n:
         raise ReadError(
             "Unexpected end of archive while reading {} "
@@ -495,10 +489,6 @@ def _encode_object(value, endian, compression_method, write_function, write_kwar
         return AUDIO_MARKER + bytes([width]) + len(blob).to_bytes(width, "little") + blob
 
     array = np.asarray(value)
-    if compression_method is not None and array.ndim == 2:
-        token, payload = compression.compress(array, compression_method, endian)
-        return BINARY_MARKER + token.encode() + b" " + payload
-
     if array.dtype.kind in "iu" and array.ndim == 2:
         # Kaldi has no integer matrix type, and float32 cannot hold int32
         # exactly above 2**24, so writing one as FM would corrupt it silently.
@@ -507,6 +497,12 @@ def _encode_object(value, endian, compression_method, write_function, write_kwar
             "cannot be written. Cast it to float32/float64 if the loss of "
             "exactness is acceptable, or write one row per key.".format(array.dtype)
         )
+
+    # After the guard: compression casts to float32, so it would lose the
+    # same exactness silently.
+    if compression_method is not None and array.ndim == 2:
+        token, payload = compression.compress(array, compression_method, endian)
+        return BINARY_MARKER + token.encode() + b" " + payload
 
     if array.dtype.kind in "iu" and array.ndim == 1:
         out = [BINARY_MARKER, _sized_int(array.shape[0], endian)]
@@ -550,6 +546,29 @@ def _encode_text_object(value):
     )
 
 
+def _check_scp_target(name):
+    """An scp entry is only usable if ``load_mat`` can reopen and seek it.
+
+    That rules out stdin/stdout and pipe destinations as well as unnamed
+    streams: each would produce lines such as ``utt -:123`` that look
+    well-formed and only fail much later, at read time.
+    """
+    if not isinstance(name, str):
+        raise ValueError(
+            "Cannot write an scp for an archive object with no file name: "
+            "every line would point at an unopenable path. Pass a path for "
+            "the ark, or drop the scp."
+        )
+    stripped = name.strip()
+    if stripped == "-" or stripped.startswith("|") or stripped.endswith("|"):
+        raise ValueError(
+            "Cannot write an scp for the non-seekable archive target {!r}: an "
+            "scp entry is '<path>:<offset>' and is read back by reopening the "
+            "path and seeking, which a stream or a pipe cannot support. Write "
+            "the ark to a file, or drop the scp.".format(name)
+        )
+
+
 class _ArkWriter:
     """Writes ``<key> <object>`` records and, optionally, the matching scp."""
 
@@ -566,16 +585,15 @@ class _ArkWriter:
     ):
         self._own_ark = isinstance(ark, str)
         self._own_scp = isinstance(scp, str)
+        self._ark_name = ark if self._own_ark else getattr(ark, "name", None)
+        # Before opening anything: for a pipe target that would already have
+        # started the subprocess.
+        if scp is not None:
+            _check_scp_target(self._ark_name)
+
         mode = "ab" if append else "wb"
         self._ark = open_like_kaldi(ark, mode) if self._own_ark else ark
         self._scp = open_like_kaldi(scp, "a" if append else "w") if self._own_scp else scp
-        self._ark_name = ark if self._own_ark else getattr(ark, "name", None)
-        if self._scp is not None and not isinstance(self._ark_name, str):
-            raise ValueError(
-                "Cannot write an scp for an archive object with no file name: "
-                "every scp line would point at an unopenable path. Pass a path "
-                "for the ark, or drop the scp."
-            )
         self._text = text
         self._endian = endian
         self._compression_method = compression_method
