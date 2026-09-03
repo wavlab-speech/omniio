@@ -11,10 +11,10 @@
 #     @coderabbitai configuration   print the settings actually in effect
 language: en-US
 tone_instructions: >-
-  Be concise and technical. No jokes or emoji. Report correctness,
-  data-compatibility, and API-compatibility problems; omniio reads and writes
-  binary archives, so a bug usually shows up as silently wrong bytes rather
-  than an exception. Prefer one concrete failure case over general advice.
+  Be concise and technical. No jokes or emoji. omniio reads and writes binary
+  archives, so bugs surface as silently wrong bytes rather than exceptions:
+  give one concrete failure case instead of general advice, and skip style
+  nitpicks.
 reviews:
   profile: chill
   high_level_summary: false
