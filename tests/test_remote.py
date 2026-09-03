@@ -68,18 +68,22 @@ class TestLoad:
         }
         table = pa.table(extended_data)
 
+        # The unlink has to happen after the `with` closes the handle: Windows
+        # refuses to delete a file that is still open.
         with tempfile.NamedTemporaryFile(mode='wb', suffix='.parquet', delete=False) as f:
             pq.write_table(table, f.name)
-            try:
-                result = load(f.name, 'http://example.com')
-                paths = result.column('path').to_pylist()
+            path = f.name
 
-                assert paths[0] == 'http://example.com/blob_0.bin'
-                assert paths[1] == 'http://example.com/blob_1.bin'
-                assert paths[2] == 'http://example.com/blob_2.bin'
-                assert paths[3] == 'http://example.com/blob_3.bin'
-            finally:
-                os.unlink(f.name)
+        try:
+            result = load(path, 'http://example.com')
+            paths = result.column('path').to_pylist()
+
+            assert paths[0] == 'http://example.com/blob_0.bin'
+            assert paths[1] == 'http://example.com/blob_1.bin'
+            assert paths[2] == 'http://example.com/blob_2.bin'
+            assert paths[3] == 'http://example.com/blob_3.bin'
+        finally:
+            os.unlink(path)
 
     def test_load_strips_trailing_slash(self, temp_metadata_file):
         """Test that trailing slashes in URL are handled correctly."""
