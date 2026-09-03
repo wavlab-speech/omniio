@@ -16,6 +16,8 @@ The library is organized by data modality, with each supporting read and write o
 - **video/**: Video file I/O (MP4 with audio streams)
 - **text/**: Text file I/O (zstandard compressed)
 - **blob/**: Binary archive management with PyArrow metadata
+- **tools/**: Format-specific helpers that are not omniio's own archive layout;
+  currently **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`)
 
 ### Core Components
 
@@ -24,6 +26,17 @@ The library is organized by data modality, with each supporting read and write o
 - `AudioRead`: Extends with sample_rate and numpy array
 - `VideoRead`: Extends with fps, dimensions, and separate audio/video arrays
 - `TextRead`: Extends with text string
+
+**__init__.py**: Public import aliases. The source tree groups modules by what
+they are, but the stable import paths are the short ones (`omniio.kaldi`, not
+`omniio.tools.kaldi`). A meta path finder built from the `_ALIASES` dict maps
+public names -- and their submodules -- onto the real ones, lazily, so
+`import omniio` pulls in nothing extra. To relocate a subpackage, move it and
+add a line to `_ALIASES`; importers do not change. The finder is *prepended* to
+`sys.meta_path` on purpose: left to the normal path finder, a submodule such as
+`omniio.kaldi.compression` would be loaded a second time under the alias, with
+duplicate module state, because the aliased parent's `__path__` still points at
+the real directory.
 
 **interface.py**: Main entry points that route to local or remote readers
 - `audio_read()`: Checks if path exists, routes to local or remote implementation
@@ -149,6 +162,26 @@ raw_bytes, metadata = text_write(
 )
 # Returns compressed bytes and metadata with original_size, compressed_size
 ```
+
+## Kaldi Compatibility Layer
+
+The code lives in `omniio/tools/kaldi/` and is imported as `omniio.kaldi`
+(see the alias note above). It is independent of the blob machinery -- it
+depends only on numpy and, for audio payloads, soundfile.
+
+- **compression.py**: the `CompressedMatrix` codec (`CM`/`CM2`/`CM3`). Encode
+  and decode formulas are float32 with a specific operation ordering; changing
+  the grouping changes the last bit and breaks byte-compatibility.
+- **matio.py**: object codec plus `load_ark`/`load_scp`/`load_mat`/`save_ark`/
+  `save_mat` and the `LazyLoader` mapping.
+- **highlevel.py**: `ReadHelper`/`WriteHelper` and `segments` support.
+- **specifier.py**, **stream.py**: rspecifier/wspecifier parsing and Kaldi
+  extended filenames (pipes, `-`, `.gz`).
+
+`tests/test_kaldi.py` runs without `kaldiio`. `tests/test_kaldi_interop.py`
+skips unless `kaldiio` happens to be installed, and then asserts byte-identical
+output in both directions. `kaldiio` must never become a dependency: its
+license forbids redistribution, which is the reason this module exists.
 
 ## Dependencies
 
