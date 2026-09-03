@@ -34,6 +34,8 @@ setup(
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
     python_requires=">=3.8",
+    # NOTE: pyproject.toml is what actually builds this package; this list is
+    # kept in step only so the two do not disagree. See #3 for removing it.
     install_requires=[
         "numpy>=1.20.0",
         "av>=10.0.0",
@@ -41,6 +43,8 @@ setup(
         "requests>=2.28.0",
         "zstandard>=0.19.0",
         "pyarrow>=10.0.0",
+        "Pillow>=9.0.0",
+        "tqdm>=4.60.0",
     ],
     extras_require={
         "dev": [
