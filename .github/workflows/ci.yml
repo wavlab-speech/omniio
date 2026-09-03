@@ -1,0 +1,119 @@
+name: ci
+
+# Closes #2. Runs the test suite on every push to main and every pull request.
+#
+# Third-party actions are pinned to a commit SHA rather than a tag: a tag can be
+# moved, so `@v7` is a promise from whoever owns the repository, not a fixed
+# input.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # One macOS run: omniio decodes little-endian binary formats by hand
+          # and leans on soundfile and av wheels, both of which differ per
+          # platform.
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: python -m pip install -e ".[test]"
+      - name: Test
+        run: python -m pytest tests -v
+
+  kaldi-interop:
+    name: kaldi interop (byte-identity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: python -m pip install -e ".[test]"
+      # kaldiio is deliberately not a dependency of omniio -- its licence
+      # forbids redistribution, which is why omniio.kaldi exists. It is
+      # installed here, and only here, as a black-box oracle: the interop tests
+      # assert that archives written by omniio are byte-identical to the ones
+      # kaldiio writes, in both directions. Without it those tests skip, which
+      # would make the most load-bearing guarantee in this repository silently
+      # untested.
+      - name: Install kaldiio as a reference implementation
+        run: python -m pip install kaldiio
+      - name: Test
+        run: python -m pytest tests/test_kaldi.py tests/test_kaldi_interop.py -v
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install black isort flake8
+      # Scoped to the paths that are formatted today rather than to the whole
+      # tree, so this starts green. Widening it means running black and isort
+      # over the rest first; that is a diff worth making on its own.
+      - name: black
+        run: black --check omniio/__init__.py omniio/tools tests/test_kaldi.py tests/test_kaldi_interop.py
+      - name: isort
+        run: isort --check-only omniio/__init__.py omniio/tools tests/test_kaldi.py tests/test_kaldi_interop.py
+      - name: flake8
+        run: flake8 --max-line-length 100 --extend-ignore E203 omniio/__init__.py omniio/tools tests/test_kaldi.py tests/test_kaldi_interop.py
+
+  coderabbit-config:
+    name: .coderabbit.yaml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install jsonschema pyyaml requests
+      # An invalid config is not partially applied: CodeRabbit rejects the file
+      # and silently falls back to its defaults, so the settings sit in the
+      # repository looking correct while none of them apply. That is how the
+      # 250-character tone_instructions limit went unnoticed.
+      - name: Validate against schema.v2.json
+        run: |
+          python - <<'PY'
+          import json, sys, jsonschema, requests, yaml
+          schema = requests.get(
+              "https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json",
+              timeout=30,
+          ).json()
+          config = yaml.safe_load(open(".coderabbit.yaml"))
+          errors = sorted(
+              jsonschema.Draft202012Validator(schema).iter_errors(config),
+              key=lambda e: list(e.path),
+          )
+          for e in errors:
+              print("{}: {}".format("/".join(map(str, e.path)) or "<root>", e.message))
+          sys.exit(1 if errors else 0)
+          PY
