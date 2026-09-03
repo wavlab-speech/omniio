@@ -499,3 +499,43 @@ def test_keys_with_whitespace_are_rejected(tmp_path, feats):
 def test_three_dim_array_is_rejected(tmp_path):
     with pytest.raises(ValueError, match="ndim"):
         kaldi.save_ark(str(tmp_path / "a.ark"), {"u1": np.zeros((2, 2, 2), np.float32)})
+
+
+# --------------------------------------------------------------------------
+# import paths
+# --------------------------------------------------------------------------
+
+
+def test_public_import_paths_all_resolve():
+    """``omniio.kaldi`` is the stable path; the code lives in ``omniio.tools``."""
+    import importlib
+
+    from omniio import kaldi as attr_import
+    from omniio.kaldi import ReadHelper as from_import
+
+    assert importlib.import_module("omniio.kaldi") is attr_import
+    assert from_import is attr_import.ReadHelper
+
+    real = importlib.import_module("omniio.tools.kaldi")
+    assert real is attr_import, "both names must refer to one module object"
+
+    assert importlib.import_module("omniio.kaldi.compression") is importlib.import_module(
+        "omniio.tools.kaldi.compression"
+    )
+
+
+def test_importing_omniio_does_not_pull_in_the_subpackages():
+    """The aliases are lazy, so ``import omniio`` stays cheap."""
+    import subprocess
+    import sys
+
+    code = "import sys; import omniio; " "print('omniio.tools.kaldi' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "False"
+
+
+def test_unknown_attribute_still_raises():
+    import omniio
+
+    with pytest.raises(AttributeError, match="no attribute"):
+        omniio.definitely_not_a_module

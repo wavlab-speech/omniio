@@ -174,6 +174,10 @@ Exported: `ReadHelper`, `WriteHelper`, `load_ark`, `load_scp`,
 `load_scp_sequential`, `load_mat`, `save_ark`, `save_mat`, `open_like_kaldi`,
 `parse_wspecifier`, `parse_rspecifier`, `LazyLoader`.
 
+The code lives in `omniio/tools/kaldi/`, but `omniio.kaldi` is the supported
+import path and `import omniio.kaldi`, `from omniio import kaldi` and
+`from omniio.kaldi import ReadHelper` all work.
+
 Supported on-disk formats:
 
 | Form | Notes |

@@ -18,7 +18,7 @@ Unlike ``kaldiio`` this code is licensed under the MIT license, and it is
 written against the format description in Kaldi itself (Apache-2.0).
 """
 
-from omniio.kaldi.compression import (
+from omniio.tools.kaldi.compression import (
     kAutomaticMethod,
     kOneByteAuto,
     kOneByteUnsignedInteger,
@@ -27,12 +27,12 @@ from omniio.kaldi.compression import (
     kTwoByteAuto,
     kTwoByteSignedInteger,
 )
-from omniio.kaldi.highlevel import (
+from omniio.tools.kaldi.highlevel import (
     ReadHelper,
     WriteHelper,
     load_segments,
 )
-from omniio.kaldi.matio import (
+from omniio.tools.kaldi.matio import (
     LazyLoader,
     ReadError,
     load_ark,
@@ -43,8 +43,8 @@ from omniio.kaldi.matio import (
     save_ark,
     save_mat,
 )
-from omniio.kaldi.specifier import parse_rspecifier, parse_wspecifier
-from omniio.kaldi.stream import open_like_kaldi, parse_extended_filename
+from omniio.tools.kaldi.specifier import parse_rspecifier, parse_wspecifier
+from omniio.tools.kaldi.stream import open_like_kaldi, parse_extended_filename
 
 __all__ = [
     "LazyLoader",

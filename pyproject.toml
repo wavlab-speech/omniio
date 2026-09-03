@@ -59,7 +59,7 @@ Repository = "https://github.com/wavlab-speech/omniio"
 "Bug Tracker" = "https://github.com/wavlab-speech/omniio/issues"
 
 [tool.setuptools]
-packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image", "omniio.kaldi"]
+packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image", "omniio.tools", "omniio.tools.kaldi"]
 
 [tool.setuptools.package-data]
 omniio = ["py.typed"]

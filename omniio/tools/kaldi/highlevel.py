@@ -2,15 +2,15 @@
 
 import numpy as np
 
-from omniio.kaldi.matio import (
+from omniio.tools.kaldi.matio import (
     ReadError,
     _ArkWriter,
     load_ark,
     load_mat,
     load_scp_lines,
 )
-from omniio.kaldi.specifier import parse_rspecifier, parse_wspecifier
-from omniio.kaldi.stream import open_like_kaldi
+from omniio.tools.kaldi.specifier import parse_rspecifier, parse_wspecifier
+from omniio.tools.kaldi.stream import open_like_kaldi
 
 
 def load_segments(path):

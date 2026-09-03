@@ -30,8 +30,8 @@ import io
 
 import numpy as np
 
-from omniio.kaldi import compression
-from omniio.kaldi.stream import open_like_kaldi, parse_extended_filename
+from omniio.tools.kaldi import compression
+from omniio.tools.kaldi.stream import open_like_kaldi, parse_extended_filename
 
 BINARY_MARKER = b"\x00B"
 AUDIO_MARKER = b"AUDIO"
