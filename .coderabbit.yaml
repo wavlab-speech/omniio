@@ -1,0 +1,95 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# https://docs.coderabbit.ai/reference/yaml-template
+#
+# Unlike the ESPnet configuration this is modelled on, incremental review is
+# left ON: omniio is low volume, so re-reviewing each push does not risk the
+# per-repository rate limit of the open-source plan.
+#
+# Useful pull request comments:
+#     @coderabbitai full review     re-read the whole PR from scratch
+#     @coderabbitai review          only commits not reviewed yet
+#     @coderabbitai configuration   print the settings actually in effect
+language: en-US
+tone_instructions: >-
+  Be concise and technical. No jokes or emoji. Report correctness,
+  data-compatibility, and API-compatibility problems; omniio reads and writes
+  binary archives, so a bug usually shows up as silently wrong bytes rather
+  than an exception. Prefer one concrete failure case over general advice.
+reviews:
+  profile: chill
+  high_level_summary: false
+  review_status: false
+  poem: false
+  changed_files_summary: false
+  sequence_diagrams: false
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: true
+    ignore_usernames:
+      - dependabot[bot]
+      - pre-commit-ci[bot]
+  path_instructions:
+    - path: 'omniio/tools/kaldi/**'
+      instructions: >-
+        Kaldi ark/scp compatibility layer. The binding constraint is that
+        archives written here stay byte-identical to the ones Kaldi and kaldiio
+        produce, and that every archive they produce is readable here.
+        In compression.py the quantisation formulas are float32 with a specific
+        operation grouping -- for example min + (range * value) / 65535, not
+        min + range * (1/65535) * value. Regrouping or widening an intermediate
+        to float64 changes the last bit and breaks byte-compatibility, so flag
+        any change to the arithmetic that is not accompanied by a matching
+        change to the interop tests. The two documented divergences from
+        kaldiio (kSpeechFeature on matrices with fewer than five rows, and
+        clipping in the fixed-range compression methods) are deliberate.
+        Also check offset bookkeeping: an scp entry points at the first byte
+        after "<key> ", so any change to how a record is framed must update the
+        offsets written alongside it.
+        kaldiio must never become a dependency and its source must never be
+        copied: its license is evaluation-only and forbids redistribution. It
+        may only appear as an optional test-time oracle behind importorskip.
+    - path: 'omniio/blob/**'
+      instructions: >-
+        Archive writer. The .bin payload and the .parquet metadata must stay
+        consistent: start_byte/end_byte have to match what was actually
+        written, including across bin rollover and shard concatenation, where
+        offsets are shifted after the fact. A mismatch here is silent -- reads
+        return the wrong bytes rather than failing -- so check the arithmetic
+        rather than trusting it. Code inside the worker function runs in a
+        separate process, so it must not rely on state from the parent.
+    - path: 'omniio/{audio,video,text,image}/**'
+      instructions: >-
+        Each modality has a local reader and a remote reader that must return
+        identical results for the same entry; the remote one fetches the same
+        byte range over HTTP instead of seeking. Flag changes that touch only
+        one of the pair. Check that decoded dtype and array shape are stated
+        and stable, since callers index into these arrays directly.
+    - path: 'omniio/remote.py'
+      instructions: >-
+        HTTP range requests. The Range header is inclusive at both ends, so an
+        off-by-one truncates or over-reads the entry. Check that non-206
+        responses and short reads are treated as errors rather than returning
+        partial data.
+    - path: 'omniio/__init__.py'
+      instructions: >-
+        Public import aliases. Two properties are load-bearing and easy to
+        break: the aliases must resolve lazily, so that importing omniio does
+        not pull in av, soundfile or pyarrow; and the meta path finder must
+        stay prepended to sys.meta_path, because appended it lets the normal
+        path finder load an aliased submodule a second time under its public
+        name, producing two module objects from one file.
+    - path: 'tests/**'
+      instructions: >-
+        Check that a test asserts the behavior under change rather than being a
+        smoke test, and that it needs no network access. Tests that depend on
+        an optional package must skip cleanly via importorskip.
+    - path: '{pyproject.toml,setup.py}'
+      instructions: >-
+        Packaging metadata. Both files currently declare dependencies, so a new
+        or changed requirement must be applied to both or the drift will ship;
+        see issue #3. Every module imported at import time must appear in the
+        dependency list, and any new subpackage must be added to the packages
+        list in pyproject.toml or it will be missing from the wheel.
+chat:
+  art: false
