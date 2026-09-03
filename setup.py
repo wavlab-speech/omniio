@@ -47,6 +47,15 @@ setup(
         "tqdm>=4.60.0",
     ],
     extras_require={
+        # Mirrors [project.optional-dependencies] in pyproject.toml; the two
+        # must not drift. See #3 for removing this file entirely.
+        "test": [
+            "pytest>=7.0.0",
+            "pytest-cov>=4.0.0",
+            # tests/test_blob.py reads metadata back through pyarrow's pandas
+            # bridge.
+            "pandas>=1.3.0",
+        ],
         "dev": [
             "pytest>=7.0.0",
             "pytest-cov>=4.0.0",
