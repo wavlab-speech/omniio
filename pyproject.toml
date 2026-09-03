@@ -2,7 +2,7 @@
 # setuptools_scm was listed but never wired up -- the version below is
 # static and the repository has no tags. Deriving it from tags instead is a
 # reasonable change, but it should be a deliberate one.
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]  # 77 is where PEP 639 landed; see the license fields below
 build-backend = "setuptools.build_meta"
 
 [project]
