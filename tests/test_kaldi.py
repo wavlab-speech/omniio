@@ -6,6 +6,7 @@ The golden byte strings below were checked against Kaldi's own on-disk layout;
 
 import io
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -539,3 +540,290 @@ def test_unknown_attribute_still_raises():
 
     with pytest.raises(AttributeError, match="no attribute"):
         omniio.definitely_not_a_module
+
+
+# --------------------------------------------------------------------------
+# regressions
+# --------------------------------------------------------------------------
+
+
+def test_segments_end_of_recording(tmp_path, wav):
+    """Kaldi's segments format uses end <= 0 for "to the end of the recording"."""
+    ark = str(tmp_path / "s.ark")
+    scp = str(tmp_path / "s.scp")
+    seg = tmp_path / "segments"
+    kaldi.save_ark(ark, {"rec1": (16000, wav)}, scp=scp)
+    seg.write_text("utt_a rec1 0.1 -1\nutt_b rec1 0.2 0\n")
+
+    with kaldi.ReadHelper("scp:" + scp, segments=str(seg)) as r:
+        got = dict(r)
+    assert np.array_equal(got["utt_a"][1], wav[1600:])
+    assert np.array_equal(got["utt_b"][1], wav[3200:])
+
+
+def test_two_dim_integer_array_is_refused(tmp_path):
+    """Silently writing it as float32 would lose exactness above 2**24."""
+    array = np.array([[16777217, 16777219]], dtype=np.int32)
+    with pytest.raises(ValueError, match="no integer matrix type"):
+        kaldi.save_ark(str(tmp_path / "a.ark"), {"u": array})
+
+    # 1-dim integer arrays are still fine: those Kaldi does have a type for.
+    kaldi.save_ark(str(tmp_path / "b.ark"), {"u": array[0]})
+    assert np.array_equal(dict(kaldi.load_ark(str(tmp_path / "b.ark")))["u"], array[0])
+
+
+@pytest.mark.parametrize("endian", ["<", ">"])
+def test_endian_roundtrip(tmp_path, feats, endian):
+    p = str(tmp_path / "e.ark")
+    kaldi.save_ark(p, {"u": feats, "v": np.arange(4, dtype=np.int32)}, endian=endian)
+    got = dict(kaldi.load_ark(p, endian=endian))
+    assert np.array_equal(got["u"], feats)
+    assert np.array_equal(got["v"], np.arange(4))
+
+
+def test_stale_scp_offset_raises_read_error(tmp_path, feats):
+    """A wrong offset must not surface as UnicodeDecodeError or MemoryError."""
+    p = str(tmp_path / "a.ark")
+    kaldi.save_ark(p, {"u1": feats, "u2": feats})
+    size = os.path.getsize(p)
+    for offset in (7, 40, size // 2):
+        with pytest.raises(kaldi.ReadError):
+            kaldi.load_mat("{}:{}".format(p, offset))
+
+
+def test_absurd_dimensions_raise_read_error(tmp_path):
+    p = tmp_path / "huge.ark"
+    dim = (2**30).to_bytes(4, "little")
+    p.write_bytes(b"u \x00BFM \x04" + dim + b"\x04" + dim)
+    with pytest.raises(kaldi.ReadError, match="Unexpected end"):
+        kaldi.load_mat("{}:2".format(p))
+
+    q = tmp_path / "huge_vec.ark"
+    q.write_bytes(b"u \x00B\x04" + (2**31 - 1).to_bytes(4, "little"))
+    with pytest.raises(kaldi.ReadError):
+        kaldi.load_mat("{}:2".format(q))
+
+
+def test_scp_for_an_unnamed_stream_is_refused(feats):
+    """Every line would point at a path that cannot be opened."""
+    with pytest.raises(ValueError, match="no file name"):
+        kaldi.save_ark(io.BytesIO(), {"u1": feats}, scp=io.StringIO())
+
+    # Without an scp there is nothing to point anywhere, so this stays allowed.
+    buf = io.BytesIO()
+    kaldi.save_ark(buf, {"u1": feats})
+    assert buf.getvalue().startswith(b"u1 \x00BFM ")
+
+
+def test_non_finite_values_are_refused_by_compression(tmp_path, feats):
+    for bad in (np.nan, np.inf, -np.inf):
+        broken = feats.copy()
+        broken[3, 2] = bad
+        with pytest.raises(ValueError, match="NaN or inf"):
+            with kaldi.WriteHelper("ark:" + str(tmp_path / "c.ark"), compression_method=2) as w:
+                w["u"] = broken
+
+
+def test_alias_does_not_shadow_an_existing_package(monkeypatch):
+    """An _ALIASES entry added before its package moves must not break it."""
+    import importlib
+
+    import omniio
+
+    monkeypatch.setitem(omniio._ALIASES, "omniio.text", "omniio.modalities.text")
+    for name in [n for n in list(sys.modules) if n.startswith("omniio.text")]:
+        monkeypatch.delitem(sys.modules, name)
+
+    # The target does not exist, so the real omniio/text/ must still be found.
+    assert importlib.import_module("omniio.text.read") is not None
+
+
+@pytest.mark.parametrize("method", [1, 2, 3, 4, 5, 6, 7])
+def test_non_finite_refused_for_every_method(tmp_path, feats, method):
+    """The fixed-range methods never look at the data's min/max, so the check
+    has to sit in compress() rather than in the global-header branch."""
+    for bad in (np.nan, np.inf, -np.inf):
+        broken = feats.copy()
+        broken[3, 2] = bad
+        with pytest.raises(ValueError, match="NaN or inf"):
+            with kaldi.WriteHelper(
+                "ark:" + str(tmp_path / "c.ark"), compression_method=method
+            ) as w:
+                w["u"] = broken
+
+
+def test_two_dim_integer_array_is_refused_under_compression(tmp_path):
+    """compress() casts to float32, so the guard has to run before it."""
+    array = np.array([[16777217, 16777219]], dtype=np.int32)
+    with pytest.raises(ValueError, match="no integer matrix type"):
+        with kaldi.WriteHelper("ark:" + str(tmp_path / "c.ark"), compression_method=2) as w:
+            w["u"] = array
+
+
+@pytest.mark.parametrize("target", ["-", "| cat > /dev/null", "gzip -c > x.gz |"])
+def test_scp_for_a_non_seekable_target_is_refused(tmp_path, feats, target):
+    """An scp entry is read back by reopening the path and seeking."""
+    scp = str(tmp_path / "f.scp")
+    with pytest.raises(ValueError, match="non-seekable"):
+        kaldi.save_ark(target, {"u1": feats}, scp=scp)
+
+    # Without an scp there is nothing to point anywhere, so a pipe stays fine.
+    out = tmp_path / "piped.ark"
+    kaldi.save_ark("| cat > {}".format(out), {"u1": feats})
+    assert np.array_equal(dict(kaldi.load_ark(str(out)))["u1"], feats)
+
+
+def test_reads_do_not_seek(tmp_path, feats):
+    """Bounding a read by seeking to the end would defeat buffering on a plain
+    file and decompress the remainder on a gzipped one."""
+    kaldi.save_ark(str(tmp_path / "a.ark"), {"u{}".format(i): feats for i in range(5)})
+
+    seeks = []
+
+    class NoSeek(io.BufferedReader):
+        def seek(self, *args):
+            seeks.append(args)
+            return super().seek(*args)
+
+    with NoSeek(open(str(tmp_path / "a.ark"), "rb")) as fd:
+        got = dict(kaldi.load_ark(fd))
+    assert len(got) == 5
+    assert seeks == [], "sequential reading must not seek"
+
+
+def test_absurd_length_does_not_allocate(tmp_path):
+    """A stale offset can ask for petabytes; the read is chunked so the first
+    short read rejects it."""
+    p = tmp_path / "huge.ark"
+    dim = (2**40).to_bytes(8, "little")
+    p.write_bytes(b"u \x00BFV \x08" + dim + b"payload")
+    with pytest.raises(kaldi.ReadError, match="Unexpected end"):
+        kaldi.load_mat("{}:2".format(p))
+
+
+# --------------------------------------------------------------------------
+# x-vectors, as ESPnet's TTS recipe produces and consumes them
+#
+# egs2/TEMPLATE/tts1/tts.sh passes "<tag>.scp,spembs,kaldi_ark", which reaches
+# load_scp. The archives come from either Kaldi itself (spk_embed_tool=kaldi ->
+# nnet3-xvector-compute) or from pyscripts/utils/extract_spk_embed.py, so both
+# writers are covered here.
+# --------------------------------------------------------------------------
+
+
+def _kaldi_native_vector_ark(path, vectors):
+    """Write vectors exactly as Kaldi's BaseFloatVectorWriter does.
+
+    Built from the format rather than from this module's writer, so the test
+    still fails if both sides drift together.
+    """
+    scp = path + ".scp"
+    with open(path, "wb") as ark, open(scp, "w") as index:
+        for key, vec in vectors.items():
+            offset = ark.tell() + len(key) + 1
+            ark.write(
+                key.encode()
+                + b" \x00BFV \x04"
+                + np.int32(vec.size).tobytes()
+                + vec.astype("<f4").tobytes()
+            )
+            index.write("{} {}:{}\n".format(key, path, offset))
+    return scp
+
+
+@pytest.fixture
+def xvectors():
+    rng = np.random.RandomState(11)
+    return {"utt{}".format(i): rng.randn(512).astype(np.float32) for i in range(3)}
+
+
+def test_xvector_from_kaldi_is_read_verbatim(tmp_path, xvectors):
+    scp = _kaldi_native_vector_ark(str(tmp_path / "xvector.ark"), xvectors)
+    loader = kaldi.load_scp(scp)
+
+    assert list(loader.keys()) == ["utt0", "utt1", "utt2"]
+    assert len(loader) == 3 and "utt1" in loader
+    for key, want in xvectors.items():
+        got = loader[key]
+        assert got.dtype == np.float32 and got.shape == (512,)
+        assert np.array_equal(got, want)
+
+
+def test_xvector_from_extract_spk_embed(tmp_path, xvectors):
+    """Per-utterance embeddings are 1-dim; the per-speaker mean keeps the
+    extractor's leading axis and lands as a (1, D) matrix."""
+    utt_ark = str(tmp_path / "xvector.ark")
+    spk_ark = str(tmp_path / "spk_xvector.ark")
+    with kaldi.WriteHelper("ark,scp:{0},{0}.scp".format(utt_ark)) as utt, kaldi.WriteHelper(
+        "ark,scp:{0},{0}.scp".format(spk_ark)
+    ) as spk:
+        for key, vec in xvectors.items():
+            utt[key] = np.squeeze(vec)
+        spk["spk1"] = np.mean(np.stack([v[None, :] for v in xvectors.values()], 0), 0)
+
+    # "utt0 " is five bytes, then the two-byte binary marker.
+    assert open(utt_ark, "rb").read()[5:10] == b"\x00BFV "
+    assert open(spk_ark, "rb").read()[5:10] == b"\x00BFM "
+
+    per_utt = kaldi.load_scp(utt_ark + ".scp")
+    for key, want in xvectors.items():
+        assert np.array_equal(per_utt[key], want)
+
+    per_spk = kaldi.load_scp(spk_ark + ".scp")["spk1"]
+    assert per_spk.shape == (1, 512) and per_spk.dtype == np.float32
+    assert np.allclose(per_spk[0], np.mean(list(xvectors.values()), 0))
+
+
+def test_xvector_in_kaldi_text_mode(tmp_path, xvectors):
+    """copy-vector --binary=false, which some recipes leave enabled."""
+    ark = str(tmp_path / "t.ark")
+    scp = str(tmp_path / "t.scp")
+    with open(ark, "wb") as f, open(scp, "w") as index:
+        for key, vec in xvectors.items():
+            offset = f.tell() + len(key) + 1
+            body = " [ " + " ".join(repr(float(x)) for x in vec) + " ]\n"
+            f.write(key.encode() + b" " + body.encode())
+            index.write("{} {}:{}\n".format(key, ark, offset))
+
+    loader = kaldi.load_scp(scp)
+    for key, want in xvectors.items():
+        assert loader[key].shape == (512,)
+        assert np.allclose(loader[key], want, atol=1e-6)
+
+
+def test_xvector_whole_ark_iteration(tmp_path, xvectors):
+    """espnet2/sds/tts/espnet_tts.py reads the ark rather than the scp."""
+    ark = str(tmp_path / "x.ark")
+    kaldi.save_ark(ark, xvectors)
+    got = {k: v for k, v in kaldi.load_ark(ark)}
+    assert sorted(got) == sorted(xvectors)
+    assert all(np.array_equal(got[k], v) for k, v in xvectors.items())
+
+
+@pytest.mark.parametrize("dim", [512, 192, 256])
+def test_xvector_embedding_sizes(tmp_path, dim):
+    """512 for kaldi/espnet, 192 for speechbrain ECAPA, 256 for rawnet."""
+    vec = np.random.RandomState(dim).randn(dim).astype(np.float32)
+    ark = str(tmp_path / "e.ark")
+    kaldi.save_ark(ark, {"u": vec}, scp=ark + ".scp")
+    assert np.array_equal(kaldi.load_scp(ark + ".scp")["u"], vec)
+
+
+def test_xvector_float64_extractor_output(tmp_path):
+    """An extractor that skips the float32 cast writes DV, not FV."""
+    vec = np.random.RandomState(1).randn(512)
+    ark = str(tmp_path / "d.ark")
+    kaldi.save_ark(ark, {"u": vec}, scp=ark + ".scp")
+    assert open(ark, "rb").read()[2:7] == b"\x00BDV "
+    got = kaldi.load_scp(ark + ".scp")["u"]
+    assert got.dtype == np.float64 and np.array_equal(got, vec)
+
+
+def test_xvector_scp_random_access_with_fd_cache(tmp_path, xvectors):
+    """The recipe reads spembs out of order, one utterance at a time."""
+    scp = _kaldi_native_vector_ark(str(tmp_path / "xvector.ark"), xvectors)
+    loader = kaldi.load_scp(scp, max_cache_fd=8)
+    for _ in range(3):
+        for key in reversed(list(xvectors)):
+            assert np.array_equal(loader[key], xvectors[key])
+    loader.close()

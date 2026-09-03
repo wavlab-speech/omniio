@@ -62,6 +62,15 @@ class _AliasFinder(importlib.abc.MetaPathFinder):
         real_name = _resolve(fullname)
         if real_name is None:
             return None
+        # This finder runs before the normal one, so it must not claim a name
+        # whose target does not exist: an _ALIASES entry added before its
+        # package is actually moved would otherwise shadow the package that is
+        # still there.
+        try:
+            if importlib.util.find_spec(real_name) is None:
+                return None
+        except (ImportError, AttributeError, ValueError):
+            return None
         return importlib.util.spec_from_loader(fullname, _AliasLoader(real_name))
 
 

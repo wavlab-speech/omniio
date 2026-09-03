@@ -57,8 +57,25 @@ def _peek(fd, n):
     return buf
 
 
+#: Upper bound on a single ``fd.read``. Sizes come off the wire, so a stale scp
+#: offset can ask for an absurd one; reading up to this much at a time lets the
+#: first short read reject it instead of allocating first.
+_READ_CHUNK = 1 << 23  # 8 MiB
+
+
 def _read_exact(fd, n, what):
-    buf = fd.read(n)
+    if n <= _READ_CHUNK:
+        buf = fd.read(n)
+    else:
+        parts = []
+        got = 0
+        while got < n:
+            chunk = fd.read(min(_READ_CHUNK, n - got))
+            if not chunk:
+                break
+            parts.append(chunk)
+            got += len(chunk)
+        buf = b"".join(parts)
     if len(buf) != n:
         raise ReadError(
             "Unexpected end of archive while reading {} "
@@ -68,10 +85,15 @@ def _read_exact(fd, n, what):
 
 
 def _read_sized_int(fd, endian):
-    """Read Kaldi's ``\\N``-prefixed integer; returns ``(value, bytes_read)``."""
+    """Read Kaldi's ``\\N``-prefixed integer; returns ``(value, bytes_read)``.
+
+    The width byte says how many bytes follow, so the value has to be widened
+    on the side the endianness puts the low-order bytes -- padding on the wrong
+    side scales it by 2**(8*pad).
+    """
     width = _read_exact(fd, 1, "integer size")[0]
     raw = _read_exact(fd, width, "integer")
-    return int(np.frombuffer(raw.ljust(8, b"\x00"), dtype=endian + "u8")[0]), 1 + width
+    return int.from_bytes(raw, "big" if endian == ">" else "little"), 1 + width
 
 
 def _read_token(fd):
@@ -104,11 +126,15 @@ def _read_binary_object(fd, endian):
         # ``std::vector<int32>``: no token, just the \4-prefixed length.
         dim, n = _read_sized_int(fd, endian)
         size += n
-        values = np.empty(dim, dtype=np.int32)
-        for i in range(dim):
-            values[i], n = _read_sized_int(fd, endian)
+        # Collected rather than preallocated: ``dim`` comes straight off the
+        # wire, and np.empty would honour a corrupt one before the first read
+        # could fail.
+        values = []
+        for _ in range(dim):
+            value, n = _read_sized_int(fd, endian)
+            values.append(value)
             size += n
-        return values, size
+        return np.array(values, dtype=np.int32), size
 
     token, n = _read_token(fd)
     size += n
@@ -206,7 +232,14 @@ def _read_text_object(fd, endian):
         if b"]" in line:
             break
     raw = b"".join(chunks)
-    text = raw.decode()
+    try:
+        text = raw.decode()
+    except UnicodeDecodeError as e:
+        raise ReadError(
+            "Not a Kaldi object: no binary marker, no audio magic, and not "
+            "decodable as text. An scp offset left over from an earlier "
+            "version of the archive looks exactly like this."
+        ) from e
     if "[" not in text or "]" not in text:
         raise ReadError("Malformed text-format object: {!r}".format(text[:80]))
 
@@ -456,6 +489,17 @@ def _encode_object(value, endian, compression_method, write_function, write_kwar
         return AUDIO_MARKER + bytes([width]) + len(blob).to_bytes(width, "little") + blob
 
     array = np.asarray(value)
+    if array.dtype.kind in "iu" and array.ndim == 2:
+        # Kaldi has no integer matrix type, and float32 cannot hold int32
+        # exactly above 2**24, so writing one as FM would corrupt it silently.
+        raise ValueError(
+            "Kaldi archives have no integer matrix type, so a 2-dim {} array "
+            "cannot be written. Cast it to float32/float64 if the loss of "
+            "exactness is acceptable, or write one row per key.".format(array.dtype)
+        )
+
+    # After the guard: compression casts to float32, so it would lose the
+    # same exactness silently.
     if compression_method is not None and array.ndim == 2:
         token, payload = compression.compress(array, compression_method, endian)
         return BINARY_MARKER + token.encode() + b" " + payload
@@ -502,6 +546,29 @@ def _encode_text_object(value):
     )
 
 
+def _check_scp_target(name):
+    """An scp entry is only usable if ``load_mat`` can reopen and seek it.
+
+    That rules out stdin/stdout and pipe destinations as well as unnamed
+    streams: each would produce lines such as ``utt -:123`` that look
+    well-formed and only fail much later, at read time.
+    """
+    if not isinstance(name, str):
+        raise ValueError(
+            "Cannot write an scp for an archive object with no file name: "
+            "every line would point at an unopenable path. Pass a path for "
+            "the ark, or drop the scp."
+        )
+    stripped = name.strip()
+    if stripped == "-" or stripped.startswith("|") or stripped.endswith("|"):
+        raise ValueError(
+            "Cannot write an scp for the non-seekable archive target {!r}: an "
+            "scp entry is '<path>:<offset>' and is read back by reopening the "
+            "path and seeking, which a stream or a pipe cannot support. Write "
+            "the ark to a file, or drop the scp.".format(name)
+        )
+
+
 class _ArkWriter:
     """Writes ``<key> <object>`` records and, optionally, the matching scp."""
 
@@ -518,10 +585,15 @@ class _ArkWriter:
     ):
         self._own_ark = isinstance(ark, str)
         self._own_scp = isinstance(scp, str)
+        self._ark_name = ark if self._own_ark else getattr(ark, "name", None)
+        # Before opening anything: for a pipe target that would already have
+        # started the subprocess.
+        if scp is not None:
+            _check_scp_target(self._ark_name)
+
         mode = "ab" if append else "wb"
         self._ark = open_like_kaldi(ark, mode) if self._own_ark else ark
         self._scp = open_like_kaldi(scp, "a" if append else "w") if self._own_scp else scp
-        self._ark_name = ark if self._own_ark else getattr(ark, "name", "<stream>")
         self._text = text
         self._endian = endian
         self._compression_method = compression_method
