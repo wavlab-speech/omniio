@@ -1011,3 +1011,67 @@ def test_parse_specifier_tolerates_a_repeated_flag():
 def test_parse_wspecifier_rejects_a_repeated_file_option(wspecifier):
     with pytest.raises(ValueError, match="more than once"):
         kaldi.parse_wspecifier(wspecifier)
+
+
+# --------------------------------------------------------------------------
+# text arks keep integers integral
+#
+# ESPnet writes k-means pseudo-labels with `ark,t:` and later parses the tokens
+# back with int(). Writing 5 as "5.0" makes that fail with
+# `ValueError: invalid literal for int() with base 10: '5.0'`.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64, np.uint8])
+def test_text_ark_writes_integers_without_a_decimal_point(tmp_path, dtype):
+    labels = np.array([5, 12, 3, 0], dtype=dtype)
+    p = str(tmp_path / "labels.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["utt1"] = labels
+
+    assert open(p).read() == "utt1  [ 5 12 3 0 ]\n"
+
+    # What the recipe actually does with the file it just wrote.
+    key, rest = open(p).read().split(None, 1)
+    tokens = rest.strip().lstrip("[").rstrip("]").split()
+    assert [int(t) for t in tokens] == [5, 12, 3, 0]
+
+
+def test_text_ark_integer_matrix(tmp_path):
+    p = str(tmp_path / "m.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["u"] = np.array([[1, 2], [3, 4]], dtype=np.int64)
+    assert open(p).read() == "u  [\n  1 2 \n  3 4 ]\n"
+
+
+def test_text_ark_floats_are_unaffected(tmp_path):
+    p = str(tmp_path / "f.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["u"] = np.array([1.5, 2.0], dtype=np.float32)
+    assert open(p).read() == "u  [ 1.5 2.0 ]\n"
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_text_ark_integer_vectors_round_trip(tmp_path, dtype):
+    """A vector of whole numbers is a label sequence, so it comes back integral."""
+    labels = np.array([5, 12, 3, 0], dtype=dtype)
+    p = str(tmp_path / "labels.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["u"] = labels
+    got = dict(kaldi.load_ark(p))["u"]
+    assert got.dtype == np.int32
+    assert np.array_equal(got, labels)
+
+
+def test_text_ark_reader_dtype_rules(tmp_path):
+    """Vectors follow their contents; matrices are always float, as in Kaldi."""
+    cases = {
+        "ints.txt": ("u  [ 5 12 3 ]\n", np.int32),
+        "signed.txt": ("u  [ -5 12 ]\n", np.int32),
+        "floats.txt": ("u  [ 5 12.5 ]\n", np.float32),
+        "matrix.txt": ("u  [\n  1 2 \n  3 4 ]\n", np.float32),
+    }
+    for name, (text, dtype) in cases.items():
+        p = tmp_path / name
+        p.write_text(text)
+        assert dict(kaldi.load_ark(str(p)))["u"].dtype == dtype, name

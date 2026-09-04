@@ -225,3 +225,42 @@ def test_load_mat_fd_dict_matches(tmp_path, feats):
     for fd in reference.values():
         fd.close()
     assert opened.closed
+
+
+@pytest.mark.parametrize(
+    "array",
+    [
+        np.array([5, 12, 3, 0], dtype=np.int32),
+        np.array([5, 12, 3, 0], dtype=np.int64),
+        np.array([[1, 2], [3, 4]], dtype=np.int64),
+        np.array([0, 255], dtype=np.uint8),
+        np.array([1.5, 2.0], dtype=np.float32),
+    ],
+)
+def test_text_ark_bytes_match_for_every_dtype(tmp_path, array):
+    """Integers must not pick up a decimal point on the way out."""
+
+    def write(mod, p):
+        with mod.WriteHelper("ark,t:" + p) as w:
+            w["u"] = array
+
+    ours, theirs = _both(tmp_path, "t{}".format(array.dtype), write)
+    assert open(ours).read() == open(theirs).read()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "u  [ 5 12 3 0 ]\n",
+        "u  [ -5 12 ]\n",
+        "u  [\n  1 2 \n  3 4 ]\n",
+        "u  [\n  1 2.5 \n  3 4 ]\n",
+    ],
+)
+def test_text_ark_read_dtype_matches(tmp_path, text):
+    p = tmp_path / "t.txt"
+    p.write_text(text)
+    mine = dict(kaldi.load_ark(str(p)))["u"]
+    reference = dict(kaldiio.load_ark(str(p)))["u"]
+    assert mine.dtype == reference.dtype
+    assert np.array_equal(mine, reference)
