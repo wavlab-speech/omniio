@@ -264,3 +264,12 @@ def test_text_ark_read_dtype_matches(tmp_path, text):
     reference = dict(kaldiio.load_ark(str(p)))["u"]
     assert mine.dtype == reference.dtype
     assert np.array_equal(mine, reference)
+
+
+def test_signed_integer_vector_matches(tmp_path):
+    """kaldiio reads -5 correctly; an unsigned read gives 4294967291."""
+    alignment = np.array([-5, 0, 7, -(2**31), 2**31 - 1], dtype=np.int32)
+    ours, theirs = _both(tmp_path, "ali", lambda mod, p: mod.save_ark(p, {"u": alignment}))
+    assert open(ours, "rb").read() == open(theirs, "rb").read()
+    assert np.array_equal(dict(kaldi.load_ark(theirs))["u"], alignment)
+    assert np.array_equal(dict(kaldiio.load_ark(ours))["u"], alignment)
