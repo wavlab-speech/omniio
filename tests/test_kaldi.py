@@ -1063,15 +1063,22 @@ def test_text_ark_integer_vectors_round_trip(tmp_path, dtype):
     assert np.array_equal(got, labels)
 
 
-def test_text_ark_reader_dtype_rules(tmp_path):
-    """Vectors follow their contents; matrices are always float, as in Kaldi."""
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_text_ark_reader_dtype_rules(tmp_path, eol):
+    """Vectors follow their contents; matrices are always float, as in Kaldi.
+
+    Written as bytes with an explicit line ending: a matrix is told from a
+    vector by whether a newline follows the "[", so a CRLF file used to be read
+    as one long vector -- wrong shape and wrong dtype, with no error.
+    """
     cases = {
-        "ints.txt": ("u  [ 5 12 3 ]\n", np.int32),
-        "signed.txt": ("u  [ -5 12 ]\n", np.int32),
-        "floats.txt": ("u  [ 5 12.5 ]\n", np.float32),
-        "matrix.txt": ("u  [\n  1 2 \n  3 4 ]\n", np.float32),
+        "ints.txt": (b"u  [ 5 12 3 ]", np.int32, (3,)),
+        "signed.txt": (b"u  [ -5 12 ]", np.int32, (2,)),
+        "floats.txt": (b"u  [ 5 12.5 ]", np.float32, (2,)),
+        "matrix.txt": (b"u  [%s  1 2 %s  3 4 ]" % (eol, eol), np.float32, (2, 2)),
     }
-    for name, (text, dtype) in cases.items():
+    for name, (text, dtype, shape) in cases.items():
         p = tmp_path / name
-        p.write_text(text)
-        assert dict(kaldi.load_ark(str(p)))["u"].dtype == dtype, name
+        p.write_bytes(text + eol)
+        got = dict(kaldi.load_ark(str(p)))["u"]
+        assert (got.dtype, got.shape) == (dtype, shape), name

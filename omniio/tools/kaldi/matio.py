@@ -237,7 +237,10 @@ def _read_text_object(fd, endian):
             break
     raw = b"".join(chunks)
     try:
-        text = raw.decode()
+        # Normalise line endings: a matrix is told from a vector by whether a
+        # newline follows the "[", so a CRLF file would otherwise be read as a
+        # vector of every element in the matrix.
+        text = raw.decode().replace("\r\n", "\n")
     except UnicodeDecodeError as e:
         raise ReadError(
             "Not a Kaldi object: no binary marker, no audio magic, and not "
