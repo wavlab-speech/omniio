@@ -4,8 +4,10 @@ The golden byte strings below were checked against Kaldi's own on-disk layout;
 ``test_interop.py`` re-checks them against ``kaldiio`` when it is installed.
 """
 
+import gzip
 import io
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -423,21 +425,36 @@ def test_parse_extended_filename():
     assert kaldi.parse_extended_filename("cat a.wav |") == ("cat a.wav |", None)
 
 
+def _py(snippet, *args):
+    """A shell command running ``snippet`` in this interpreter.
+
+    The pipe tests need commands that work under both ``sh`` and ``cmd.exe``,
+    so they go through ``sys.executable`` rather than through coreutils, which
+    Windows does not have. Keep snippets free of double quotes and of shell
+    metacharacters -- only the outer quoting is portable.
+    """
+    quoted = "".join(' "{}"'.format(a) for a in args)
+    return '"{}" -c "{}"{}'.format(sys.executable, snippet, quoted)
+
+
 def test_open_like_kaldi_read_pipe():
-    with kaldi.open_like_kaldi("printf hello |", "r") as f:
+    emit = _py("import sys; sys.stdout.write('hello')")
+    with kaldi.open_like_kaldi(emit + " |", "r") as f:
         assert f.read() == "hello"
 
 
 def test_open_like_kaldi_write_pipe(tmp_path):
     out = tmp_path / "out.txt"
-    with kaldi.open_like_kaldi("| cat > {}".format(out), "w") as f:
+    sink = _py("import sys; open(sys.argv[1],'wb').write(sys.stdin.buffer.read())", out)
+    with kaldi.open_like_kaldi("| " + sink, "w") as f:
         f.write("world")
     assert out.read_text() == "world"
 
 
 def test_open_like_kaldi_propagates_failure():
+    fail = _py("import sys; sys.exit(3)")
     with pytest.raises(IOError, match="status 3"):
-        with kaldi.open_like_kaldi("exit 3 |", "rb") as f:
+        with kaldi.open_like_kaldi(fail + " |", "rb") as f:
             f.read()
 
 
@@ -459,8 +476,15 @@ def test_open_like_kaldi_does_not_close_caller_streams(tmp_path):
 def test_ark_through_a_pipe(tmp_path, feats):
     p = str(tmp_path / "a.ark")
     kaldi.save_ark(p, {"u1": feats})
-    os.system("gzip -c {} > {}.gz".format(p, p))
-    with kaldi.ReadHelper("ark:gunzip -c {}.gz |".format(p)) as r:
+    with open(p, "rb") as plain, gzip.open(p + ".gz", "wb") as packed:
+        shutil.copyfileobj(plain, packed)
+
+    unpack = _py(
+        "import gzip,shutil,sys; "
+        "shutil.copyfileobj(gzip.open(sys.argv[1],'rb'), sys.stdout.buffer)",
+        p + ".gz",
+    )
+    with kaldi.ReadHelper("ark:" + unpack + " |") as r:
         got = dict(r)
     assert np.array_equal(got["u1"], feats)
 
@@ -669,7 +693,8 @@ def test_scp_for_a_non_seekable_target_is_refused(tmp_path, feats, target):
 
     # Without an scp there is nothing to point anywhere, so a pipe stays fine.
     out = tmp_path / "piped.ark"
-    kaldi.save_ark("| cat > {}".format(out), {"u1": feats})
+    sink = _py("import sys; open(sys.argv[1],'wb').write(sys.stdin.buffer.read())", out)
+    kaldi.save_ark("| " + sink, {"u1": feats})
     assert np.array_equal(dict(kaldi.load_ark(str(out)))["u1"], feats)
 
 

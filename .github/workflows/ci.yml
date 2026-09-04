@@ -25,14 +25,31 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Python versions are swept on Linux; the other platforms get one run
+        # each, because what they exercise is the wheel and the OS, not the
+        # interpreter version. omniio leans on soundfile, av, pyarrow and
+        # Pillow wheels, which are built per platform, and the kaldi layer
+        # shells out to pipes, which behave differently on Windows.
+        #
+        # Host byte order is deliberately not a matrix axis: every byte-level
+        # operation carries an explicit endianness, and the `endian=">"` path
+        # is covered by test_endian_roundtrip on any host, so a big-endian
+        # runner would add nothing.
         os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
         include:
-          # One macOS run: omniio decodes little-endian binary formats by hand
-          # and leans on soundfile and av wheels, both of which differ per
-          # platform.
-          - os: macos-latest
+          - os: ubuntu-24.04-arm    # Linux arm64
             python-version: "3.12"
+          - os: macos-latest        # macOS arm64
+            python-version: "3.12"
+          - os: macos-15-intel      # macOS x86_64
+            python-version: "3.12"
+          - os: windows-latest      # Windows x86_64
+            python-version: "3.12"
+          # windows-11-arm is deliberately absent: pyarrow publishes no
+          # win_arm64 wheel (numpy, av and soundfile all do), so pip falls back
+          # to building Arrow from source and the install fails before any test
+          # runs. Add the runner once that wheel exists.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
