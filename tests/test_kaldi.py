@@ -1011,3 +1011,135 @@ def test_parse_specifier_tolerates_a_repeated_flag():
 def test_parse_wspecifier_rejects_a_repeated_file_option(wspecifier):
     with pytest.raises(ValueError, match="more than once"):
         kaldi.parse_wspecifier(wspecifier)
+
+
+# --------------------------------------------------------------------------
+# text arks keep integers integral
+#
+# ESPnet writes k-means pseudo-labels with `ark,t:` and later parses the tokens
+# back with int(). Writing 5 as "5.0" makes that fail with
+# `ValueError: invalid literal for int() with base 10: '5.0'`.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64, np.uint8])
+def test_text_ark_writes_integers_without_a_decimal_point(tmp_path, dtype):
+    labels = np.array([5, 12, 3, 0], dtype=dtype)
+    p = str(tmp_path / "labels.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["utt1"] = labels
+
+    assert open(p).read() == "utt1  [ 5 12 3 0 ]\n"
+
+    # What the recipe actually does with the file it just wrote.
+    key, rest = open(p).read().split(None, 1)
+    tokens = rest.strip().lstrip("[").rstrip("]").split()
+    assert [int(t) for t in tokens] == [5, 12, 3, 0]
+
+
+def test_text_ark_integer_matrix(tmp_path):
+    p = str(tmp_path / "m.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["u"] = np.array([[1, 2], [3, 4]], dtype=np.int64)
+    assert open(p).read() == "u  [\n  1 2 \n  3 4 ]\n"
+
+
+def test_text_ark_floats_are_unaffected(tmp_path):
+    p = str(tmp_path / "f.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["u"] = np.array([1.5, 2.0], dtype=np.float32)
+    assert open(p).read() == "u  [ 1.5 2.0 ]\n"
+
+
+@pytest.mark.parametrize("dtype", [np.int32, np.int64])
+def test_text_ark_integer_vectors_round_trip(tmp_path, dtype):
+    """A vector of whole numbers is a label sequence, so it comes back integral."""
+    labels = np.array([5, 12, 3, 0], dtype=dtype)
+    p = str(tmp_path / "labels.txt")
+    with kaldi.WriteHelper("ark,t:" + p) as w:
+        w["u"] = labels
+    got = dict(kaldi.load_ark(p))["u"]
+    assert got.dtype == np.int32
+    assert np.array_equal(got, labels)
+
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_text_ark_reader_dtype_rules(tmp_path, eol):
+    """Vectors follow their contents; matrices are always float, as in Kaldi.
+
+    Written as bytes with an explicit line ending: a matrix is told from a
+    vector by whether a newline follows the "[", so a CRLF file used to be read
+    as one long vector -- wrong shape and wrong dtype, with no error.
+    """
+    cases = {
+        "ints.txt": (b"u  [ 5 12 3 ]", np.int32, (3,)),
+        "signed.txt": (b"u  [ -5 12 ]", np.int32, (2,)),
+        "floats.txt": (b"u  [ 5 12.5 ]", np.float32, (2,)),
+        "matrix.txt": (b"u  [%s  1 2 %s  3 4 ]" % (eol, eol), np.float32, (2, 2)),
+    }
+    for name, (text, dtype, shape) in cases.items():
+        p = tmp_path / name
+        p.write_bytes(text + eol)
+        got = dict(kaldi.load_ark(str(p)))["u"]
+        assert (got.dtype, got.shape) == (dtype, shape), name
+
+
+# --------------------------------------------------------------------------
+# integer vectors: signed, and bounded by what Kaldi's type can hold
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("endian", ["<", ">"])
+def test_integer_vector_round_trips_negative_values(tmp_path, endian):
+    """Kaldi writes int32 signed: -5 is `fb ff ff ff`, not 4294967291."""
+    alignment = np.array([-5, 0, 7, -(2**31), 2**31 - 1], dtype=np.int32)
+    p = str(tmp_path / "ali.ark")
+    kaldi.save_ark(p, {"u": alignment}, endian=endian)
+    got = dict(kaldi.load_ark(p, endian=endian))["u"]
+    assert got.dtype == np.int32
+    assert np.array_equal(got, alignment)
+
+
+@pytest.mark.parametrize("spec", ["ark:", "ark,t:"])
+@pytest.mark.parametrize(
+    "value", [2**31, -(2**31) - 1, 2**32 - 1], ids=["max+1", "min-1", "uint32max"]
+)
+def test_integers_outside_int32_are_refused(tmp_path, spec, value):
+    """Writing one would produce an archive that cannot be read back."""
+    p = str(tmp_path / "out")
+    with pytest.raises(ValueError, match="int32"):
+        with kaldi.WriteHelper(spec + p) as w:
+            w["u"] = np.array([value], dtype=np.int64)
+
+
+@pytest.mark.parametrize("spec", ["ark:", "ark,t:"])
+@pytest.mark.parametrize("value", [2**31 - 1, -(2**31), 0], ids=["max", "min", "zero"])
+def test_int32_boundaries_are_accepted(tmp_path, spec, value):
+    p = str(tmp_path / "out")
+    with kaldi.WriteHelper(spec + p) as w:
+        w["u"] = np.array([value], dtype=np.int64)
+    got = dict(kaldi.load_ark(p))["u"]
+    assert got.dtype == np.int32 and got[0] == value
+
+
+def test_out_of_range_text_token_reports_read_error(tmp_path):
+    """A file from elsewhere may hold one; numpy's OverflowError says nothing."""
+    p = tmp_path / "big.txt"
+    p.write_bytes(b"u  [ 2147483648 ]\n")
+    with pytest.raises(kaldi.ReadError, match="int32"):
+        dict(kaldi.load_ark(str(p)))
+
+
+@pytest.mark.parametrize(
+    "header,what",
+    [
+        (b"u \x00B\x04" + (-3).to_bytes(4, "little", signed=True), "vector length"),
+        (b"u \x00BFV \x04" + (-1).to_bytes(4, "little", signed=True), "dimension"),
+    ],
+)
+def test_negative_counts_report_read_error(tmp_path, header, what):
+    """fd.read(-1) reads to end of file rather than failing, so check first."""
+    p = tmp_path / "bad.ark"
+    p.write_bytes(header)
+    with pytest.raises(kaldi.ReadError, match="Negative"):
+        dict(kaldi.load_ark(str(p)))

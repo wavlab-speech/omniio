@@ -27,6 +27,7 @@ itself.
 import collections
 import collections.abc
 import io
+import re
 
 import numpy as np
 
@@ -37,6 +38,9 @@ BINARY_MARKER = b"\x00B"
 AUDIO_MARKER = b"AUDIO"
 
 _SOUND_MAGIC = (b"RIFF", b"fLaC", b"OggS", b"\x1aE\xdf\xa3")
+
+#: A text token with no decimal point or exponent.
+_INTEGER = re.compile(r"^[+-]?\d+$")
 
 _MATRIX_TOKENS = {"FM": "f4", "DM": "f8"}
 _VECTOR_TOKENS = {"FV": "f4", "DV": "f8"}
@@ -87,13 +91,29 @@ def _read_exact(fd, n, what):
 def _read_sized_int(fd, endian):
     """Read Kaldi's ``\\N``-prefixed integer; returns ``(value, bytes_read)``.
 
+    Signed, because that is what Kaldi's ``WriteBasicType`` emits for an int32
+    -- an alignment of ``-5`` is stored as ``fb ff ff ff``, and reading it
+    unsigned yields 4294967291.
+
     The width byte says how many bytes follow, so the value has to be widened
-    on the side the endianness puts the low-order bytes -- padding on the wrong
-    side scales it by 2**(8*pad).
+    on the side the endianness puts the low-order bytes.
     """
     width = _read_exact(fd, 1, "integer size")[0]
     raw = _read_exact(fd, width, "integer")
-    return int.from_bytes(raw, "big" if endian == ">" else "little"), 1 + width
+    value = int.from_bytes(raw, "big" if endian == ">" else "little", signed=True)
+    return value, 1 + width
+
+
+def _read_count(fd, endian, what):
+    """Read a length or a dimension, which cannot be negative.
+
+    Read at a stale offset the bytes are arbitrary, and a negative count would
+    reach ``fd.read(-1)`` -- which reads to end of file rather than failing.
+    """
+    value, size = _read_sized_int(fd, endian)
+    if value < 0:
+        raise ReadError("Negative {}: {}".format(what, value))
+    return value, size
 
 
 def _read_token(fd):
@@ -124,7 +144,7 @@ def _read_binary_object(fd, endian):
         raise ReadError("Unexpected end of archive after the binary marker")
     if not head.isalpha():
         # ``std::vector<int32>``: no token, just the \4-prefixed length.
-        dim, n = _read_sized_int(fd, endian)
+        dim, n = _read_count(fd, endian, "vector length")
         size += n
         # Collected rather than preallocated: ``dim`` comes straight off the
         # wire, and np.empty would honour a corrupt one before the first read
@@ -140,9 +160,9 @@ def _read_binary_object(fd, endian):
     size += n
 
     if token in _MATRIX_TOKENS:
-        rows, n = _read_sized_int(fd, endian)
+        rows, n = _read_count(fd, endian, "row count")
         size += n
-        cols, n = _read_sized_int(fd, endian)
+        cols, n = _read_count(fd, endian, "column count")
         size += n
         dtype = np.dtype(endian + _MATRIX_TOKENS[token])
         nbytes = rows * cols * dtype.itemsize
@@ -150,7 +170,7 @@ def _read_binary_object(fd, endian):
         return np.frombuffer(buf, dtype=dtype).reshape(rows, cols), size + nbytes
 
     if token in _VECTOR_TOKENS:
-        dim, n = _read_sized_int(fd, endian)
+        dim, n = _read_count(fd, endian, "vector dimension")
         size += n
         dtype = np.dtype(endian + _VECTOR_TOKENS[token])
         nbytes = dim * dtype.itemsize
@@ -233,7 +253,10 @@ def _read_text_object(fd, endian):
             break
     raw = b"".join(chunks)
     try:
-        text = raw.decode()
+        # Normalise line endings: a matrix is told from a vector by whether a
+        # newline follows the "[", so a CRLF file would otherwise be read as a
+        # vector of every element in the matrix.
+        text = raw.decode().replace("\r\n", "\n")
     except UnicodeDecodeError as e:
         raise ReadError(
             "Not a Kaldi object: no binary marker, no audio magic, and not "
@@ -250,7 +273,20 @@ def _read_text_object(fd, endian):
         rows = [r.split() for r in body.split("\n") if r.strip()]
         array = np.array(rows, dtype=np.float32)
     else:
-        array = np.array(body.split(), dtype=np.float32)
+        tokens = body.split()
+        # A vector of whole numbers is an alignment or a label sequence, and
+        # readers parse those with int(); the binary format keeps them integral
+        # too, as std::vector<int32>. Matrices are always float, as in Kaldi.
+        if tokens and all(_INTEGER.match(t) for t in tokens):
+            try:
+                array = np.array(tokens, dtype=np.int32)
+            except (OverflowError, ValueError) as e:
+                raise ReadError(
+                    "Integer vector holds a value outside int32, which Kaldi's "
+                    "std::vector<int32> cannot represent: {}".format(e)
+                ) from e
+        else:
+            array = np.array(tokens, dtype=np.float32)
     return array, len(raw)
 
 
@@ -634,6 +670,7 @@ def _encode_object(value, endian, compression_method, write_function, write_kwar
         return BINARY_MARKER + token.encode() + b" " + payload
 
     if array.dtype.kind in "iu" and array.ndim == 1:
+        _check_int32_range(array)
         out = [BINARY_MARKER, _sized_int(array.shape[0], endian)]
         out.extend(_sized_int(int(v), endian) for v in array)
         return b"".join(out)
@@ -663,13 +700,46 @@ def _encode_object(value, endian, compression_method, write_function, write_kwar
     )
 
 
+#: Kaldi's integer vector is a ``std::vector<int32>``; nothing wider fits.
+_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+
+
+def _check_int32_range(array):
+    """Reject integers Kaldi's vector type cannot hold.
+
+    Without this the text writer happily emits a value the reader cannot parse
+    back, and the binary writer fails deep inside numpy with a message that
+    does not mention the archive.
+    """
+    if array.size and (array.min() < _INT32_MIN or array.max() > _INT32_MAX):
+        bad = array[(array < _INT32_MIN) | (array > _INT32_MAX)][0]
+        raise ValueError(
+            "Kaldi stores integer vectors as int32, so {} cannot be written. "
+            "Cast to int32 if the values really do fit, or write them as "
+            "float64.".format(bad)
+        )
+
+
+def _text_values(array):
+    """Format a row for a text ark, keeping integers integral.
+
+    Writing an integer array as ``5.0`` rather than ``5`` breaks every reader
+    that parses the token back with ``int()`` -- which is what a k-means label
+    or an alignment is.
+    """
+    if array.dtype.kind in "iub":
+        _check_int32_range(array)
+        return " ".join(str(int(v)) for v in array)
+    return " ".join(repr(float(v)) for v in array)
+
+
 def _encode_text_object(value):
     array = np.asarray(value)
     if array.ndim == 2:
-        rows = "".join("\n  " + " ".join(repr(float(v)) for v in row) + " " for row in array)
+        rows = "".join("\n  " + _text_values(row) + " " for row in array)
         return (" [" + rows + "]\n").encode()
     if array.ndim == 1:
-        return (" [ " + " ".join(repr(float(v)) for v in array) + " ]\n").encode()
+        return (" [ " + _text_values(array) + " ]\n").encode()
     raise ValueError(
         "Only 1- and 2-dim arrays can be written to a text ark, got " "ndim={}".format(array.ndim)
     )
