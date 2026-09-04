@@ -8,28 +8,10 @@ from omniio.tools.kaldi.matio import (
     load_ark,
     load_mat,
     load_scp_lines,
+    load_segments,
+    slice_segment,
 )
 from omniio.tools.kaldi.specifier import parse_rspecifier, parse_wspecifier
-from omniio.tools.kaldi.stream import open_like_kaldi
-
-
-def load_segments(path):
-    """Parse a Kaldi ``segments`` file into ``(utt, rec, start, end)`` tuples."""
-    segments = []
-    with open_like_kaldi(path, "r") as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            fields = line.split()
-            if len(fields) != 4:
-                raise ReadError(
-                    "{}:{}: expected '<utt> <rec> <start> <end>', got "
-                    "{!r}".format(path, lineno, line)
-                )
-            utt, rec, start, end = fields
-            segments.append((utt, rec, float(start), float(end)))
-    return segments
 
 
 class _SegmentedReader:
@@ -56,20 +38,9 @@ class _SegmentedReader:
                         "Recording {!r} required by segment {!r} is not in the "
                         "scp".format(rec, utt)
                     )
-                value = load_mat(self._index[rec], self._endian)
-                if not isinstance(value, tuple):
-                    raise ReadError(
-                        "segments= can only be applied to audio entries, but "
-                        "{!r} is a plain array".format(rec)
-                    )
-                cached_rec, cached = rec, value
-            rate, array = cached
-            begin = int(start * rate)
-            # Kaldi's segments format uses a non-positive end time to mean "to
-            # the end of the recording". Passing it through as a slice bound
-            # would index from the end instead and silently drop audio.
-            stop = int(end * rate) if end > 0 else len(array)
-            yield utt, (rate, array[begin:stop])
+                cached_rec = rec
+                cached = load_mat(self._index[rec], self._endian)
+            yield utt, slice_segment(cached, start, end)
 
 
 class ReadHelper:

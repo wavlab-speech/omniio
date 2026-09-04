@@ -171,8 +171,14 @@ array = kaldiio.load_mat("feats.ark:1234")  # random access via an scp entry
 ```
 
 Exported: `ReadHelper`, `WriteHelper`, `load_ark`, `load_scp`,
-`load_scp_sequential`, `load_mat`, `save_ark`, `save_mat`, `open_like_kaldi`,
-`parse_wspecifier`, `parse_rspecifier`, `LazyLoader`.
+`load_scp_sequential`, `load_wav_scp`, `load_mat`, `load_segments`, `save_ark`,
+`save_mat`, `open_like_kaldi`, `parse_specifier`, `parse_rspecifier`,
+`parse_wspecifier`, `LazyLoader`, `SegmentedLoader`, `ReadError`.
+
+`load_scp` and `load_scp_sequential` take `separator=` for an scp with its own
+delimiter and `segments=` to key the result by a segments file instead of by
+recording; `load_mat` takes `fd_dict=`, a caller-owned handle cache worth using
+when reading many entries out of a few archives.
 
 The code lives in `omniio/tools/kaldi/`, but `omniio.kaldi` is the supported
 import path and `import omniio.kaldi`, `from omniio import kaldi` and
@@ -192,6 +198,18 @@ Supported on-disk formats:
 Also supported: `segments` files, `scp` random access with a bounded file
 descriptor cache (`max_cache_fd`), and Kaldi extended filenames including pipes
 (`sox ... |`, `| gzip -c > x.gz`), `-` for stdin/stdout, and `.gz`.
+
+Every public name `kaldiio` exports is present. The remaining differences are
+additive optional arguments (`endian=` on the readers, `write_kwargs=` on
+`WriteHelper`, `return_position=` on `load_ark`) and the name of the first
+parameter on four functions, which matters only if you pass it by keyword:
+
+| | `kaldiio` | `omniio.kaldi` |
+|---|---|---|
+| `ReadHelper` | `wspecifier` | `rspecifier` — it reads, so that is what it takes |
+| `load_ark` | `fname` | `file_or_fd` — an open file is accepted too |
+| `load_mat` | `ark_name` | `name` |
+| `save_mat` | `fname` | `path` |
 
 Archives written here are byte-identical to Kaldi's own. Two deliberate
 divergences from `kaldiio` are documented in `omniio/kaldi/compression.py`:

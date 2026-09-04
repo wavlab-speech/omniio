@@ -572,17 +572,22 @@ def test_unknown_attribute_still_raises():
 
 
 def test_segments_end_of_recording(tmp_path, wav):
-    """Kaldi's segments format uses end <= 0 for "to the end of the recording"."""
+    """Kaldi writes -1 for "to the end of the recording".
+
+    Exactly 0 is not that sentinel: extract-segments rejects such a line as an
+    invalid segment, and ordinary indexing gives the empty slice.
+    """
     ark = str(tmp_path / "s.ark")
     scp = str(tmp_path / "s.scp")
     seg = tmp_path / "segments"
     kaldi.save_ark(ark, {"rec1": (16000, wav)}, scp=scp)
-    seg.write_text("utt_a rec1 0.1 -1\nutt_b rec1 0.2 0\n")
+    seg.write_text("utt_a rec1 0.1 -1\nutt_b rec1 0.2 0\nutt_c rec1 0.1 0.2\n")
 
     with kaldi.ReadHelper("scp:" + scp, segments=str(seg)) as r:
         got = dict(r)
     assert np.array_equal(got["utt_a"][1], wav[1600:])
-    assert np.array_equal(got["utt_b"][1], wav[3200:])
+    assert got["utt_b"][1].size == 0
+    assert np.array_equal(got["utt_c"][1], wav[1600:3200])
 
 
 def test_two_dim_integer_array_is_refused(tmp_path):
@@ -853,3 +858,130 @@ def test_xvector_scp_random_access_with_fd_cache(tmp_path, xvectors):
         for key in reversed(list(xvectors)):
             assert np.array_equal(loader[key], xvectors[key])
     loader.close()
+
+
+# --------------------------------------------------------------------------
+# scp options: separator, segments, fd caches
+# --------------------------------------------------------------------------
+
+
+def test_scp_separator(tmp_path, feats):
+    """An scp may use its own delimiter rather than whitespace."""
+    ark = str(tmp_path / "a.ark")
+    scp = str(tmp_path / "a.scp")
+    kaldi.save_ark(ark, {"u1": feats}, scp=scp)
+    key, value = open(scp).read().strip().split(None, 1)
+
+    tabbed = tmp_path / "tab.scp"
+    tabbed.write_text("{}\t{}\n".format(key, value))
+    assert np.array_equal(kaldi.load_scp(str(tabbed), separator="\t")["u1"], feats)
+    assert np.array_equal(list(kaldi.load_scp_sequential(str(tabbed), separator="\t"))[0][1], feats)
+
+
+def test_scp_default_split_keeps_spaces_in_the_path(tmp_path, feats):
+    """The default splits once, so a path may contain spaces."""
+    directory = tmp_path / "with space"
+    directory.mkdir()
+    ark = str(directory / "a.ark")
+    scp = str(tmp_path / "a.scp")
+    kaldi.save_ark(ark, {"u1": feats}, scp=scp)
+    assert " " in open(scp).read().split(None, 1)[1]
+    assert np.array_equal(kaldi.load_scp(scp)["u1"], feats)
+
+
+@pytest.fixture
+def segmented(tmp_path, wav):
+    ark = str(tmp_path / "w.ark")
+    scp = str(tmp_path / "w.scp")
+    seg = tmp_path / "segments"
+    kaldi.save_ark(ark, {"rec1": (16000, wav), "rec2": (16000, wav[::-1].copy())}, scp=scp)
+    seg.write_text("utt_a rec1 0.1 0.2\nutt_b rec2 0.2 -1\nutt_c rec1 0.1 0\n")
+    return scp, str(seg), wav
+
+
+def test_load_scp_with_segments(segmented):
+    scp, seg, wav = segmented
+    loader = kaldi.load_scp(scp, segments=seg)
+
+    assert list(loader.keys()) == ["utt_a", "utt_b", "utt_c"]
+    assert len(loader) == 3 and "utt_b" in loader and "rec1" not in loader
+
+    assert np.array_equal(loader["utt_a"][1], wav[1600:3200])
+    assert np.array_equal(loader["utt_b"][1], wav[::-1][3200:])
+    assert loader["utt_c"][1].size == 0
+    assert all(rate == 16000 for rate, _ in (loader[k] for k in loader))
+
+
+def test_load_scp_sequential_with_segments(segmented):
+    scp, seg, wav = segmented
+    got = list(kaldi.load_scp_sequential(scp, segments=seg))
+    assert [k for k, _ in got] == ["utt_a", "utt_b", "utt_c"]
+    assert np.array_equal(got[0][1][1], wav[1600:3200])
+
+
+def test_load_wav_scp(segmented):
+    scp, seg, wav = segmented
+    rate, array = kaldi.load_wav_scp(scp)["rec1"]
+    assert rate == 16000 and np.array_equal(array, wav)
+    assert np.array_equal(kaldi.load_wav_scp(scp, segments=seg)["utt_a"][1], wav[1600:3200])
+
+
+def test_segments_reports_a_recording_missing_from_the_scp(tmp_path, wav):
+    scp = str(tmp_path / "w.scp")
+    seg = tmp_path / "segments"
+    kaldi.save_ark(str(tmp_path / "w.ark"), {"rec1": (16000, wav)}, scp=scp)
+    seg.write_text("utt_a nope 0.0 0.1\n")
+    with pytest.raises(kaldi.ReadError, match="nope"):
+        kaldi.load_scp(scp, segments=seg.as_posix())["utt_a"]
+
+
+def test_segments_on_a_plain_array_is_rejected(tmp_path, feats):
+    scp = str(tmp_path / "f.scp")
+    seg = tmp_path / "segments"
+    kaldi.save_ark(str(tmp_path / "f.ark"), {"rec1": feats}, scp=scp)
+    seg.write_text("utt_a rec1 0.0 0.1\n")
+    with pytest.raises(kaldi.ReadError, match="audio entries"):
+        kaldi.load_scp(scp, segments=seg.as_posix())["utt_a"]
+
+
+def test_load_mat_fd_dict_reuses_one_handle(tmp_path, feats):
+    ark = str(tmp_path / "a.ark")
+    scp = str(tmp_path / "a.scp")
+    kaldi.save_ark(ark, {"u{}".format(i): feats[: i + 1] for i in range(4)}, scp=scp)
+    names = dict(line.split(None, 1) for line in open(scp).read().splitlines())
+
+    fds = {}
+    for _ in range(3):
+        for key, name in names.items():
+            got = kaldi.load_mat(name, fd_dict=fds)
+            assert np.array_equal(got, feats[: int(key[1]) + 1])
+    assert list(fds) == [ark], "one archive should mean one handle"
+    for fd in fds.values():
+        fd.close()
+
+
+def test_parse_specifier_reports_every_flag():
+    assert kaldi.parse_specifier("ark:a.ark") == {
+        "ark": "a.ark",
+        "scp": None,
+        "t": False,
+        "o": False,
+        "p": False,
+        "f": False,
+        "s": False,
+        "cs": False,
+    }
+    both = kaldi.parse_specifier("ark,scp:a.ark,b.scp")
+    assert (both["ark"], both["scp"]) == ("a.ark", "b.scp")
+    assert kaldi.parse_specifier("scp:a.scp")["ark"] is None
+    assert kaldi.parse_specifier("ark,t:a.txt")["t"] is True
+    assert kaldi.parse_specifier("ark,f:a.ark")["f"] is True
+
+
+def test_parse_specifier_errors():
+    with pytest.raises(ValueError, match="Invalid specifier"):
+        kaldi.parse_specifier("a.ark")
+    with pytest.raises(ValueError, match="must contain"):
+        kaldi.parse_specifier("t:a.ark")
+    with pytest.raises(ValueError, match="file"):
+        kaldi.parse_specifier("ark,scp:a.ark")
