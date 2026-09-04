@@ -325,43 +325,97 @@ def load_ark(file_or_fd, endian="<", return_position=False):
             fd.close()
 
 
-def load_mat(name, endian="<"):
+def load_mat(name, endian="<", fd_dict=None):
     """Load a single object named by a Kaldi extended filename.
 
     ``name`` may be ``file.ark:1234``, a plain path holding one object, or a
     pipe such as ``gunzip -c foo.gz |``.
+
+    ``fd_dict`` is a caller-owned ``{path: file}`` cache. Passing the same one
+    across calls keeps each archive open, which is worth it when reading many
+    entries out of a few arks; the caller closes them.
     """
     path, offset = parse_extended_filename(name)
+    if fd_dict is not None and offset is not None and isinstance(path, str):
+        fd = fd_dict.get(path)
+        if fd is None:
+            fd = fd_dict[path] = open_like_kaldi(path, "rb")
+        fd.seek(offset)
+        return read_object(fd, endian)
+
     with open_like_kaldi(path, "rb") as fd:
         if offset is not None:
             fd.seek(offset)
         return read_object(fd, endian)
 
 
-def load_scp_lines(path):
-    """Yield ``(key, extended_filename)`` for each line of an scp file."""
+def load_scp_lines(path, separator=None):
+    """Yield ``(key, extended_filename)`` for each line of an scp file.
+
+    ``separator`` splits the key from the file; the default splits on the first
+    run of whitespace, which is what Kaldi writes. Pass one explicitly for an
+    scp whose keys may themselves contain spaces.
+    """
     with open_like_kaldi(path, "r") as f:
         for lineno, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            parts = line.split(None, 1)
+            parts = line.split(separator, 1) if separator else line.split(None, 1)
             if len(parts) != 2:
                 raise ReadError(
                     "{}:{}: expected '<key> <file>', got {!r}".format(path, lineno, line)
                 )
-            yield parts[0], parts[1]
+            yield parts[0].strip(), parts[1].strip()
+
+
+def load_segments(path):
+    """Parse a Kaldi ``segments`` file into ``(utt, rec, start, end)`` tuples."""
+    segments = []
+    with open_like_kaldi(path, "r") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            fields = line.split()
+            if len(fields) != 4:
+                raise ReadError(
+                    "{}:{}: expected '<utt> <rec> <start> <end>', got "
+                    "{!r}".format(path, lineno, line)
+                )
+            utt, rec, start, end = fields
+            segments.append((utt, rec, float(start), float(end)))
+    return segments
+
+
+def slice_segment(value, start, end):
+    """Cut ``[start, end)`` seconds out of an audio entry.
+
+    A *negative* ``end`` is Kaldi's "to the end of the recording" sentinel,
+    written as ``-1``; passing it through as a slice bound would index from the
+    end instead and silently drop audio. An ``end`` of exactly ``0`` is not
+    that sentinel -- Kaldi's ``extract-segments`` rejects such a line as an
+    invalid segment -- and yields the empty slice ordinary indexing gives.
+    """
+    if not isinstance(value, tuple):
+        raise ReadError(
+            "segments can only be applied to audio entries, but this one is a " "plain array"
+        )
+    rate, array = value
+    begin = int(start * rate)
+    stop = len(array) if end < 0 else int(end * rate)
+    return rate, array[begin:stop]
 
 
 class LazyLoader(collections.abc.Mapping):
     """Dict-like view over an scp file; objects are read on ``__getitem__``."""
 
-    def __init__(self, path, endian="<", max_cache_fd=0):
+    def __init__(self, path, endian="<", max_cache_fd=0, separator=None):
         self._path = path
         self._endian = endian
         self._max_cache_fd = max_cache_fd
         self._cache = collections.OrderedDict()
-        self._dict = collections.OrderedDict(load_scp_lines(path))
+        self._dict = collections.OrderedDict(load_scp_lines(path, separator))
 
     def __repr__(self):
         return "{}({!r})".format(type(self).__name__, self._path)
@@ -411,15 +465,90 @@ class LazyLoader(collections.abc.Mapping):
             pass
 
 
-def load_scp(path, endian="<", max_cache_fd=0):
-    """Return a lazy mapping from utterance id to array for an scp file."""
-    return LazyLoader(path, endian=endian, max_cache_fd=max_cache_fd)
+class SegmentedLoader(collections.abc.Mapping):
+    """Dict-like view keyed by the utterances of a ``segments`` file.
+
+    Each value is the ``(rate, array)`` slice of the recording the segment
+    names. Recordings are decoded on demand and the most recent one is kept,
+    so reading a segments file in its own order costs one decode per recording
+    rather than one per segment.
+    """
+
+    def __init__(self, path, segments, endian="<", separator=None):
+        self._index = dict(load_scp_lines(path, separator))
+        self._dict = collections.OrderedDict(
+            (utt, (rec, start, end)) for utt, rec, start, end in load_segments(segments)
+        )
+        self._endian = endian
+        self._cached_rec = None
+        self._cached = None
+
+    def __len__(self):
+        return len(self._dict)
+
+    def __iter__(self):
+        return iter(self._dict)
+
+    def __contains__(self, key):
+        return key in self._dict
+
+    def keys(self):
+        return self._dict.keys()
+
+    def __getitem__(self, key):
+        rec, start, end = self._dict[key]
+        if rec != self._cached_rec:
+            if rec not in self._index:
+                raise ReadError(
+                    "Recording {!r} required by segment {!r} is not in the " "scp".format(rec, key)
+                )
+            self._cached = load_mat(self._index[rec], self._endian)
+            self._cached_rec = rec
+        return slice_segment(self._cached, start, end)
 
 
-def load_scp_sequential(path, endian="<"):
-    """Iterate ``(key, object)`` over an scp file in file order."""
-    for key, name in load_scp_lines(path):
-        yield key, load_mat(name, endian)
+def load_scp(fname, endian="<", separator=None, segments=None, max_cache_fd=0):
+    """Return a lazy mapping from utterance id to array for an scp file.
+
+    With ``segments`` the mapping is keyed by the segments file's utterances
+    instead, and each value is a slice of the recording it names.
+    """
+    if segments is not None:
+        return SegmentedLoader(fname, segments, endian=endian, separator=separator)
+    return LazyLoader(fname, endian=endian, max_cache_fd=max_cache_fd, separator=separator)
+
+
+def load_wav_scp(fname, segments=None, separator=None, endian="<"):
+    """``load_scp`` for an scp of audio; every value is ``(rate, array)``.
+
+    Provided for compatibility only. :func:`load_scp` already returns
+    ``(rate, array)`` for audio entries, so there is nothing this adds;
+    ``kaldiio`` deprecated its own copy for the same reason.
+    """
+    return load_scp(fname, endian=endian, separator=separator, segments=segments)
+
+
+def load_scp_sequential(fname, endian="<", separator=None, segments=None):
+    """Iterate ``(key, object)`` over an scp file in file order.
+
+    With ``segments`` the iteration follows the segments file instead, and each
+    recording is decoded once for as long as consecutive segments share it.
+    """
+    if segments is None:
+        for key, name in load_scp_lines(fname, separator):
+            yield key, load_mat(name, endian)
+        return
+
+    index = dict(load_scp_lines(fname, separator))
+    cached_rec, cached = None, None
+    for utt, rec, start, end in load_segments(segments):
+        if rec != cached_rec:
+            if rec not in index:
+                raise ReadError(
+                    "Recording {!r} required by segment {!r} is not in the " "scp".format(rec, utt)
+                )
+            cached, cached_rec = load_mat(index[rec], endian), rec
+        yield utt, slice_segment(cached, start, end)
 
 
 # --------------------------------------------------------------------------

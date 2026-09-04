@@ -131,3 +131,97 @@ def test_segments_match(tmp_path, wav):
     for (_, (r1, a1)), (_, (r2, a2)) in zip(mine, reference):
         assert r1 == r2
         assert np.array_equal(a1, a2)
+
+
+@pytest.fixture
+def recordings(tmp_path, wav):
+    scp = str(tmp_path / "w.scp")
+    seg = tmp_path / "segments"
+    kaldi.save_ark(
+        str(tmp_path / "w.ark"),
+        {"rec1": (16000, wav), "rec2": (16000, wav[::-1].copy())},
+        scp=scp,
+    )
+    # -1 is Kaldi's "to the end" sentinel; 0 is not, and gives an empty slice.
+    seg.write_text("utt_a rec1 0.05 0.1\nutt_b rec2 0.1 -1\nutt_c rec1 0.05 0\n")
+    return scp, str(seg)
+
+
+def _same(a, b):
+    if isinstance(a, tuple) != isinstance(b, tuple):
+        return False
+    if isinstance(a, tuple):
+        return a[0] == b[0] and np.array_equal(a[1], b[1])
+    return np.array_equal(a, b)
+
+
+def test_load_scp_with_segments_matches(recordings):
+    scp, seg = recordings
+    mine = kaldi.load_scp(scp, segments=seg)
+    reference = kaldiio.load_scp(scp, segments=seg)
+    assert list(mine) == list(reference)
+    assert all(_same(mine[k], reference[k]) for k in reference)
+
+
+def test_load_scp_sequential_with_segments_matches(recordings):
+    scp, seg = recordings
+    mine = list(kaldi.load_scp_sequential(scp, segments=seg))
+    reference = list(kaldiio.load_scp_sequential(scp, segments=seg))
+    assert [k for k, _ in mine] == [k for k, _ in reference]
+    assert all(_same(a, b) for (_, a), (_, b) in zip(mine, reference))
+
+
+def test_load_wav_scp_matches(recordings):
+    scp, seg = recordings
+    assert _same(kaldi.load_wav_scp(scp)["rec1"], kaldiio.load_wav_scp(scp)["rec1"])
+    assert _same(
+        kaldi.load_wav_scp(scp, segments=seg)["utt_a"],
+        kaldiio.load_wav_scp(scp, segments=seg)["utt_a"],
+    )
+
+
+@pytest.mark.parametrize(
+    "specifier",
+    [
+        "ark:a.ark",
+        "scp:a.scp",
+        "ark,scp:a.ark,b.scp",
+        "ark,t:a.txt",
+        "ark,scp,t:a.ark,b.scp",
+        "ark,f:a.ark",
+    ],
+)
+def test_parse_specifier_matches(specifier):
+    assert kaldi.parse_specifier(specifier) == kaldiio.parse_specifier(specifier)
+
+
+def test_separator_matches(tmp_path, feats):
+    scp = str(tmp_path / "a.scp")
+    kaldi.save_ark(str(tmp_path / "a.ark"), {"u1": feats}, scp=scp)
+    tabbed = tmp_path / "tab.scp"
+    tabbed.write_text(open(scp).read().replace(" ", "\t", 1))
+    assert _same(
+        kaldi.load_scp(str(tabbed), separator="\t")["u1"],
+        kaldiio.load_scp(str(tabbed), separator="\t")["u1"],
+    )
+
+
+def test_load_mat_fd_dict_matches(tmp_path, feats):
+    scp = str(tmp_path / "a.scp")
+    kaldi.save_ark(str(tmp_path / "a.ark"), {"u1": feats}, scp=scp)
+    name = open(scp).read().split()[1]
+    mine, reference = {}, {}
+    assert _same(kaldi.load_mat(name, fd_dict=mine), kaldiio.load_mat(name, fd_dict=reference))
+    assert sorted(mine) == sorted(reference) and len(mine) == 1
+
+    # A second read must reuse that handle, not open another one under the same
+    # key -- which would leak the first while leaving the dict the same size.
+    opened = next(iter(mine.values()))
+    kaldi.load_mat(name, fd_dict=mine)
+    assert next(iter(mine.values())) is opened
+
+    for fd in mine.values():
+        fd.close()
+    for fd in reference.values():
+        fd.close()
+    assert opened.closed
