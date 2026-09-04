@@ -985,3 +985,29 @@ def test_parse_specifier_errors():
         kaldi.parse_specifier("t:a.ark")
     with pytest.raises(ValueError, match="file"):
         kaldi.parse_specifier("ark,scp:a.ark")
+
+
+@pytest.mark.parametrize("specifier", ["ark,x:a.ark", "ark,ns:a.ark", "ark,bg:a.ark"])
+def test_parse_specifier_rejects_unknown_options(specifier):
+    with pytest.raises(ValueError, match="Unsupported"):
+        kaldi.parse_specifier(specifier)
+
+
+@pytest.mark.parametrize(
+    "specifier",
+    ["ark,ark:a.ark,b.ark", "scp,scp:a.scp,b.scp", "ark,scp,scp:a.ark,b.scp,c.scp"],
+)
+def test_parse_specifier_rejects_a_repeated_file_option(specifier):
+    """Keeping only the last would drop the other file silently."""
+    with pytest.raises(ValueError, match="more than once"):
+        kaldi.parse_specifier(specifier)
+
+
+def test_parse_specifier_tolerates_a_repeated_flag():
+    assert kaldi.parse_specifier("ark,t,t:a.txt")["t"] is True
+
+
+@pytest.mark.parametrize("wspecifier", ["ark,ark:a.ark,b.ark", "ark,scp,scp:a.ark,b.scp,c.scp"])
+def test_parse_wspecifier_rejects_a_repeated_file_option(wspecifier):
+    with pytest.raises(ValueError, match="more than once"):
+        kaldi.parse_wspecifier(wspecifier)

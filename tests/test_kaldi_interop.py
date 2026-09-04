@@ -212,7 +212,16 @@ def test_load_mat_fd_dict_matches(tmp_path, feats):
     name = open(scp).read().split()[1]
     mine, reference = {}, {}
     assert _same(kaldi.load_mat(name, fd_dict=mine), kaldiio.load_mat(name, fd_dict=reference))
-    kaldi.load_mat(name, fd_dict=mine)
     assert sorted(mine) == sorted(reference) and len(mine) == 1
+
+    # A second read must reuse that handle, not open another one under the same
+    # key -- which would leak the first while leaving the dict the same size.
+    opened = next(iter(mine.values()))
+    kaldi.load_mat(name, fd_dict=mine)
+    assert next(iter(mine.values())) is opened
+
     for fd in mine.values():
         fd.close()
+    for fd in reference.values():
+        fd.close()
+    assert opened.closed

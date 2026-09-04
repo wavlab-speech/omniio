@@ -54,15 +54,19 @@ over code with comments, docstrings and blank lines stripped:
 | | |
 |---|---|
 | Highest similarity of any file pair | **10.6 %** |
-| Identical non-trivial lines | **46 of 982 (4.7 %)** |
-| Shared internal helper names | **0** (`kaldiio` has 15, omniio has 32) |
-| Identical comments or docstrings | **0** (of 148 and 158) |
-| Code lines | 1847 vs 982 — the same job in about half |
+| Identical non-trivial lines | **55 of 1075 (5.1 %)** |
+| Shared internal helper names | **0** (`kaldiio` has 15, omniio has 33) |
+| Identical comments or docstrings | **0** (of 148 and 194) |
+| Code lines | 1847 vs 1075 — the same job in well under half |
+| Similarity over the whole tree | **3.7 %** |
+
+Produced by the script at the end of this file, which prints exactly these
+rows; re-run it after any change here rather than trusting the numbers above.
 
 Zero overlap in internal names is the load-bearing number. Copied code keeps
 its private helper names; there would be no reason to rename all 32.
 
-The 46 identical lines fall into four groups, none of which is protectable
+The identical lines fall into four groups, none of which is protectable
 expression:
 
 1. **Public API signatures**, such as the parameter list of `save_ark`. These
@@ -90,19 +94,94 @@ Their contents were written from the sources above.
 
 ## Reproducing the comparison
 
+Run from the repository root, with `kaldiio` installed:
+
 ```python
-import ast, difflib, itertools, os, pathlib, re, kaldiio
+"""Reproduce every row of the evidence table in PROVENANCE.md."""
 
-def code_lines(directory):
-    """Code only: no docstrings, comments or blanks."""
-    for p in sorted(pathlib.Path(directory).glob("*.py")):
-        src = re.sub(r'("""|\'\'\')(?:.|\n)*?\1', "", p.read_text())
-        for line in src.splitlines():
-            line = re.sub(r"#.*$", "", line).strip()
-            if line:
-                yield line
+import ast
+import difflib
+import itertools
+import os
+import pathlib
+import re
 
-a = list(code_lines(os.path.dirname(kaldiio.__file__)))
-b = list(code_lines("omniio/tools/kaldi"))
-print("similarity:", difflib.SequenceMatcher(None, a, b).ratio())
+import kaldiio
+
+THEIRS = pathlib.Path(os.path.dirname(kaldiio.__file__))
+OURS = pathlib.Path("omniio/tools/kaldi")
+TRIVIAL = re.compile(r"^(import |from |return$|else:|try:|pass$|continue$|break$|\)|\]|\}|@)")
+
+
+def code_lines(path):
+    """Code only: docstrings, comments and blank lines removed."""
+    src = re.sub(r'("""|\'\'\')(?:.|\n)*?\1', "", path.read_text())
+    for line in src.splitlines():
+        line = re.sub(r"#.*$", "", line).strip()
+        if line:
+            yield line
+
+
+def per_file(directory):
+    return {p.name: list(code_lines(p)) for p in sorted(directory.glob("*.py"))}
+
+
+def helper_names(directory, private=True):
+    found = set()
+    for p in directory.glob("*.py"):
+        for node in ast.walk(ast.parse(p.read_text())):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name.startswith("_") == private and not node.name.startswith("__"):
+                    found.add(node.name)
+    return found
+
+
+def prose(directory):
+    """Comments and docstring lines long enough to be more than a fragment."""
+    out = []
+    for p in directory.glob("*.py"):
+        src = p.read_text()
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                doc = ast.get_docstring(node)
+                if doc:
+                    out += [ln.strip() for ln in doc.splitlines() if len(ln.strip()) > 25]
+        out += [m.group(1).strip() for m in re.finditer(r"#\s*(.+)", src) if len(m.group(1).strip()) > 25]
+    return out
+
+
+theirs, ours = per_file(THEIRS), per_file(OURS)
+their_all = list(itertools.chain.from_iterable(theirs.values()))
+our_all = list(itertools.chain.from_iterable(ours.values()))
+
+best = max(
+    (difflib.SequenceMatcher(None, a, b).ratio(), an, bn)
+    for an, a in theirs.items()
+    for bn, b in ours.items()
+)
+identical = {
+    line
+    for line in set(their_all) & set(our_all)
+    if not TRIVIAL.match(line) and len(line) > 12
+}
+their_priv, our_priv = helper_names(THEIRS), helper_names(OURS)
+their_prose, our_prose = prose(THEIRS), prose(OURS)
+
+print(f"highest file-pair similarity   {best[0]:.1%}  ({best[1]} vs {best[2]})")
+print(f"identical non-trivial lines    {len(identical)} of {len(our_all)} ({len(identical)/len(our_all):.1%})")
+print(f"shared internal helper names   {len(their_priv & our_priv)}  (theirs {len(their_priv)}, ours {len(our_priv)})")
+print(f"identical comments/docstrings  {len(set(their_prose) & set(our_prose))}  (theirs {len(their_prose)}, ours {len(our_prose)})")
+print(f"code lines                     {len(their_all)} vs {len(our_all)}")
+print(f"whole-tree similarity          {difflib.SequenceMatcher(None, their_all, our_all).ratio():.1%}")
+```
+
+Output at the time of writing:
+
+```
+highest file-pair similarity   10.6%  (compression_header.py vs compression.py)
+identical non-trivial lines    55 of 1075 (5.1%)
+shared internal helper names   0  (theirs 15, ours 33)
+identical comments/docstrings  0  (theirs 148, ours 194)
+code lines                     1847 vs 1075
+whole-tree similarity          3.7%
 ```
