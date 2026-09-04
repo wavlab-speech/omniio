@@ -779,9 +779,10 @@ def test_xvector_from_extract_spk_embed(tmp_path, xvectors):
     extractor's leading axis and lands as a (1, D) matrix."""
     utt_ark = str(tmp_path / "xvector.ark")
     spk_ark = str(tmp_path / "spk_xvector.ark")
-    with kaldi.WriteHelper("ark,scp:{0},{0}.scp".format(utt_ark)) as utt, kaldi.WriteHelper(
-        "ark,scp:{0},{0}.scp".format(spk_ark)
-    ) as spk:
+    with (
+        kaldi.WriteHelper("ark,scp:{0},{0}.scp".format(utt_ark)) as utt,
+        kaldi.WriteHelper("ark,scp:{0},{0}.scp".format(spk_ark)) as spk,
+    ):
         for key, vec in xvectors.items():
             utt[key] = np.squeeze(vec)
         spk["spk1"] = np.mean(np.stack([v[None, :] for v in xvectors.values()], 0), 0)

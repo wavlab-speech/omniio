@@ -10,7 +10,7 @@ name = "omniio"
 version = "0.1.0"
 description = "Efficient multimedia I/O for binary archive blobs"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"  # what CI tests; 3.8 and 3.9 are end-of-life
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [
@@ -25,11 +25,10 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Multimedia :: Video",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -76,7 +75,10 @@ packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blo
 
 [tool.black]
 line-length = 100
-target-version = ["py38", "py39", "py310", "py311", "py312"]
+# The minimum supported version is all black needs: it decides which syntax
+# it may emit, and listing newer ones only makes its AST check complain when
+# it runs on an older interpreter than the newest listed.
+target-version = ["py310"]
 include = '\.pyi?$'
 exclude = '''
 /(
@@ -93,7 +95,7 @@ line_length = 100
 skip_gitignore = true
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
