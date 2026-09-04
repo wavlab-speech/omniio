@@ -84,12 +84,13 @@ reviews:
         Check that a test asserts the behavior under change rather than being a
         smoke test, and that it needs no network access. Tests that depend on
         an optional package must skip cleanly via importorskip.
-    - path: '{pyproject.toml,setup.py}'
+    - path: 'pyproject.toml'
       instructions: >-
-        Packaging metadata. Both files currently declare dependencies, so a new
-        or changed requirement must be applied to both or the drift will ship;
-        see issue #3. Every module imported at import time must appear in the
-        dependency list, and any new subpackage must be added to the packages
-        list in pyproject.toml or it will be missing from the wheel.
+        Packaging metadata, and the only place that declares it -- setup.py was
+        removed because the two had drifted. Every module imported at import
+        time must appear in the dependency list, and any new subpackage must be
+        added to the packages list or it will be missing from the wheel. The
+        version here is what a release tag is checked against, so bumping one
+        without the other fails the publish workflow.
 chat:
   art: false

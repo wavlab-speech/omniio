@@ -1,0 +1,110 @@
+name: publish
+
+# Uploads to PyPI with Trusted Publishing, so no API token is stored here.
+#
+# One-time setup, both of which need a maintainer and cannot be done from a
+# pull request:
+#   1. On PyPI (and TestPyPI), add a trusted publisher for this repository:
+#      owner wavlab-speech, repository omniio, workflow publish.yml,
+#      environment pypi (respectively testpypi).
+#   2. In this repository's settings, create the environments `pypi` and
+#      `testpypi`. Protection rules on `pypi` are worth adding: the id-token
+#      permission below is what authorises the upload.
+#
+# Publishing a GitHub Release uploads to PyPI. Running the workflow by hand
+# uploads to TestPyPI, which is the way to rehearse the first upload.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+
+      # A release tag that does not match the version in pyproject.toml would
+      # otherwise upload the previous version under a new tag, silently.
+      - name: Tag must match the declared version
+        if: github.event_name == 'release'
+        run: |
+          python - <<'PY'
+          import os, sys, tomllib
+          declared = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["TAG"].lstrip("v")
+          if tag != declared:
+              sys.exit(
+                  "Release tag {!r} does not match pyproject version {!r}. "
+                  "Bump the version, or retag.".format(tag, declared)
+              )
+          print("tag and version agree:", declared)
+          PY
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+
+      # The installed wheel, not the source tree: this is what users get, and
+      # the import aliases in omniio/__init__.py resolve through the package
+      # directory rather than through the checkout.
+      - name: Smoke-test the built wheel
+        run: |
+          python -m venv /tmp/check
+          /tmp/check/bin/pip install dist/*.whl
+          cd /tmp && /tmp/check/bin/python -c "
+          import importlib
+          from omniio import kaldi
+          from omniio.kaldi import ReadHelper
+          import omniio.blob.blob, omniio.interface
+          assert importlib.import_module('omniio.kaldi.matio') is importlib.import_module('omniio.tools.kaldi.matio')
+          print('ok:', kaldi.__name__, ReadHelper.__name__)
+          "
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+
+  testpypi:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
