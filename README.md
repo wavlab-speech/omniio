@@ -1,13 +1,14 @@
 # Omni-IO
 
-Efficient Python library for reading and writing multimedia data (audio, video, text) from binary archive blobs with support for both local and remote HTTP range requests.
+Efficient Python library for reading and writing multimedia data (audio, video, text, images, MIDI) from binary archive blobs with support for both local and remote HTTP range requests.
 
 ## Features
 
-- **Multi-format support**: Audio (FLAC, WAV, WebM/Opus), Video (MP4), Text (zstandard compressed)
+- **Multi-format support**: Audio (FLAC, WAV, WebM/Opus), Video (MP4), Text (zstandard compressed), Images (PNG/JPEG), MIDI (Standard MIDI Files, optionally zstd-compressed)
 - **Local and remote access**: Seamlessly read from local files or remote URLs using HTTP range requests
 - **Efficient storage**: Binary blob archives with PyArrow/Parquet metadata indexing
-- **Frame-level slicing**: Extract specific time ranges from audio/video without loading entire files
+- **Frame-level slicing**: Extract specific time ranges from audio/video/MIDI without loading entire files
+- **MIDI synthesis**: Render a MIDI entry (or a time window of it) to a waveform through FluidSynth
 - **Parallel processing**: Multi-process append operations for fast archive creation
 - **Streaming operations**: Memory-efficient handling of large multimedia files
 
@@ -89,6 +90,46 @@ result = text_read_local(
 print(result.text)
 ```
 
+
+#### MIDI
+
+```python
+from omniio.interface import midi_read
+
+# Read a MIDI entry; optionally restrict it to a time window (seconds, like audio)
+result = midi_read(
+    archive_path="/path/to/archive.bin",
+    start_offset=1024,
+    file_size=5000,
+    start_time=5.0,   # optional
+    end_time=10.0,    # optional
+)
+
+result.midi        # pretty_midi.PrettyMIDI, times re-zeroed to the window
+result.notes       # structured array: onset, offset, pitch, velocity, program, is_drum, instrument
+result.duration    # 5.0
+result.to_bytes()  # the window as a Standard MIDI File; result.write("slice.mid") also works
+
+# Synthesize while reading: `array` is (frames, channels) float32 covering exactly `duration`
+result = midi_read(archive_path, start_offset, file_size, start_time=5.0, end_time=10.0,
+                   synthesize=True, sample_rate=24000)
+result.array.shape  # (120000, 1)
+```
+
+Notes that *sound* inside the window are kept and clipped to it (so a note held across
+`start_time` becomes a note starting at 0); pass `include_partial=False` to keep only notes
+whose onset lies inside. Sustain-pedal / pitch-bend state at `start_time` is carried in, so
+a synthesized window sounds as it would in the full file.
+
+`notes` is sorted by `(onset, is_drum, program, pitch)`, a deterministic order for chords
+that a sequence model can be trained against.
+
+Synthesis uses FluidSynth when available (`pip install omniio[synth]` plus the
+`libfluidsynth` shared library, e.g. `conda install -c conda-forge fluidsynth`) with the GM
+SoundFont bundled in `pretty_midi`, or the one named by `$OMNIIO_SOUNDFONT` / the
+`soundfont=` argument. Without FluidSynth it falls back to additive sine tones
+(`backend="sine"`, drums silent).
+
 ### Writing to Archives
 
 #### Creating an Archive
@@ -109,7 +150,8 @@ blob.append(
     ids=["sample_001", "sample_002", "sample_003"],
     num_workers=4,
     target_format="flac",
-    target_bit_depth=16
+    target_bit_depth=16,
+    skip_errors=True,   # skip unreadable items instead of aborting; returns [(id, error), ...]
 )
 
 # View archive statistics
@@ -133,6 +175,28 @@ print(f"Channels: {metadata['channels']}")
 print(f"Sample rate: {metadata['sample_rate']}")
 print(f"Compressed size: {len(raw_bytes)} bytes")
 ```
+
+
+#### MIDI Archives
+
+```python
+from omniio.blob.blob import Blob
+from omniio.midi.common import midi_from_notes
+
+blob = Blob(archive_dir="./my_midi_archive", modality="midi")
+
+# Items may be .mid paths, raw Standard-MIDI-File bytes (e.g. a parquet binary column),
+# or pretty_midi.PrettyMIDI objects — mix freely.
+blob.append(
+    items=["a.mid", midi_bytes, midi_from_notes([(0.0, 0.5, 60), (0.5, 1.0, 64)])],
+    ids=["a", "b", "c"],
+    num_workers=4,
+    compress=True,   # zstd; the reader detects it
+)
+```
+
+Per-entry metadata: `duration`, `n_notes`, `n_instruments`, `programs`, `has_drums`,
+`resolution`, `min_pitch`, `max_pitch`, `format` (`midi` / `midi.zst`), sizes.
 
 #### Text Compression
 
@@ -256,6 +320,11 @@ The metadata table contains:
 - **Compression**: Zstandard (levels 1-22)
 - **Encoding**: UTF-8
 
+### MIDI
+- **Input**: Standard MIDI Files (`.mid`/`.midi`), raw SMF bytes, or `pretty_midi.PrettyMIDI`
+- **Storage**: native SMF bytes, optionally zstd-compressed
+- **Output**: `pretty_midi.PrettyMIDI` + a `(onset, offset, pitch, velocity, program, is_drum, instrument)` note table; optional synthesized waveform `(frames, channels)` float32
+
 ## Requirements
 
 - Python >= 3.8
@@ -265,6 +334,8 @@ The metadata table contains:
 - requests
 - zstandard
 - pyarrow
+- pretty_midi (MIDI)
+- pyfluidsynth + libfluidsynth (optional, MIDI synthesis)
 
 ## License
 

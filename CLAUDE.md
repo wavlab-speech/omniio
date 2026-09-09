@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`omniio` is a Python library for reading and writing multimedia data (audio, video, text) from binary archive blobs. It supports both local file access and remote HTTP range requests, enabling efficient random access to large multimedia archives.
+`omniio` is a Python library for reading and writing multimedia data (audio, video, text, images, MIDI) from binary archive blobs. It supports both local file access and remote HTTP range requests, enabling efficient random access to large multimedia archives.
 
 ## Architecture
 
@@ -12,9 +12,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The library is organized by data modality, with each supporting read and write operations:
 
-- **audio/**: Audio file I/O (FLAC, WAV, WebM/Opus)
-- **video/**: Video file I/O (MP4 with audio streams)
-- **text/**: Text file I/O (zstandard compressed)
+- **modalities/**: the per-modality packages below; imported through the short public paths (`omniio.audio`, `omniio.midi`, ...) via the aliases in `omniio/__init__.py`
+- **modalities/audio/**: Audio file I/O (FLAC, WAV, WebM/Opus)
+- **modalities/video/**: Video file I/O (MP4 with audio streams)
+- **modalities/text/**: Text file I/O (zstandard compressed)
+- **modalities/image/**: PNG/JPEG I/O
+- **modalities/midi/**: Standard MIDI File I/O, seconds-based time slicing, FluidSynth/sine synthesis
 - **blob/**: Binary archive management with PyArrow metadata
 - **tools/**: Format-specific helpers that are not omniio's own archive layout;
   currently **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`)
@@ -26,6 +29,7 @@ The library is organized by data modality, with each supporting read and write o
 - `AudioRead`: Extends with sample_rate and numpy array
 - `VideoRead`: Extends with fps, dimensions, and separate audio/video arrays
 - `TextRead`: Extends with text string
+- `MidiRead`: pretty_midi object + structured `notes` table for the window read, `duration`, and `sample_rate`/`array` when synthesized; `to_bytes()` / `write()` emit the window as a .mid
 
 **__init__.py**: Public import aliases. The source tree groups modules by what
 they are, but the stable import paths are the short ones (`omniio.kaldi`, not
@@ -41,6 +45,7 @@ the real directory.
 **interface.py**: Main entry points that route to local or remote readers
 - `audio_read()`: Checks if path exists, routes to local or remote implementation
 - `text_read()`: Same pattern for text data
+- `midi_read()`: Same pattern, plus `start_time`/`end_time`, `include_partial`, and `synthesize` (+ `sample_rate`, `channels`, `soundfont`, `backend`)
 
 **blob/blob.py**: Main `Blob` class for managing binary archives
 - Archive structure: `archive_dir/blob_0.bin`, `blob_1.bin`, ..., `metadata.parquet`
@@ -49,7 +54,7 @@ the real directory.
 - Manages multiple bin files with configurable max size (default 320MB)
 
 **blob/write.py**: Registry mapping modalities to their write functions
-- `modality_writer` dict: {'audio': audio_write, 'text': text_write}
+- `modality_writer` dict: {'audio': audio_write, 'text': text_write, 'video': video_write, 'image': image_write, 'midi': midi_write}
 
 ### Key Design Patterns
 
@@ -63,10 +68,15 @@ the real directory.
 - `b"\x1aE\xdf\xa3"` → WebM/Matroska
 - `b"OggS"` → OGG
 
-**Time-Based Slicing**: Audio and video readers support optional time-based extraction:
+**Time-Based Slicing**: Audio, video and MIDI readers support optional time-based extraction:
 - `start_time`, `end_time` parameters in seconds
 - Video also supports frame-based slicing with `start_frame`, `end_frame`
 - Frame indices take priority over time when both provided
+- MIDI keeps notes that sound inside the window, clips them to it, shifts times by `-start_time`, and carries controller/pitch-bend state at `start_time` in as `t=0` events (`omniio/modalities/midi/common.py:slice_midi`)
+
+**MIDI format detection**: `b"MThd"` → raw SMF, `b"\x28\xb5\x2f\xfd"` → zstd-wrapped SMF (`compress=True` at write time).
+
+**MIDI synthesis** (`omniio/modalities/midi/synth.py`): one cached `fluidsynth.Synth` per (soundfont, sample rate, gain, effects) per process; every instrument rendered through its own channel (drums on 9) in a single pass; reverb/chorus off by default; after each render voices are killed and the buffer drained to a 64-sample block boundary so output does not depend on prior renders. Waveform length is exactly `duration` seconds so it lines up with a paired audio slice.
 
 **Streaming Operations**: Archive operations avoid loading entire files into memory:
 - Blob append uses `shutil.copyfileobj()` for streaming concatenation
@@ -102,6 +112,22 @@ result = video_read_local(archive_path, start_offset, file_size,
 #   - fps, sample_rate, height, width
 ```
 
+### MIDI Reading
+
+```python
+from omniio.interface import midi_read
+
+result = midi_read(archive_path, start_offset, file_size,
+                   start_time=5.0, end_time=10.0,          # optional window (seconds)
+                   include_partial=True,                   # keep notes held across start_time
+                   synthesize=True, sample_rate=24000)     # optional waveform
+# result.midi   -> pretty_midi.PrettyMIDI (times relative to start_time)
+# result.notes  -> np.ndarray[NOTE_DTYPE]: onset, offset, pitch, velocity, program, is_drum, instrument
+#                  sorted by (onset, is_drum, program, pitch) — deterministic chord order
+# result.array  -> (frames, channels) float32 of exactly result.duration seconds
+# result.to_bytes() / result.write(path) -> the window as a Standard MIDI File
+```
+
 ### Text Reading
 
 ```python
@@ -127,6 +153,7 @@ blob.append(
     ids=["id1", "id2", ...],  # optional, defaults to sequential integers
     num_workers=4,  # 0 for single-process
     overwrite=False,  # True to skip duplicates
+    skip_errors=False,  # True: skip items whose writer raises (returned as [(id, error)], also blob.last_failed)
     target_format="flac",  # modality-specific kwargs
     target_bit_depth=16
 )
@@ -147,6 +174,24 @@ raw_bytes, metadata = audio_write(
     target_bit_depth=16    # 8, 16, 24, 32 (ignored for webm)
 )
 # Returns raw bytes and metadata dict with sample_rate, channels, samples, format, bit_depth
+```
+
+### MIDI Writing
+
+```python
+from omniio.midi.write import midi_write
+from omniio.midi.common import midi_from_notes, notes_from_midi
+
+raw_bytes, metadata = midi_write(
+    "song.mid",          # or raw SMF bytes, a file-like, or a pretty_midi.PrettyMIDI
+    "midi_001",
+    compress=False,      # True -> zstd-wrapped; reader auto-detects
+)
+# metadata: duration, n_notes, n_instruments, programs, has_drums, resolution,
+#           min_pitch, max_pitch, format ('midi' | 'midi.zst'), original_size, stored_size
+
+# Build MIDI from a note table (e.g. a transcription model's output):
+pm = midi_from_notes([(onset, offset, pitch, velocity, program, is_drum), ...])
 ```
 
 ### Text Writing
@@ -192,6 +237,8 @@ Key libraries used throughout the codebase:
 - **requests**: HTTP range requests for remote reading
 - **zstandard**: Text compression/decompression
 - **pyarrow/parquet**: Efficient metadata storage and operations
+- **pretty_midi** (+ mido): MIDI parsing/serialization; ships the TimGM6mb GM SoundFont
+- **pyfluidsynth** (optional, needs libfluidsynth): MIDI synthesis backend
 
 ## Common Implementation Notes
 
@@ -201,3 +248,5 @@ Key libraries used throughout the codebase:
 - Blob workers check for duplicate IDs before writing; set `overwrite=True` to skip
 - Archive byte offsets use [start_byte, end_byte) convention (end is exclusive)
 - Remote reads use HTTP 206 Partial Content with `Range` headers
+- `pretty_midi` is imported lazily inside `omniio/modalities/midi/` so the rest of the library works without it
+- Run tests with `python -m pytest tests -o addopts=""` when `pytest-cov` is not installed (pyproject's addopts require it)

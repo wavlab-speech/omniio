@@ -609,3 +609,40 @@ class TestBlobUtilities:
         )
 
         assert len(blob) == 1
+
+
+class TestBlobSkipErrors:
+    """`skip_errors`: a bad item must not take the rest of the batch down with it."""
+
+    def _items(self, temp_dir, sample_audio_wav):
+        wav_path, _, _ = sample_audio_wav
+        bad = temp_dir / "bad.wav"
+        bad.write_bytes(b"this is not audio")
+        return [str(wav_path), str(bad), str(wav_path), str(bad), str(wav_path)]
+
+    def test_default_raises_and_keeps_good_shards(self, temp_dir, sample_audio_wav):
+        blob = Blob(archive_dir=str(temp_dir / "strict"), modality="audio")
+        with pytest.raises(RuntimeError):
+            blob.append(items=self._items(temp_dir, sample_audio_wav),
+                        ids=list("abcde"), num_workers=0, target_format="wav")
+        assert blob.last_failed == []
+
+    @pytest.mark.parametrize("num_workers", [0, 2])
+    def test_skip_errors_writes_the_rest(self, temp_dir, sample_audio_wav, num_workers):
+        blob = Blob(archive_dir=str(temp_dir / f"skip{num_workers}"), modality="audio")
+        with pytest.warns(UserWarning, match="Skipped 2 item"):
+            failed = blob.append(items=self._items(temp_dir, sample_audio_wav),
+                                 ids=list("abcde"), num_workers=num_workers,
+                                 skip_errors=True, target_format="wav")
+        assert [i for i, _ in failed] == ["b", "d"]
+        assert all(msg for _, msg in failed)
+        assert blob.last_failed == failed
+        assert len(blob) == 3
+        assert sorted(blob.get_metadata().column("id").to_pylist()) == ["a", "c", "e"]
+
+    def test_no_failures_returns_empty(self, temp_dir, sample_audio_wav):
+        wav_path, _, _ = sample_audio_wav
+        blob = Blob(archive_dir=str(temp_dir / "clean"), modality="audio")
+        failed = blob.append(items=[str(wav_path)], ids=["a"], num_workers=0,
+                             skip_errors=True, target_format="wav")
+        assert failed == [] and blob.last_failed == [] and len(blob) == 1
