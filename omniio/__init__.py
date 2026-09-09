@@ -30,6 +30,7 @@ _ALIASES = {
     "omniio.text": "omniio.modalities.text",
     "omniio.image": "omniio.modalities.image",
     "omniio.midi": "omniio.modalities.midi",
+    "omniio.discrete": "omniio.modalities.discrete",
 }
 
 

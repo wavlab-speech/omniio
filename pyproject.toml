@@ -19,7 +19,7 @@ authors = [
 maintainers = [
     {name = "William Chen", email = "williamchen@cmu.edu"}
 ]
-keywords = ["multimedia", "audio", "video", "text", "midi", "archive", "blob", "io"]
+keywords = ["multimedia", "audio", "video", "text", "midi", "tokens", "archive", "blob", "io"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -76,7 +76,7 @@ Repository = "https://github.com/wavlab-speech/omniio"
 "Bug Tracker" = "https://github.com/wavlab-speech/omniio/issues"
 
 [tool.setuptools]
-packages = ["omniio", "omniio.modalities", "omniio.modalities.audio", "omniio.modalities.video", "omniio.modalities.text", "omniio.modalities.image", "omniio.modalities.midi", "omniio.blob", "omniio.tools", "omniio.tools.kaldi"]
+packages = ["omniio", "omniio.modalities", "omniio.modalities.audio", "omniio.modalities.video", "omniio.modalities.text", "omniio.modalities.image", "omniio.modalities.midi", "omniio.modalities.discrete", "omniio.blob", "omniio.tools", "omniio.tools.kaldi"]
 
 [tool.black]
 line-length = 100
