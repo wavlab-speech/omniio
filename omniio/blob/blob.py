@@ -31,7 +31,8 @@ def _worker_process(
     modality_kwargs: dict,
     max_bin_size: int,
     progress_file: Optional[str] = None,
-) -> Tuple[int, List[Tuple[str, str, int]]]:
+    skip_errors: bool = False,
+) -> Tuple[int, List[Tuple[str, str, int]], List[Tuple[str, str]]]:
     """
     Worker function that runs in a separate process.
     Writes items to one or more shard bin files in shard_dir, splitting into a
@@ -41,12 +42,16 @@ def _worker_process(
     Worker 0 optionally writes its per-item count to progress_file so the
     main process can approximate overall progress.
 
+    With ``skip_errors`` an item whose write_fn raises is logged and skipped instead of
+    aborting the worker (which would lose every item the worker had already written).
+
     Returns:
-        (worker_id, [(bin_path, meta_path, n_rows), ...])
+        (worker_id, [(bin_path, meta_path, n_rows), ...], [(item_id, error), ...])
     """
     import warnings
 
     write_fn = modality_writer[modality]
+    failed: List[Tuple[str, str]] = []
 
     def _make_paths(bid: int) -> Tuple[str, str]:
         bp = os.path.join(shard_dir, f"shard_{worker_id}_{bid}.bin")
@@ -73,7 +78,14 @@ def _worker_process(
                 )
                 continue
 
-            raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+            try:
+                raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+            except Exception as exc:
+                if not skip_errors:
+                    raise
+                failed.append((str(item_id), f"{type(exc).__name__}: {exc}"))
+                n_written += 1
+                continue
             n_bytes = len(raw_bytes)
 
             # Roll over to a new bin when the current one is non-empty and full
@@ -119,7 +131,7 @@ def _worker_process(
     elif os.path.exists(bin_path):
         os.remove(bin_path)
 
-    return worker_id, sub_results
+    return worker_id, sub_results, failed
 
 
 class Blob:
@@ -158,6 +170,8 @@ class Blob:
         self.data: Optional[pa.Table] = None
         if self.metadata_file.exists():
             self.data = self._read_metadata()
+        # (item_id, error) pairs skipped by the most recent append(skip_errors=True)
+        self.last_failed: List[Tuple[str, str]] = []
 
         if name is not None:
             self.name = name
@@ -281,6 +295,7 @@ class Blob:
         allow_duplicate_ids: bool = False,
         progress: bool = True,
         reshard: bool = False,
+        skip_errors: bool = False,
         **modality_kwargs,
     ):
         """
@@ -306,6 +321,17 @@ class Blob:
                          If False (default), each shard bin is simply moved into
                          the archive as its own blob file — much faster, at the
                          cost of producing more bin files.
+            skip_errors: If True, an item whose write_fn raises (corrupt file,
+                         unparsable bytes, ...) is skipped with a warning and the
+                         rest of the batch is written. If False (default), the first
+                         error aborts that worker and is re-raised after the other
+                         workers' shards have been merged. Skipped ids are returned
+                         and also recorded on `self.last_failed`.
+
+        Returns:
+            List of (item_id, error_message) for the items skipped. Empty unless
+            `skip_errors` is set.
+
             **modality_kwargs: Forwarded to the modality write_fn.
         """
         if ids is None:
@@ -331,6 +357,7 @@ class Blob:
         log_dir = self.archive_path.parent / "logs"
         log_dir.mkdir(exist_ok=True)
 
+        failed: List[Tuple[str, str]] = []
         try:
             # Each entry: (worker_id, [(bin_path, meta_path, n_rows), ...])
             completed_results: List[Tuple[int, List[Tuple[str, str, int]]]] = []
@@ -368,7 +395,14 @@ class Blob:
                                 )
                                 pbar.update(1)
                                 continue
-                            raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+                            try:
+                                raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+                            except Exception as exc:
+                                if not skip_errors:
+                                    raise
+                                failed.append((str(item_id), f"{type(exc).__name__}: {exc}"))
+                                pbar.update(1)
+                                continue
                             n_bytes = len(raw_bytes)
 
                             if cur_bin_size > 0 and cur_bin_size + n_bytes > self.max_bin_size:
@@ -444,13 +478,15 @@ class Blob:
                             existing_ids, allow_duplicate_ids, modality_kwargs,
                             self.max_bin_size,
                             progress_file if wid == 0 else None,
+                            skip_errors,
                         )
                         futures[fut] = wid
 
                     for fut in as_completed(futures):
                         try:
-                            result = fut.result()
-                            completed_results.append(result)
+                            wid, sub_results, w_failed = fut.result()
+                            completed_results.append((wid, sub_results))
+                            failed.extend(w_failed)
                         except Exception as exc:
                             if first_error is None:
                                 first_error = exc
@@ -480,6 +516,18 @@ class Blob:
 
         finally:
             shutil.rmtree(log_dir, ignore_errors=True)
+
+        failed.sort()
+        self.last_failed = failed
+        if failed:
+            import warnings as _warnings
+
+            preview = "; ".join(f"{i}: {e}" for i, e in failed[:5])
+            more = f" (+{len(failed) - 5} more)" if len(failed) > 5 else ""
+            _warnings.warn(
+                f"Skipped {len(failed)} item(s) that failed to write: {preview}{more}"
+            )
+        return failed
 
     # ------------------------------------------------------------------ #
     # Shard concatenation

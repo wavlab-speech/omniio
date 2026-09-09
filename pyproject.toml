@@ -19,7 +19,7 @@ authors = [
 maintainers = [
     {name = "William Chen", email = "williamchen@cmu.edu"}
 ]
-keywords = ["multimedia", "audio", "video", "text", "archive", "blob", "io"]
+keywords = ["multimedia", "audio", "video", "text", "midi", "archive", "blob", "io"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -45,9 +45,14 @@ dependencies = [
     # omniio/blob/blob.py imports it at module scope, so omniio.blob does not
     # import at all without it. See #3.
     "tqdm>=4.60.0",
+    # omniio/midi: Standard MIDI File parsing/serialization (imported lazily there)
+    "pretty_midi>=0.2.10",
 ]
 
 [project.optional-dependencies]
+synth = [
+    "pyfluidsynth>=1.3.0",   # MIDI synthesis; also needs libfluidsynth (conda install -c conda-forge fluidsynth)
+]
 test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -71,7 +76,7 @@ Repository = "https://github.com/wavlab-speech/omniio"
 "Bug Tracker" = "https://github.com/wavlab-speech/omniio/issues"
 
 [tool.setuptools]
-packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image", "omniio.tools", "omniio.tools.kaldi"]
+packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image", "omniio.midi", "omniio.tools", "omniio.tools.kaldi"]
 
 [tool.black]
 line-length = 100
