@@ -138,13 +138,24 @@ from omniio.interface import discrete_read
 # Codec agnostic: an entry is N integer streams, each with its own length, alphabet size
 # and optional rate; RVQ is N equal-length streams sharing one rate.
 r = discrete_read(archive_path, start_offset, file_size,
-                  streams=[0, 1],                  # optional: decode only these streams (e.g. the coarse codebooks)
+                  start_level=0, end_level=2,      # optional: a window of streams / RVQ levels [start, end)
+#                 streams=[0, 3],                  # ... or an explicit list of stream indices
                   start_frame=75, end_frame=188)   # optional: partial read in frames (elements)
 #                 start_time=1.0, end_time=2.5     # ... or in seconds through each stream's own rate
 r.array          # (n_streams, T) when the lengths agree; uint8/16/32 = narrowest dtype for the alphabet
 r.streams        # list of 1-D arrays (ragged lengths are fine); r.to_array(pad_value=-1) pads
-r.vocab_sizes, r.rates, r.lengths, r.stream_indices
+r.vocab_sizes, r.rates, r.lengths, r.stream_indices, r.frame_windows
+r.bytes_read     # the I/O actually done for this read (vs r.entry_size)
 ```
+
+Partial reads are true partial reads, not decode-then-slice: the reader fetches the
+216-byte header, then only the byte span of each requested stream window (frame windows map
+to a bit offset inside a stream) — locally via seek, remotely as one HTTP range request per
+span; a level window with no frame window is a single contiguous read because streams are
+stored back to back. For a 10-minute 8×75 Hz RVQ entry (450 KB), the first two codebooks
+read 25% of the bytes and a 3 s window reads 0.5%. Entries written with `compress=True`
+(zstd over the whole payload) are the exception: they read the entry once and window after
+decompressing.
 
 ### Writing to Archives
 

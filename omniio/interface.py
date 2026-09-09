@@ -156,28 +156,33 @@ def discrete_read(
     start_offset: int,
     file_size: int,
     streams: Optional[list] = None,
-    start_time: Optional[float] = None,
-    end_time: Optional[float] = None,
+    start_level: Optional[int] = None,
+    end_level: Optional[int] = None,
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
 ) -> DiscreteRead:
     """
     Read integer streams (VQ / RVQ codes, token ids) from an archive, local or remote.
+    Partial reads fetch only the bytes they need: a level window is one contiguous read,
+    a frame window is one small read per stream (zstd-wrapped entries read the payload).
 
     Args:
         archive_path: Path or URL to the archive bin file
         start_offset: Byte offset where the entry begins
         file_size:    Number of bytes for this entry
-        streams:      Stream indices to decode (default all), e.g. the first k codebooks
-        start_frame / end_frame: Window in elements (frames); wins over the time window
-        start_time / end_time:   Window in seconds through each stream's own rate
+        streams:      Explicit stream indices to decode (default all); or
+        start_level / end_level: window of stream (RVQ level) indices, [start, end)
+        start_frame / end_frame: window in elements (frames); wins over the time window
+        start_time / end_time:   window in seconds through each stream's own rate
 
     Returns:
         DiscreteRead with `streams` (list of 1-D arrays), `array` ((n, T) when regular),
-        `lengths`, `vocab_sizes`, `rates`
+        `lengths`, `vocab_sizes`, `rates`, `frame_windows`, `bytes_read`
     """
-    kwargs = dict(streams=streams, start_time=start_time, end_time=end_time,
-                  start_frame=start_frame, end_frame=end_frame)
+    kwargs = dict(streams=streams, start_level=start_level, end_level=end_level,
+                  start_frame=start_frame, end_frame=end_frame, start_time=start_time, end_time=end_time)
     if os.path.exists(archive_path):
         return discrete_read_local(archive_path, start_offset, file_size, **kwargs)
     return discrete_read_remote(archive_path, start_offset, file_size, **kwargs)

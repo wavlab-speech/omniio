@@ -139,3 +139,103 @@ def test_blob_append_and_public_import_path(tmp_path):
     assert omniio.discrete.write.discrete_write is real
     from omniio.blob.write import modality_writer
     assert modality_writer["discrete"] is real
+
+
+# ---- true partial reads: only the bytes of the requested streams / frames are fetched
+
+def _counting_reader(raw):
+    calls = []
+
+    def read(off, size):
+        size = min(size, len(raw) - off)
+        calls.append((off, size))
+        return raw[off: off + size]
+    return read, calls
+
+
+@pytest.mark.parametrize("bits", [3, 10, 13, 16, 17])
+def test_frame_window_unpacks_at_a_bit_offset_and_fetches_only_its_bytes(bits):
+    from omniio.modalities.discrete.common import HEADER_GUESS_STREAMS, decode_partial, header_size
+    rng = np.random.default_rng(bits)
+    codes = rng.integers(0, 1 << bits, size=(3, 1000))
+    raw, _ = discrete_write(codes, "x", vocab_size=1 << bits)
+    for lo, hi in [(0, 1000), (1, 2), (7, 8), (3, 999), (500, 500), (123, 456), (999, 1000)]:
+        read, calls = _counting_reader(raw)
+        infos, idx, arrays, windows, n_read = decode_partial(read, start_frame=lo, end_frame=hi)
+        assert idx == [0, 1, 2] and windows == [(lo, hi)] * 3
+        for k in range(3):
+            assert np.array_equal(arrays[k].astype(np.int64), codes[k, lo:hi])
+        # one header read + one read per stream, each just the window's byte span (a span
+        # that lies inside the header over-read is served from it, no extra I/O)
+        span = (hi * bits + 7) // 8 - (lo * bits) // 8 if hi > lo else 0
+        assert calls[0] == (0, header_size(HEADER_GUESS_STREAMS))
+        assert all(s == span for _, s in calls[1:]) and len(calls) <= 4
+        assert n_read <= header_size(HEADER_GUESS_STREAMS) + 3 * span
+        if span > header_size(HEADER_GUESS_STREAMS):          # nothing served from the over-read
+            assert n_read == header_size(HEADER_GUESS_STREAMS) + 3 * span
+
+
+def test_level_window_is_one_contiguous_read_and_matches_streams_list(tmp_path):
+    from omniio.modalities.discrete.common import HEADER_GUESS_STREAMS, decode_partial, header_size
+    rng = np.random.default_rng(5)
+    codes = rng.integers(0, 1024, size=(8, 750))
+    raw, _ = discrete_write(codes, "x", vocab_size=1024, rate=75.0)
+    per_stream = (750 * 10 + 7) // 8
+    read, calls = _counting_reader(raw)
+    infos, idx, arrays, windows, n_read = decode_partial(read, start_level=2, end_level=5)
+    assert idx == [2, 3, 4] and np.array_equal(np.stack(arrays), codes[2:5])
+    assert calls[1:] == [(header_size(8) + 2 * per_stream, 3 * per_stream)]     # one read
+    assert n_read == header_size(HEADER_GUESS_STREAMS) + 3 * per_stream
+    # the public reader: start_level/end_level == streams=range(...); bytes_read reported
+    path, [(off, size)] = _archive(tmp_path, [raw])
+    a = discrete_read(path, off, size, start_level=2, end_level=5)
+    b = discrete_read(path, off, size, streams=[2, 3, 4])
+    assert np.array_equal(a.array, b.array) and a.stream_indices == b.stream_indices == [2, 3, 4]
+    assert a.bytes_read == b.bytes_read == n_read and a.entry_size == size
+    assert a.frame_windows == [(0, 750)] * 3
+    # first k codebooks (the usual coarse-to-fine use) and open-ended windows
+    assert discrete_read(path, off, size, end_level=1).array.shape == (1, 750)
+    assert discrete_read(path, off, size, start_level=6).stream_indices == [6, 7]
+    assert discrete_read(path, off, size, start_level=6, end_level=100).stream_indices == [6, 7]
+    # combined with a time window: 3 small reads, decoded == full-then-slice
+    c = discrete_read(path, off, size, start_level=2, end_level=5, start_time=1.0, end_time=2.5)
+    assert c.frame_windows == [(75, 188)] * 3 and np.array_equal(c.array, codes[2:5, 75:188])
+    assert c.bytes_read == header_size(HEADER_GUESS_STREAMS) + 3 * ((188 * 10 + 7) // 8 - (75 * 10) // 8)
+    with pytest.raises(ValueError):
+        discrete_read(path, off, size, streams=[0], start_level=1)
+    with pytest.raises(IndexError):
+        discrete_read(path, off, size, streams=[8])
+
+
+def test_zstd_entries_read_the_payload_once_and_still_window(tmp_path):
+    rng = np.random.default_rng(6)
+    codes = rng.integers(0, 512, size=(4, 400))
+    raw, meta = discrete_write(codes, "x", vocab_size=512, rate=50.0, compress=True)
+    path, [(off, size)] = _archive(tmp_path, [raw])
+    r = discrete_read(path, off, size, start_level=1, end_level=3, start_frame=10, end_frame=33)
+    assert np.array_equal(r.array, codes[1:3, 10:33]) and r.bytes_read == size
+
+
+def test_remote_partial_reads_issue_one_range_request_per_fetched_span(tmp_path, monkeypatch):
+    from omniio.modalities.discrete import read as rmod
+    from omniio.modalities.discrete.common import HEADER_GUESS_STREAMS, header_size
+    rng = np.random.default_rng(7)
+    codes = rng.integers(0, 1024, size=(4, 750))
+    raw, _ = discrete_write(codes, "x", vocab_size=1024)
+    blob = b"pad" * 5 + raw + b"tail"
+    ranges = []
+
+    class _Resp:
+        def __init__(self, content): self.content = content
+        def raise_for_status(self): pass
+
+    def fake_get(url, headers):
+        a, b = map(int, headers["Range"][len("bytes="):].split("-"))
+        ranges.append((a, b))
+        return _Resp(blob[a: b + 1])
+    monkeypatch.setattr(rmod.requests, "get", fake_get)
+    r = rmod.discrete_read_remote("http://x/a.bin", 15, len(raw), start_level=1, end_level=3, start_frame=100, end_frame=200)
+    assert np.array_equal(r.array, codes[1:3, 100:200])
+    assert len(ranges) == 3 and ranges[0] == (15, 15 + header_size(HEADER_GUESS_STREAMS) - 1)   # header, then 2 stream spans
+    span = (200 * 10 + 7) // 8 - (100 * 10) // 8
+    assert all(b - a + 1 == span for a, b in ranges[1:])

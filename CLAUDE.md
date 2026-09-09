@@ -18,7 +18,7 @@ The library is organized by data modality, with each supporting read and write o
 - **modalities/text/**: Text file I/O (zstandard compressed)
 - **modalities/image/**: PNG/JPEG I/O
 - **modalities/midi/**: Standard MIDI File I/O, seconds-based time slicing, FluidSynth/sine synthesis
-- **modalities/discrete/**: codec-agnostic integer streams (VQ / RVQ codes, token ids): N streams with their own length / alphabet / rate, bit-packed at `ceil(log2(vocab))` bits, stream-major, optional zstd; `discrete_read(streams=..., start_frame/end_frame or start_time/end_time)`
+- **modalities/discrete/**: codec-agnostic integer streams (VQ / RVQ codes, token ids): N streams with their own length / alphabet / rate, bit-packed at `ceil(log2(vocab))` bits, stream-major, optional zstd; `discrete_read(streams=... or start_level/end_level, start_frame/end_frame or start_time/end_time)`; partial reads fetch only the needed byte ranges
 - **blob/**: Binary archive management with PyArrow metadata
 - **tools/**: Format-specific helpers that are not omniio's own archive layout;
   currently **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`)
@@ -75,7 +75,7 @@ the real directory.
 - Frame indices take priority over time when both provided
 - MIDI keeps notes that sound inside the window, clips them to it, shifts times by `-start_time`, and carries controller/pitch-bend state at `start_time` in as `t=0` events (`omniio/modalities/midi/common.py:slice_midi`)
 
-**Discrete byte layout** (`omniio/modalities/discrete/common.py`): `b"ODSQ"` magic, version, flags (bit0 = zstd payload), `n_streams`, then per stream `u32 length | u8 bits | u32 vocab | f32 rate`, then the bit-packed streams back to back (byte-aligned per stream, so `streams=[...]` decodes a subset). Widths 1-56 are packed; wider alphabets store as u64. Partial reads: frames (`start_frame`/`end_frame`, priority) or seconds through each stream's own rate (floor start, ceil end); ragged streams come back as a list, `to_array(pad_value)` pads. Bit-packing is the fixed-width optimum for near-uniform codes (1.25 B/token at 1024-way; zstd over uint16 is ~18% worse).
+**Discrete byte layout** (`omniio/modalities/discrete/common.py`): `b"ODSQ"` magic, version, flags (bit0 = zstd payload), `n_streams`, then per stream `u32 length | u8 bits | u32 vocab | f32 rate`, then the bit-packed streams back to back (byte-aligned per stream). Widths 1-56 are packed; wider alphabets store as u64. Partial reads are byte-range reads (`common.decode_partial` over a `read(offset, size)` accessor: header first, sized for 16 streams, then only each requested window's byte span; `unpack_bits(bit_offset=)` starts mid-byte; a `start_level`/`end_level` window with no frame window is one contiguous read; zstd entries read the payload once): stream selection by `streams=[...]` or the level window `[start_level, end_level)`; frames (`start_frame`/`end_frame`, priority) or seconds through each stream's own rate (floor start, ceil end); ragged streams come back as a list, `to_array(pad_value)` pads; `DiscreteRead.bytes_read` reports the I/O done. Bit-packing is the fixed-width optimum for near-uniform codes (1.25 B/token at 1024-way; zstd over uint16 is ~18% worse).
 
 **MIDI format detection**: `b"MThd"` → raw SMF, `b"\x28\xb5\x2f\xfd"` → zstd-wrapped SMF (`compress=True` at write time).
 
