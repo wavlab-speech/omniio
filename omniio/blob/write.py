@@ -3,6 +3,7 @@ from omniio.modalities.text.write import text_write
 from omniio.modalities.video.write import video_write
 from omniio.modalities.image.write import image_write
 from omniio.modalities.midi.write import midi_write
+from omniio.modalities.discrete.write import discrete_write
 
 modality_writer = {
     'audio': audio_write,
@@ -10,4 +11,5 @@ modality_writer = {
     'video': video_write,
     'image': image_write,
     'midi': midi_write,
+    'discrete': discrete_write,
 }
