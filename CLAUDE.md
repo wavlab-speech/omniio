@@ -18,6 +18,7 @@ The library is organized by data modality, with each supporting read and write o
 - **modalities/text/**: Text file I/O (zstandard compressed)
 - **modalities/image/**: PNG/JPEG I/O
 - **modalities/midi/**: Standard MIDI File I/O, seconds-based time slicing, FluidSynth/sine synthesis
+- **modalities/discrete/**: codec-agnostic integer streams (VQ / RVQ codes, token ids): N streams with their own length / alphabet / rate, bit-packed at `ceil(log2(vocab))` bits, stream-major, optional zstd; `discrete_read(streams=..., start_frame/end_frame or start_time/end_time)`
 - **blob/**: Binary archive management with PyArrow metadata
 - **tools/**: Format-specific helpers that are not omniio's own archive layout;
   currently **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`)
@@ -54,7 +55,7 @@ the real directory.
 - Manages multiple bin files with configurable max size (default 320MB)
 
 **blob/write.py**: Registry mapping modalities to their write functions
-- `modality_writer` dict: {'audio': audio_write, 'text': text_write, 'video': video_write, 'image': image_write, 'midi': midi_write}
+- `modality_writer` dict: {'audio': audio_write, 'text': text_write, 'video': video_write, 'image': image_write, 'midi': midi_write, 'discrete': discrete_write}
 
 ### Key Design Patterns
 
@@ -73,6 +74,8 @@ the real directory.
 - Video also supports frame-based slicing with `start_frame`, `end_frame`
 - Frame indices take priority over time when both provided
 - MIDI keeps notes that sound inside the window, clips them to it, shifts times by `-start_time`, and carries controller/pitch-bend state at `start_time` in as `t=0` events (`omniio/modalities/midi/common.py:slice_midi`)
+
+**Discrete byte layout** (`omniio/modalities/discrete/common.py`): `b"ODSQ"` magic, version, flags (bit0 = zstd payload), `n_streams`, then per stream `u32 length | u8 bits | u32 vocab | f32 rate`, then the bit-packed streams back to back (byte-aligned per stream, so `streams=[...]` decodes a subset). Widths 1-56 are packed; wider alphabets store as u64. Partial reads: frames (`start_frame`/`end_frame`, priority) or seconds through each stream's own rate (floor start, ceil end); ragged streams come back as a list, `to_array(pad_value)` pads. Bit-packing is the fixed-width optimum for near-uniform codes (1.25 B/token at 1024-way; zstd over uint16 is ~18% worse).
 
 **MIDI format detection**: `b"MThd"` → raw SMF, `b"\x28\xb5\x2f\xfd"` → zstd-wrapped SMF (`compress=True` at write time).
 
