@@ -24,8 +24,12 @@ import sys
 #: Public import path -> where the module actually lives.
 _ALIASES = {
     "omniio.kaldi": "omniio.tools.kaldi",
-    # e.g. when the modality packages move under omniio/modalities/:
-    #   "omniio.audio": "omniio.modalities.audio",
+    # the modality packages live under omniio/modalities/
+    "omniio.audio": "omniio.modalities.audio",
+    "omniio.video": "omniio.modalities.video",
+    "omniio.text": "omniio.modalities.text",
+    "omniio.image": "omniio.modalities.image",
+    "omniio.midi": "omniio.modalities.midi",
 }
 
 

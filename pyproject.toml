@@ -76,7 +76,7 @@ Repository = "https://github.com/wavlab-speech/omniio"
 "Bug Tracker" = "https://github.com/wavlab-speech/omniio/issues"
 
 [tool.setuptools]
-packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image", "omniio.midi", "omniio.tools", "omniio.tools.kaldi"]
+packages = ["omniio", "omniio.modalities", "omniio.modalities.audio", "omniio.modalities.video", "omniio.modalities.text", "omniio.modalities.image", "omniio.modalities.midi", "omniio.blob", "omniio.tools", "omniio.tools.kaldi"]
 
 [tool.black]
 line-length = 100

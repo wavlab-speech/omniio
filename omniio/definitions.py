@@ -37,7 +37,7 @@ class MidiRead(ArchiveRead):
     """A MIDI entry, optionally restricted to a time window and/or synthesized.
 
     `midi` is a pretty_midi.PrettyMIDI whose times are relative to `start_time`;
-    `notes` is a structured array (see omniio.midi.common.NOTE_DTYPE) with onset/offset
+    `notes` is a structured array (see omniio.modalities.midi.common.NOTE_DTYPE) with onset/offset
     in seconds on the same clock; `duration` is the seconds the window covers.
     `sample_rate` / `array` (frames, channels) float32 are set only when synthesized.
     """
@@ -51,7 +51,7 @@ class MidiRead(ArchiveRead):
 
     def to_bytes(self) -> bytes:
         """Serialize `midi` (i.e. the window that was read) to Standard MIDI File bytes."""
-        from omniio.midi.common import midi_to_bytes
+        from omniio.modalities.midi.common import midi_to_bytes
         return midi_to_bytes(self.midi)
 
     def write(self, path: str) -> None:

@@ -9,7 +9,7 @@ from typing import Any, Tuple
 
 import zstandard as zstd
 
-from omniio.midi.common import load_midi, midi_metadata, midi_to_bytes
+from omniio.modalities.midi.common import load_midi, midi_metadata, midi_to_bytes
 
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 

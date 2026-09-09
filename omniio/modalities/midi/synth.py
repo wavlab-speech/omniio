@@ -250,7 +250,7 @@ def synthesize(
 
     Args:
         pm:          ``pretty_midi.PrettyMIDI`` (typically already sliced, see
-                     `omniio.midi.common.slice_midi`).
+                     `omniio.modalities.midi.common.slice_midi`).
         sample_rate: Output rate in Hz.
         channels:    1 (stereo downmixed by averaging) or 2.
         duration:    Seconds to render. Default: the MIDI's end time, so the waveform

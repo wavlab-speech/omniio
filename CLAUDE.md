@@ -12,11 +12,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The library is organized by data modality, with each supporting read and write operations:
 
-- **audio/**: Audio file I/O (FLAC, WAV, WebM/Opus)
-- **video/**: Video file I/O (MP4 with audio streams)
-- **text/**: Text file I/O (zstandard compressed)
-- **image/**: PNG/JPEG I/O
-- **midi/**: Standard MIDI File I/O, seconds-based time slicing, FluidSynth/sine synthesis
+- **modalities/**: the per-modality packages below; imported through the short public paths (`omniio.audio`, `omniio.midi`, ...) via the aliases in `omniio/__init__.py`
+- **modalities/audio/**: Audio file I/O (FLAC, WAV, WebM/Opus)
+- **modalities/video/**: Video file I/O (MP4 with audio streams)
+- **modalities/text/**: Text file I/O (zstandard compressed)
+- **modalities/image/**: PNG/JPEG I/O
+- **modalities/midi/**: Standard MIDI File I/O, seconds-based time slicing, FluidSynth/sine synthesis
 - **blob/**: Binary archive management with PyArrow metadata
 - **tools/**: Format-specific helpers that are not omniio's own archive layout;
   currently **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`)
@@ -71,11 +72,11 @@ the real directory.
 - `start_time`, `end_time` parameters in seconds
 - Video also supports frame-based slicing with `start_frame`, `end_frame`
 - Frame indices take priority over time when both provided
-- MIDI keeps notes that sound inside the window, clips them to it, shifts times by `-start_time`, and carries controller/pitch-bend state at `start_time` in as `t=0` events (`omniio/midi/common.py:slice_midi`)
+- MIDI keeps notes that sound inside the window, clips them to it, shifts times by `-start_time`, and carries controller/pitch-bend state at `start_time` in as `t=0` events (`omniio/modalities/midi/common.py:slice_midi`)
 
 **MIDI format detection**: `b"MThd"` → raw SMF, `b"\x28\xb5\x2f\xfd"` → zstd-wrapped SMF (`compress=True` at write time).
 
-**MIDI synthesis** (`omniio/midi/synth.py`): one cached `fluidsynth.Synth` per (soundfont, sample rate, gain, effects) per process; every instrument rendered through its own channel (drums on 9) in a single pass; reverb/chorus off by default; after each render voices are killed and the buffer drained to a 64-sample block boundary so output does not depend on prior renders. Waveform length is exactly `duration` seconds so it lines up with a paired audio slice.
+**MIDI synthesis** (`omniio/modalities/midi/synth.py`): one cached `fluidsynth.Synth` per (soundfont, sample rate, gain, effects) per process; every instrument rendered through its own channel (drums on 9) in a single pass; reverb/chorus off by default; after each render voices are killed and the buffer drained to a 64-sample block boundary so output does not depend on prior renders. Waveform length is exactly `duration` seconds so it lines up with a paired audio slice.
 
 **Streaming Operations**: Archive operations avoid loading entire files into memory:
 - Blob append uses `shutil.copyfileobj()` for streaming concatenation
@@ -247,5 +248,5 @@ Key libraries used throughout the codebase:
 - Blob workers check for duplicate IDs before writing; set `overwrite=True` to skip
 - Archive byte offsets use [start_byte, end_byte) convention (end is exclusive)
 - Remote reads use HTTP 206 Partial Content with `Range` headers
-- `pretty_midi` is imported lazily inside `omniio/midi/` so the rest of the library works without it
+- `pretty_midi` is imported lazily inside `omniio/modalities/midi/` so the rest of the library works without it
 - Run tests with `python -m pytest tests -o addopts=""` when `pytest-cov` is not installed (pyproject's addopts require it)

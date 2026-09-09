@@ -5,9 +5,9 @@ import requests
 import zstandard as zstd
 
 from omniio.definitions import MidiRead
-from omniio.midi.common import MIDI_MAGIC, midi_from_bytes, notes_from_midi, slice_midi
-from omniio.midi.synth import DEFAULT_SAMPLE_RATE, synthesize
-from omniio.midi.write import ZSTD_MAGIC
+from omniio.modalities.midi.common import MIDI_MAGIC, midi_from_bytes, notes_from_midi, slice_midi
+from omniio.modalities.midi.synth import DEFAULT_SAMPLE_RATE, synthesize
+from omniio.modalities.midi.write import ZSTD_MAGIC
 
 
 def _detect_format(header: bytes) -> str:

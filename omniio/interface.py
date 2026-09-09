@@ -1,11 +1,11 @@
 import os
 from typing import Optional
 from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead, ImageRead, MidiRead
-from omniio.audio.read import audio_read_local, audio_read_remote
-from omniio.text.read import text_read_local, text_read_remote
-from omniio.video.read import video_read_local, video_read_remote
-from omniio.image.read import image_read_local, image_read_remote
-from omniio.midi.read import midi_read_local, midi_read_remote
+from omniio.modalities.audio.read import audio_read_local, audio_read_remote
+from omniio.modalities.text.read import text_read_local, text_read_remote
+from omniio.modalities.video.read import video_read_local, video_read_remote
+from omniio.modalities.image.read import image_read_local, image_read_remote
+from omniio.modalities.midi.read import midi_read_local, midi_read_remote
 
 def audio_read(
     archive_path: str, 
