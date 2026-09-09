@@ -77,10 +77,13 @@ class DiscreteRead(ArchiveRead):
     vocab_sizes: list = None
     rates: list = None
     n_streams: int = None
+    frame_windows: list = None        # [lo, hi) decoded frames per returned stream
     start_time: float = None
     end_time: float = None
     start_frame: int = None
     end_frame: int = None
+    bytes_read: int = None            # I/O actually done (header + the windows' bytes)
+    entry_size: int = None
 
     @property
     def ragged(self) -> bool:
