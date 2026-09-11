@@ -275,6 +275,55 @@ def test_wave_holder_with_unseekable_writer_size(tmp_path, wav):
     assert np.array_equal(array, wav)
 
 
+def _blank_riff_size(raw, start, placeholder=0x7FFFF624):
+    """Overwrite one record's RIFF and data sizes the way piped sox does."""
+    raw[start + 4 : start + 8] = placeholder.to_bytes(4, "little")
+    data = raw.index(b"data", start)
+    raw[data + 4 : data + 8] = (placeholder - 36).to_bytes(4, "little")
+
+
+def test_unseekable_writer_size_does_not_swallow_the_next_record(tmp_path, wav):
+    """A placeholder size in the middle of an archive must not lose records.
+
+    Reading to EOF is right when the record really is the last thing in the
+    stream, but in a multi-record archive it would glue every following
+    utterance onto this one and return a plausible-looking array.  The
+    placeholder destroys the only length information there is, so the record
+    genuinely cannot be recovered -- but losing the rest silently is worse
+    than saying so.
+    """
+    p = str(tmp_path / "two.ark")
+    kaldi.save_ark(p, {"r1": (16000, wav), "r2": (16000, wav[:4000])})
+    raw = bytearray(open(p, "rb").read())
+    _blank_riff_size(raw, raw.index(b"RIFF"))
+
+    lying = str(tmp_path / "lying_two.ark")
+    open(lying, "wb").write(bytes(raw))
+
+    with pytest.raises(kaldi.ReadError, match="placeholder"):
+        dict(kaldi.load_ark(lying))
+
+
+def test_unseekable_writer_size_on_the_last_record_still_reads(tmp_path, wav):
+    """The same placeholder on the final record is recoverable, and must be.
+
+    This is the shape ESPnet actually meets: one object arriving over a pipe.
+    """
+    p = str(tmp_path / "two.ark")
+    kaldi.save_ark(p, {"r1": (16000, wav), "r2": (16000, wav[:4000])})
+    raw = bytearray(open(p, "rb").read())
+    second = raw.index(b"RIFF", raw.index(b"RIFF") + 4)
+    _blank_riff_size(raw, second)
+
+    lying = str(tmp_path / "lying_last.ark")
+    open(lying, "wb").write(bytes(raw))
+
+    got = dict(kaldi.load_ark(lying))
+    assert sorted(got) == ["r1", "r2"]
+    assert np.array_equal(got["r1"][1], wav)
+    assert np.array_equal(got["r2"][1], wav[:4000])
+
+
 def test_extended_audio_ark(tmp_path, wav):
     p = str(tmp_path / "e.ark")
     s = str(tmp_path / "e.scp")

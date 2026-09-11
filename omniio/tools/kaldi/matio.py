@@ -243,6 +243,30 @@ def _read_extended_audio(fd):
     return _decode_sound(blob), len(AUDIO_MARKER) + 1 + width + length
 
 
+#: A following WaveHolder record, found where only audio samples should be.
+#: Eight fixed bytes, so a chance match inside real samples is ~2**-64.
+_EMBEDDED_RIFF = re.compile(rb"RIFF.{4}WAVE", re.DOTALL)
+
+
+def _reject_swallowed_record(rest, declared):
+    """Refuse a short read that ran past the end of its own record."""
+    # ``rest`` begins at our own "WAVE", so any RIFF header inside it belongs
+    # to a later record rather than to us.
+    found = _EMBEDDED_RIFF.search(rest)
+    if found is None:
+        return
+    raise ReadError(
+        "RIFF size field says {} bytes but the stream ends after {}, and "
+        "another RIFF record starts {} bytes in. The size is a placeholder "
+        "from a writer that could not seek back over its own header (sox "
+        "piping to stdout leaves 0x7ffff624 there), which leaves this record "
+        "with no length information at all, so it cannot be separated from "
+        "the ones after it. Rewrite the archive with correct sizes, or read "
+        "the object on its own rather than as part of an "
+        "archive.".format(declared, len(rest), found.start())
+    )
+
+
 def _read_riff(fd):
     """Read one RIFF chunk written by Kaldi's ``WaveHolder``.
 
@@ -255,14 +279,23 @@ def _read_riff(fd):
         can't seek to fix it
 
     So the payload is read up to the declared length and a short read is
-    accepted rather than raising: it means the header lied and the object runs
-    to the end of the stream.  This cannot swallow a following object, because
-    an archive whose sizes are wrong is not seekable by any reader anyway.
+    accepted rather than raising: the read stopped at EOF, so the header lied
+    and the object runs to the end of the stream.
+
+    The one thing that must not happen is swallowing the *next* record of a
+    multi-record archive, turning a loud framing error into silently missing
+    utterances.  A placeholder size destroys the only framing information
+    there is -- the ``data`` chunk size is a placeholder too -- so such a
+    record cannot be recovered by any reader, Kaldi included.  What we can do
+    is notice, so the scan below refuses rather than returning a plausible
+    array with the following utterances glued onto the end of it.
     """
     head = _read_exact(fd, 8, "RIFF header")
     # The RIFF size field counts everything after itself.
     length = int.from_bytes(head[4:8], "little")
     rest = _read_at_most(fd, length)
+    if len(rest) < length:
+        _reject_swallowed_record(rest, length)
     return _decode_sound(head + rest, native_dtype=True), 8 + len(rest)
 
 
