@@ -47,16 +47,47 @@ TOKENS = {
     b"\x00BDV ": "DV (float64 vector)",
 }
 
-#: Programs a pipe entry may invoke under --allow-pipes. Everything a Kaldi
-#: recipe writes into a wav.scp is on this list; anything else is skipped
-#: rather than run, so an unexpected command shape cannot execute by accident.
+#: Programs a pipe entry may invoke under --allow-pipes, each with a predicate
+#: saying whether *this* invocation of it only reads.
 #:
-#: Matched against the executable token *exactly*, not against its basename:
+#: Naming the program is not enough: every one of these except ``cat`` will
+#: happily write a file if told to, and two of them delete their input while
+#: doing it (``gunzip archive.gz``, ``flac -d x.flac``). A Kaldi pipe always
+#: writes its object to stdout, so requiring that is not a restriction on real
+#: data -- it just makes "read-only" true rather than intended.
+#:
+#: The executable token is matched here *exactly*, not by basename:
 #: "/tmp/payload/sox" has the basename "sox" but is not sox. A recipe that
 #: writes an absolute path to its own sph2pipe is therefore skipped -- put the
 #: directory on PATH instead, which is the same thing without letting the scp
 #: file choose which binary runs.
-ALLOWED_PROGRAMS = {"sox", "sph2pipe", "ffmpeg", "flac", "shorten", "wav-copy", "cat", "gunzip"}
+
+
+def _writes_to_stdout(argv):
+    """True if the invocation names ``-`` as its destination."""
+    return "-" in argv[1:]
+
+
+def _has_flag(*flags):
+    return lambda argv: any(f in argv[1:] for f in flags)
+
+
+def _single_input(argv):
+    """True if only one non-flag argument, so there is no output path."""
+    return sum(1 for a in argv[1:] if not a.startswith("-")) <= 1
+
+
+#: Anything not listed is skipped rather than run.
+ALLOWED_PROGRAMS = {
+    "cat": lambda argv: True,  # cannot write, whatever the arguments
+    "zcat": lambda argv: True,
+    "gunzip": _has_flag("-c", "--stdout"),  # without it, deletes the input
+    "sph2pipe": _single_input,  # a second path would be the output file
+    "sox": _writes_to_stdout,
+    "ffmpeg": _writes_to_stdout,
+    "flac": _has_flag("-c", "--stdout"),  # without it, deletes the input
+    "shorten": _writes_to_stdout,
+}
 
 #: Shell metacharacters that would make the entry more than a plain pipeline.
 #: Nothing here is interpreted anyway -- stages are executed directly rather
@@ -140,11 +171,13 @@ def is_archive_scp(rows, probe=10):
 def split_pipeline(command):
     """Split ``command`` into argv lists, or return ``None`` if it may not run.
 
-    A stage qualifies only when its executable token is *exactly* an entry in
-    :data:`ALLOWED_PROGRAMS`. Checking the basename instead would accept
-    ``/tmp/payload/sox``, and since the command comes out of a file on disk
-    rather than from the person running this, that is enough to execute
-    anything -- the scp would be choosing the binary.
+    A stage qualifies only when its executable token is *exactly* a key of
+    :data:`ALLOWED_PROGRAMS` **and** that program's predicate says this
+    particular invocation only reads. Checking the name alone would accept
+    ``gunzip archive.gz``, which deletes the archive, and ``sox a.wav b.wav``,
+    which overwrites b.wav.  Since the command comes out of a file on disk
+    rather than from the person running this, neither the binary nor the
+    arguments can be taken on trust.
     """
     if FORBIDDEN & set(command):
         return None
@@ -154,7 +187,10 @@ def split_pipeline(command):
             argv = shlex.split(stage)
         except ValueError:
             return None
-        if not argv or argv[0] not in ALLOWED_PROGRAMS:
+        if not argv:
+            return None
+        reads_only = ALLOWED_PROGRAMS.get(argv[0])
+        if reads_only is None or not reads_only(argv):
             return None
         stages.append(argv)
     return stages or None

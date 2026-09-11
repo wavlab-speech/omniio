@@ -43,11 +43,16 @@ point the script at a directory that has some.
 Off by default, because reading such an entry means **running the command in
 it**, and the command comes out of a file rather than from you. With the flag:
 
-- Each stage's executable must match an entry in `ALLOWED_PROGRAMS`
+- Each stage's executable must match a key of `ALLOWED_PROGRAMS`
   (`sox`, `sph2pipe`, `ffmpeg`, `flac`, …) **exactly**. A path-qualified
   `/tmp/payload/sox` has the right basename but is not sox, so it is skipped —
   put the directory on `PATH` instead, which is the same thing without letting
   the `scp` file choose which binary runs.
+- The *arguments* are checked too, not just the program. Every one of these
+  except `cat` will write a file if told to, and two of them delete their
+  input while doing it (`gunzip archive.gz`, `flac -d x.flac`). A Kaldi pipe
+  always writes its object to stdout, so that is what is required — which
+  costs nothing on real data and makes "read-only" true rather than intended.
 - Stages are exec'd directly, never through a shell, so nothing in the entry
   is interpreted as shell syntax.
 - Output is streamed and capped (`PIPE_MAX_BYTES`, 512 MiB) under a timeout
