@@ -66,6 +66,9 @@ def _peek(fd, n):
 #: first short read reject it instead of allocating first.
 _READ_CHUNK = 1 << 23  # 8 MiB
 
+#: Kaldi's integer vector is a ``std::vector<int32>``; nothing wider fits.
+_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
+
 
 def _read_exact(fd, n, what):
     if n <= _READ_CHUNK:
@@ -86,6 +89,19 @@ def _read_exact(fd, n, what):
             "({} of {} bytes)".format(what, len(buf), n)
         )
     return buf
+
+
+def _read_at_most(fd, n):
+    """Read up to ``n`` bytes, returning fewer if the stream ends first."""
+    parts = []
+    got = 0
+    while got < n:
+        chunk = fd.read(min(_READ_CHUNK, n - got))
+        if not chunk:
+            break
+        parts.append(chunk)
+        got += len(chunk)
+    return b"".join(parts)
 
 
 def _read_sized_int(fd, endian):
@@ -227,13 +243,60 @@ def _read_extended_audio(fd):
     return _decode_sound(blob), len(AUDIO_MARKER) + 1 + width + length
 
 
+#: A following WaveHolder record, found where only audio samples should be.
+#: Eight fixed bytes, so a chance match inside real samples is ~2**-64.
+_EMBEDDED_RIFF = re.compile(rb"RIFF.{4}WAVE", re.DOTALL)
+
+
+def _reject_swallowed_record(rest, declared):
+    """Refuse a short read that ran past the end of its own record."""
+    # ``rest`` begins at our own "WAVE", so any RIFF header inside it belongs
+    # to a later record rather than to us.
+    found = _EMBEDDED_RIFF.search(rest)
+    if found is None:
+        return
+    raise ReadError(
+        "RIFF size field says {} bytes but the stream ends after {}, and "
+        "another RIFF record starts {} bytes in. The size is a placeholder "
+        "from a writer that could not seek back over its own header (sox "
+        "piping to stdout leaves 0x7ffff624 there), which leaves this record "
+        "with no length information at all, so it cannot be separated from "
+        "the ones after it. Rewrite the archive with correct sizes, or read "
+        "the object on its own rather than as part of an "
+        "archive.".format(declared, len(rest), found.start())
+    )
+
+
 def _read_riff(fd):
-    """Read one RIFF chunk written by Kaldi's ``WaveHolder``."""
+    """Read one RIFF chunk written by Kaldi's ``WaveHolder``.
+
+    The size field is not always trustworthy.  A writer that cannot seek back
+    over its own header -- ``sox`` piping to stdout, which is how ESPnet's
+    speed-perturbed ``wav.scp`` entries are produced -- leaves a placeholder
+    there and says so:
+
+        sox WARN wav: Length in output .wav header will be wrong since
+        can't seek to fix it
+
+    So the payload is read up to the declared length and a short read is
+    accepted rather than raising: the read stopped at EOF, so the header lied
+    and the object runs to the end of the stream.
+
+    The one thing that must not happen is swallowing the *next* record of a
+    multi-record archive, turning a loud framing error into silently missing
+    utterances.  A placeholder size destroys the only framing information
+    there is -- the ``data`` chunk size is a placeholder too -- so such a
+    record cannot be recovered by any reader, Kaldi included.  What we can do
+    is notice, so the scan below refuses rather than returning a plausible
+    array with the following utterances glued onto the end of it.
+    """
     head = _read_exact(fd, 8, "RIFF header")
     # The RIFF size field counts everything after itself.
     length = int.from_bytes(head[4:8], "little")
-    rest = _read_exact(fd, length, "RIFF payload")
-    return _decode_sound(head + rest, native_dtype=True), 8 + length
+    rest = _read_at_most(fd, length)
+    if len(rest) < length:
+        _reject_swallowed_record(rest, length)
+    return _decode_sound(head + rest, native_dtype=True), 8 + len(rest)
 
 
 def _read_bare_sound(fd):
@@ -278,13 +341,17 @@ def _read_text_object(fd, endian):
         # readers parse those with int(); the binary format keeps them integral
         # too, as std::vector<int32>. Matrices are always float, as in Kaldi.
         if tokens and all(_INTEGER.match(t) for t in tokens):
-            try:
-                array = np.array(tokens, dtype=np.int32)
-            except (OverflowError, ValueError) as e:
+            # Range-checked in Python rather than left to numpy: numpy 2 raises
+            # on an out-of-range cast, but numpy 1.x -- still inside our
+            # declared floor -- silently wraps 2147483648 to -2147483648.
+            values = [int(t) for t in tokens]
+            outside = [v for v in values if not _INT32_MIN <= v <= _INT32_MAX]
+            if outside:
                 raise ReadError(
                     "Integer vector holds a value outside int32, which Kaldi's "
-                    "std::vector<int32> cannot represent: {}".format(e)
-                ) from e
+                    "std::vector<int32> cannot represent: {}".format(outside[0])
+                )
+            array = np.array(values, dtype=np.int32)
         else:
             array = np.array(tokens, dtype=np.float32)
     return array, len(raw)
@@ -698,10 +765,6 @@ def _encode_object(value, endian, compression_method, write_function, write_kwar
         + shape
         + np.ascontiguousarray(array, dtype=dtype).tobytes()
     )
-
-
-#: Kaldi's integer vector is a ``std::vector<int32>``; nothing wider fits.
-_INT32_MIN, _INT32_MAX = -(2**31), 2**31 - 1
 
 
 def _check_int32_range(array):
