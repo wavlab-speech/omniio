@@ -24,12 +24,18 @@ import collections
 import importlib.metadata as md
 import os
 import random
-import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import time
 
 import numpy as np
+
+
+class PipeRefused(Exception):
+    """A pipe entry could not be run, or ran away with itself."""
+
 
 TOKENS = {
     b"\x00BCM ": "CM (compressed, per-column)",
@@ -44,10 +50,28 @@ TOKENS = {
 #: Programs a pipe entry may invoke under --allow-pipes. Everything a Kaldi
 #: recipe writes into a wav.scp is on this list; anything else is skipped
 #: rather than run, so an unexpected command shape cannot execute by accident.
+#:
+#: Matched against the executable token *exactly*, not against its basename:
+#: "/tmp/payload/sox" has the basename "sox" but is not sox. A recipe that
+#: writes an absolute path to its own sph2pipe is therefore skipped -- put the
+#: directory on PATH instead, which is the same thing without letting the scp
+#: file choose which binary runs.
 ALLOWED_PROGRAMS = {"sox", "sph2pipe", "ffmpeg", "flac", "shorten", "wav-copy", "cat", "gunzip"}
 
 #: Shell metacharacters that would make the entry more than a plain pipeline.
+#: Nothing here is interpreted anyway -- stages are executed directly rather
+#: than through a shell -- but rejecting them keeps "|" unambiguous as the
+#: stage separator, which is what lets the command be split without a shell.
 FORBIDDEN = set(";&$`><*?()[]{}\n")
+
+#: A pipe that has not produced its object by now is not going to.
+PIPE_TIMEOUT = 300
+
+#: Upper bound on what one pipe may return. A two-hour 16 kHz mono recording
+#: is about 230 MB, so this is generous; it is here so that "cat /dev/zero |"
+#: cannot fill memory or the scratch disk. Raise it if your data really is
+#: bigger than this.
+PIPE_MAX_BYTES = 512 << 20
 
 
 def classify(fd, offset):
@@ -113,16 +137,73 @@ def is_archive_scp(rows, probe=10):
     return False
 
 
-def pipeline_is_safe(command):
-    """True if every stage is an allowed program and there is no shell trickery."""
+def split_pipeline(command):
+    """Split ``command`` into argv lists, or return ``None`` if it may not run.
+
+    A stage qualifies only when its executable token is *exactly* an entry in
+    :data:`ALLOWED_PROGRAMS`. Checking the basename instead would accept
+    ``/tmp/payload/sox``, and since the command comes out of a file on disk
+    rather than from the person running this, that is enough to execute
+    anything -- the scp would be choosing the binary.
+    """
     if FORBIDDEN & set(command):
-        return False
+        return None
+    stages = []
+    for stage in command.split("|"):
+        try:
+            argv = shlex.split(stage)
+        except ValueError:
+            return None
+        if not argv or argv[0] not in ALLOWED_PROGRAMS:
+            return None
+        stages.append(argv)
+    return stages or None
+
+
+def run_pipeline(stages, sink):
+    """Run ``stages`` connected end to end, writing the last stdout to ``sink``.
+
+    No shell: each stage is exec'd directly, so nothing in the scp entry is
+    ever interpreted as shell syntax. Output is streamed and capped rather
+    than buffered, so a stage that never stops producing cannot exhaust
+    memory.
+    """
+    procs = []
+    stdin = subprocess.DEVNULL
     try:
-        shlex.split(command)
-    except ValueError:
-        return False
-    heads = [command.split()[0]] + re.findall(r"\|\s*(\S+)", command)
-    return all(os.path.basename(h) in ALLOWED_PROGRAMS for h in heads)
+        for argv in stages[:-1]:
+            proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE)
+            procs.append(proc)
+            if stdin not in (subprocess.DEVNULL, None):
+                stdin.close()
+            stdin = proc.stdout
+        last = subprocess.Popen(stages[-1], stdin=stdin, stdout=subprocess.PIPE)
+        procs.append(last)
+        if stdin not in (subprocess.DEVNULL, None):
+            stdin.close()
+
+        written = 0
+        deadline = time.monotonic() + PIPE_TIMEOUT
+        while True:
+            chunk = last.stdout.read(1 << 20)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > PIPE_MAX_BYTES:
+                raise PipeRefused("produced more than {} bytes".format(PIPE_MAX_BYTES))
+            if time.monotonic() > deadline:
+                raise PipeRefused("still running after {}s".format(PIPE_TIMEOUT))
+            sink.write(chunk)
+        last.stdout.close()
+
+        for proc in procs:
+            if proc.wait(timeout=max(1, int(deadline - time.monotonic()))) != 0:
+                raise PipeRefused("stage exited with status {}".format(proc.returncode))
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
 
 
 def same(a, b):
@@ -148,21 +229,31 @@ def oneline(text):
     return " ".join(str(text).split())
 
 
-def read_both(kaldiio, om, name, scratch):
+def read_both(kaldiio, om, name):
     """Return ``(kaldiio_result, omniio_result)``, each a value or an Exception.
 
     A pipe is run **once** and the captured bytes are handed to both. Running
     the command twice would differ on the samples no matter what the libraries
     do: a ``sox`` stage without ``-R`` dithers non-repeatably.
     """
-    target = name
-    if name.rstrip().endswith("|"):
-        command = name.rstrip()[:-1].strip()
-        blob = subprocess.run(command, shell=True, stdout=subprocess.PIPE, check=True).stdout
-        with open(scratch, "wb") as fh:
-            fh.write(blob)
-        target = scratch
+    if not name.rstrip().endswith("|"):
+        return _load_both(kaldiio, om, name)
 
+    stages = split_pipeline(name.rstrip()[:-1].strip())
+    if stages is None:
+        raise PipeRefused("not an allow-listed pipeline")
+    # Named uniquely and removed here, so a run cannot truncate an unrelated
+    # file and two runs cannot overwrite each other.
+    handle, scratch = tempfile.mkstemp(prefix="omniio-compare-", suffix=".bin")
+    try:
+        with os.fdopen(handle, "wb") as fh:
+            run_pipeline(stages, fh)
+        return _load_both(kaldiio, om, scratch)
+    finally:
+        os.unlink(scratch)
+
+
+def _load_both(kaldiio, om, target):
     out = []
     for mod in (kaldiio, om):
         try:
@@ -200,14 +291,21 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+
+    def non_negative(text):
+        value = int(text)
+        if value < 0:
+            raise argparse.ArgumentTypeError("must be zero or more, got {}".format(value))
+        return value
+
     p.add_argument("roots", nargs="+", help="directories to walk")
     p.add_argument(
         "--max-per-file",
-        type=int,
+        type=non_negative,
         default=25,
         help="entries sampled per scp; 0 for all (default: 25)",
     )
-    p.add_argument("--max-files", type=int, default=0, help="stop after N scp files")
+    p.add_argument("--max-files", type=non_negative, default=0, help="stop after N scp files")
     p.add_argument("--seed", type=int, default=0, help="sampling seed (default: 0)")
     p.add_argument(
         "--allow-pipes",
@@ -240,8 +338,6 @@ def main():
     skips = collections.Counter()
     checked = skipped = 0
     problems = []
-    scratch = os.path.abspath(".omniio_compare_scratch")
-
     for i, scp in enumerate(scps, 1):
         rows = list(entries(scp, args.allow_pipes))
         if not rows:
@@ -257,10 +353,11 @@ def main():
         for key, name in rows:
             is_pipe = name.rstrip().endswith("|")
             if is_pipe:
-                if not pipeline_is_safe(name.rstrip()[:-1].strip()):
+                stages = split_pipeline(name.rstrip()[:-1].strip())
+                if stages is None:
                     skips["pipe command not in the allow-list"] += 1
                     continue
-                fmt = "pipe ({})".format(os.path.basename(name.split()[0]))
+                fmt = "pipe ({})".format(stages[0][0])
             else:
                 path, _, tail = name.rpartition(":")
                 offset = int(tail) if tail.isdigit() else None
@@ -279,9 +376,12 @@ def main():
                 fmt = classify(fd, offset)
 
             try:
-                a, b = read_both(kaldiio, om, name, scratch)
-            except subprocess.CalledProcessError as exc:
-                skips["pipe command itself failed (rc={})".format(exc.returncode)] += 1
+                a, b = read_both(kaldiio, om, name)
+            except PipeRefused as exc:
+                skips["pipe not run: {}".format(exc)] += 1
+                continue
+            except OSError as exc:
+                skips["pipe could not start: {}".format(exc.strerror or exc)] += 1
                 continue
 
             kind, detail = verdict(a, b)
@@ -304,9 +404,6 @@ def main():
                 )
             )
 
-    if os.path.exists(scratch):
-        os.unlink(scratch)
-
     print("\n=== by format (this is the part that matters) ===")
     for fmt, n in by_format.most_common():
         print("  {:<34} {:>7}   mismatched {}".format(fmt, n, bad_by_format[fmt]))
@@ -317,17 +414,18 @@ def main():
     mismatched = sum(bad_by_format.values())
     print("\nchecked {}   MISMATCHED {}   entries skipped {}".format(checked, mismatched, skipped))
 
-    if problems:
-        shown = [row for row in problems if row[3].startswith("MISMATCH")][:20]
-        if shown:
-            print("\n=== first {} mismatches ===".format(len(shown)))
-            for scp, key, fmt, why in shown:
-                print("  {}\n    {}  [{}]\n    {}".format(scp, key, fmt, why))
-        if args.out:
-            with open(args.out, "w") as fh:
-                for row in problems:
-                    fh.write("\t".join(oneline(c) for c in row) + "\n")
-            print("\nfull list ({} lines): {}".format(len(problems), args.out))
+    shown = [row for row in problems if row[3].startswith("MISMATCH")][:20]
+    if shown:
+        print("\n=== first {} mismatches ===".format(len(shown)))
+        for scp, key, fmt, why in shown:
+            print("  {}\n    {}  [{}]\n    {}".format(scp, key, fmt, why))
+    if args.out:
+        # Written even when clean, so a stale file from an earlier run cannot
+        # be read as describing this one.
+        with open(args.out, "w") as fh:
+            for row in problems:
+                fh.write("\t".join(oneline(c) for c in row) + "\n")
+        print("\nfull list ({} lines): {}".format(len(problems), args.out))
     return 1 if mismatched else 0
 
 
