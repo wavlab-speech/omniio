@@ -15,12 +15,23 @@ _MAGIC = {
     b"RIFF":        "wav",
     b"\x1aE\xdf\xa3": "webm",  # EBML header (Matroska/WebM)
     b"OggS":        "ogg",
+    b"ID3":         "mp3",   # ID3v2 tag ahead of the first MPEG frame
 }
+
+
+def _is_mpeg_frame_sync(header: bytes) -> bool:
+    """A tagless mp3 starts directly on an MPEG audio frame: 11 sync bits, then a
+    non-zero layer field. The layer check keeps AAC ADTS (0xFFF1/0xFFF9, layer 00) out."""
+    return (len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0
+            and (header[1] >> 1) & 0x3 != 0)
+
 
 def _detect_format(header: bytes) -> str:
     for magic, fmt in _MAGIC.items():
         if header[: len(magic)] == magic:
             return fmt
+    if _is_mpeg_frame_sync(header):
+        return "mp3"
     raise ValueError(f"Unknown audio format (header bytes: {header[:8].hex()})")
 
 def _read_pcm(
@@ -29,7 +40,7 @@ def _read_pcm(
     start_time: Optional[float],
     end_time: Optional[float],
 ) -> AudioRead:
-    """Read FLAC/WAV/OGG via soundfile, with optional time slicing. `blob` is the
+    """Read FLAC/WAV/OGG/MP3 via soundfile, with optional time slicing. `blob` is the
     entry's bytes, or an already-seekable file object (a lazy byte-range view)."""
     buf = blob if hasattr(blob, "seek") else io.BytesIO(blob)
     info = sf.info(buf)
@@ -38,15 +49,24 @@ def _read_pcm(
     start_frame = 0 if start_time is None else int(start_time * sr)
     end_frame = info.frames if end_time is None else int(end_time * sr)
     num_frames = end_frame - start_frame
+    # MP3 windows are never seeked into. libsndfile/mpg123 lands on the right sample,
+    # but the frames after it can decode wrong: each draws on a bit reservoir (up to
+    # 511/255 bytes back) and overlap state from frames the decoder never saw, and how
+    # many frames that spans depends on the bitrate, with no safe fixed bound (up to
+    # ~2 s for 8 kbps stereo). Decoding from the first sample makes the window a slice
+    # of the full decode by construction; cost is O(end_frame) rather than O(window).
+    read_from = 0 if fmt == "mp3" else start_frame
 
     buf.seek(0)
     data, sr = sf.read(
         buf,
-        start=start_frame,
+        start=read_from,
         stop=end_frame,
         dtype="float32",
         always_2d=True,
     )
+    if read_from != start_frame:
+        data = data[start_frame:]
 
     return AudioRead(
         file_type=fmt,

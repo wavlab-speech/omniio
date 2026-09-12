@@ -18,6 +18,11 @@ SUBTYPE_TO_BIT_DEPTH = {v: k for k, v in BIT_DEPTH_TO_SUBTYPE.items()}
 
 PYAV_FORMATS = {"webm", "opus"}
 
+# Formats with no PCM bit depth: same-format writes are byte copies, bit_depth is None.
+LOSSY_FORMATS = PYAV_FORMATS | {"mp3"}
+
+MP3_SAMPLE_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+
 
 def _read_webm(audio_path: str) -> Tuple[np.ndarray, int, int, int]:
     """
@@ -93,27 +98,110 @@ def _get_webm_info(audio_path: str) -> dict:
         }
 
 
+def _write_mp3(
+    data: np.ndarray,
+    sample_rate: int,
+    compression_level: Optional[float] = None,
+    bitrate_mode: Optional[str] = None,
+) -> bytes:
+    """
+    Encode float (frames, channels) audio to MP3 bytes via libsndfile's LAME binding.
+    The stream carries gapless info, so decoding returns exactly data.shape[0] samples
+    and the `samples` metadata stays true.
+    """
+    if sample_rate not in MP3_SAMPLE_RATES:
+        raise ValueError(
+            f"MP3 does not support sample rate {sample_rate}. "
+            f"Supported: {list(MP3_SAMPLE_RATES)} (resample first)."
+        )
+    kwargs = {}
+    if compression_level is not None:
+        # libsndfile 1.2.2 rejects exactly 1.0 for MP3 with a garbled error; say so here
+        if not 0.0 <= compression_level < 1.0:
+            raise ValueError(
+                f"MP3 compression_level must be in [0.0, 1.0), got {compression_level}"
+            )
+        kwargs["compression_level"] = compression_level
+    if bitrate_mode is not None:
+        kwargs["bitrate_mode"] = bitrate_mode
+    buf = io.BytesIO()
+    sf.write(buf, data, sample_rate, format="MP3", subtype="MPEG_LAYER_III", **kwargs)
+    return buf.getvalue()
+
+
+def _encode(
+    data: np.ndarray,
+    sr: int,
+    target_format: str,
+    target_bit_depth: Optional[int],
+    compression_level: Optional[float],
+    bitrate_mode: Optional[str],
+) -> Tuple[bytes, dict]:
+    """Encode float64 (frames, channels) audio to `target_format`."""
+    if target_format in PYAV_FORMATS:
+        raw_bytes = _write_webm(data, sr)
+        return raw_bytes, {
+            "sample_rate": 48000,  # Opus always outputs 48kHz
+            "channels": data.shape[1],
+            "samples": data.shape[0],
+            "format": "webm",
+            "bit_depth": None,
+            "duration": data.shape[0] / 48000,
+        }
+
+    if target_format == "mp3":
+        raw_bytes = _write_mp3(data, sr, compression_level, bitrate_mode)
+        bit_depth = None
+    else:
+        target_subtype = BIT_DEPTH_TO_SUBTYPE.get(target_bit_depth)
+        if target_subtype is None:
+            raise ValueError(
+                f"Unsupported target bit depth: {target_bit_depth}. "
+                f"Supported: {sorted(BIT_DEPTH_TO_SUBTYPE.keys())}"
+            )
+        buf = io.BytesIO()
+        sf.write(buf, data, sr, format=target_format.upper(), subtype=target_subtype)
+        raw_bytes = buf.getvalue()
+        bit_depth = target_bit_depth
+
+    return raw_bytes, {
+        "sample_rate": sr,
+        "channels": data.shape[1],
+        "samples": data.shape[0],
+        "format": target_format,
+        "bit_depth": bit_depth,
+        "duration": data.shape[0] / sr,
+    }
+
+
 def audio_write(
     audio_path: Union[str, Path, Tuple[np.ndarray, int]],
     item_id: str,
     target_format: Optional[str] = None,
     target_bit_depth: Optional[int] = None,
+    compression_level: Optional[float] = None,
+    bitrate_mode: Optional[str] = None,
 ) -> Tuple[bytes, dict]:
     """
     Read an audio file (or in-memory array), optionally convert format/bit depth,
     and return raw bytes + metadata dict.
 
-    Uses soundfile for FLAC/WAV and PyAV for WebM/Opus.
+    Uses soundfile for FLAC/WAV/MP3 and PyAV for WebM/Opus.
 
     Args:
-        audio_path:       Path to the source audio file (str or Path), or a
-                          (numpy_array, sample_rate) tuple for in-memory audio.
-                          Array shape must be (frames,) or (frames, channels).
-        item_id:          Unique identifier for this sample.
-        target_format:    Desired output format ('flac', 'wav', 'webm').
-                          If None, keeps the original format (flac for array input).
-        target_bit_depth: Desired bit depth (e.g. 16, 24, 32).
-                          Ignored when target format is webm/opus.
+        audio_path:        Path to the source audio file (str or Path), or a
+                           (numpy_array, sample_rate) tuple for in-memory audio.
+                           Array shape must be (frames,) or (frames, channels).
+        item_id:           Unique identifier for this sample.
+        target_format:     Desired output format ('flac', 'wav', 'webm', 'mp3').
+                           If None, keeps the original format (flac for array input).
+                           mp3 -> mp3 and webm -> webm are byte copies.
+        target_bit_depth:  Desired bit depth (e.g. 16, 24, 32).
+                           Ignored when target format is webm/opus/mp3. Decoding a
+                           lossy source (mp3/webm) to PCM defaults to 16.
+        compression_level: MP3 only: 0.0 (highest bitrate) .. <1.0 (smallest).
+                           None keeps libsndfile's default.
+        bitrate_mode:      MP3 only: 'CONSTANT', 'AVERAGE' or 'VARIABLE'.
 
     Returns:
         (raw_bytes, metadata_dict)
@@ -132,38 +220,8 @@ def audio_write(
         if target_bit_depth is None:
             target_bit_depth = 16
 
-        target_format = target_format.lower()
-        target_is_webm = target_format in PYAV_FORMATS
-
-        if target_is_webm:
-            raw_bytes = _write_webm(data, sr)
-            metadata = {
-                "sample_rate": 48000,
-                "channels": data.shape[1],
-                "samples": data.shape[0],
-                "format": "webm",
-                "bit_depth": None,
-                "duration": data.shape[0] / 48000,
-            }
-        else:
-            target_subtype = BIT_DEPTH_TO_SUBTYPE.get(target_bit_depth)
-            if target_subtype is None:
-                raise ValueError(
-                    f"Unsupported target bit depth: {target_bit_depth}. "
-                    f"Supported: {sorted(BIT_DEPTH_TO_SUBTYPE.keys())}"
-                )
-            buf = io.BytesIO()
-            sf.write(buf, data, sr, format=target_format.upper(), subtype=target_subtype)
-            raw_bytes = buf.getvalue()
-            metadata = {
-                "sample_rate": sr,
-                "channels": data.shape[1],
-                "samples": data.shape[0],
-                "format": target_format,
-                "bit_depth": target_bit_depth,
-                "duration": data.shape[0] / sr,
-            }
-        return raw_bytes, metadata
+        return _encode(data, sr, target_format.lower(), target_bit_depth,
+                       compression_level, bitrate_mode)
 
     # Convert Path to string
     audio_path = str(audio_path)
@@ -189,17 +247,19 @@ def audio_write(
 
     if target_format is None:
         target_format = src_format
-    if target_bit_depth is None:
-        target_bit_depth = src_bit_depth  # None for Opus, int for PCM
-
     target_format = target_format.lower()
-    target_is_webm = target_format in PYAV_FORMATS
+    target_is_lossy = target_format in LOSSY_FORMATS
+
+    if target_bit_depth is None:
+        target_bit_depth = src_bit_depth  # None for Opus/MP3, int for PCM
+        if target_bit_depth is None and src_format in LOSSY_FORMATS and not target_is_lossy:
+            target_bit_depth = 16
 
     # --- Fast path: no conversion needed -----------------------------
     needs_conversion = True
     if target_format == src_format:
-        if target_is_webm:
-            # Opus is not PCM — nothing to convert if format matches
+        if target_is_lossy:
+            # Opus/MP3 are not PCM — nothing to convert if format matches
             needs_conversion = False
         elif (
             src_bit_depth is not None
@@ -222,49 +282,10 @@ def audio_write(
         return raw_bytes, metadata
 
     # --- Slow path: decode then re-encode ----------------------------
-
-    # Decode
     if src_is_webm:
         data, sr, channels, frames = _read_webm(audio_path)
     else:
         data, sr = sf.read(audio_path, dtype="float64", always_2d=True)
 
-    # Encode
-    if target_is_webm:
-        raw_bytes = _write_webm(data, sr)
-        metadata = {
-            "sample_rate": 48000,  # Opus always outputs 48kHz
-            "channels": data.shape[1],
-            "samples": data.shape[0],
-            "format": "webm",
-            "bit_depth": None,
-            "duration": data.shape[0] / 48000
-        }
-    else:
-        target_subtype = BIT_DEPTH_TO_SUBTYPE.get(target_bit_depth)
-        if target_subtype is None:
-            raise ValueError(
-                f"Unsupported target bit depth: {target_bit_depth}. "
-                f"Supported: {sorted(BIT_DEPTH_TO_SUBTYPE.keys())}"
-            )
-
-        buf = io.BytesIO()
-        sf.write(
-            buf,
-            data,
-            sr,
-            format=target_format.upper(),
-            subtype=target_subtype,
-        )
-        raw_bytes = buf.getvalue()
-
-        metadata = {
-            "sample_rate": sr,
-            "channels": data.shape[1],
-            "samples": data.shape[0],
-            "format": target_format,
-            "bit_depth": target_bit_depth,
-            "duration": data.shape[0] / sr
-        }
-
-    return raw_bytes, metadata
+    return _encode(data, sr, target_format, target_bit_depth,
+                   compression_level, bitrate_mode)

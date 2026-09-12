@@ -4,7 +4,7 @@ Efficient Python library for reading and writing multimedia data (audio, video, 
 
 ## Features
 
-- **Multi-format support**: Audio (FLAC, WAV, WebM/Opus), Video (MP4), Text (zstandard compressed)
+- **Multi-format support**: Audio (FLAC, WAV, MP3, WebM/Opus), Video (MP4), Text (zstandard compressed)
 - **Local and remote access**: Seamlessly read from local files or remote URLs using HTTP range requests
 - **Efficient storage**: Binary blob archives with PyArrow/Parquet metadata indexing
 - **Frame-level slicing**: Extract specific time ranges from audio/video without loading entire files
@@ -123,7 +123,7 @@ from omniio.audio.write import audio_write
 raw_bytes, metadata = audio_write(
     audio_path="input.wav",
     item_id="converted_audio",
-    target_format="flac",  # 'flac', 'wav', 'webm'
+    target_format="flac",  # 'flac', 'wav', 'webm', 'mp3'
     target_bit_depth=24
 )
 
@@ -170,7 +170,7 @@ The metadata table contains:
 ## Data Formats
 
 ### Audio
-- **Input formats**: FLAC, WAV, OGG, WebM/Opus
+- **Input formats**: FLAC, WAV, OGG, MP3, WebM/Opus
 - **Output shape**: `(frames, channels)` as `float32`
 - **Supported bit depths**: 8, 16, 24, 32 (PCM formats only)
 

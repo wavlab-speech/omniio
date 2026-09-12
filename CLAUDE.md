@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The library is organized by data modality, with each supporting read and write operations:
 
-- **audio/**: Audio file I/O (FLAC, WAV, WebM/Opus)
+- **audio/**: Audio file I/O (FLAC, WAV, MP3, WebM/Opus)
 - **video/**: Video file I/O (MP4 with audio streams)
 - **text/**: Text file I/O (zstandard compressed)
 - **blob/**: Binary archive management with PyArrow metadata
@@ -49,6 +49,7 @@ The library is organized by data modality, with each supporting read and write o
 - `b"RIFF"` → WAV
 - `b"\x1aE\xdf\xa3"` → WebM/Matroska
 - `b"OggS"` → OGG
+- `b"ID3"` or an MPEG frame sync (`0xFF` + 3 high bits, non-zero layer) → MP3
 
 **Time-Based Slicing**: Audio and video readers support optional time-based extraction:
 - `start_time`, `end_time` parameters in seconds
@@ -130,8 +131,8 @@ from omniio.audio.write import audio_write
 raw_bytes, metadata = audio_write(
     audio_path="input.wav",
     item_id="sample_001",
-    target_format="flac",  # 'flac', 'wav', 'webm'
-    target_bit_depth=16    # 8, 16, 24, 32 (ignored for webm)
+    target_format="flac",  # 'flac', 'wav', 'webm', 'mp3'
+    target_bit_depth=16    # 8, 16, 24, 32 (ignored for webm/mp3)
 )
 # Returns raw bytes and metadata dict with sample_rate, channels, samples, format, bit_depth
 ```
@@ -154,7 +155,7 @@ raw_bytes, metadata = text_write(
 
 Key libraries used throughout the codebase:
 - **av (PyAV)**: Video/audio codec operations, supports WebM/Opus
-- **soundfile**: Audio I/O for FLAC, WAV, OGG formats
+- **soundfile**: Audio I/O for FLAC, WAV, OGG, MP3 formats (MP3 needs libsndfile >= 1.1)
 - **numpy**: Array operations for audio/video data
 - **requests**: HTTP range requests for remote reading
 - **zstandard**: Text compression/decompression
@@ -165,6 +166,8 @@ Key libraries used throughout the codebase:
 - Audio data is normalized to float32 in range [-1.0, 1.0] with shape (frames, channels)
 - Video frames are RGB24 format with shape (frames, height, width, 3) as uint8
 - WebM/Opus always uses 48kHz sample rate internally (PyAV handles resampling)
+- MP3: same-format writes are byte copies (`bit_depth` None); encoding is gapless, so `samples` matches the decoded length. Only MPEG rates (8k-48k) can be encoded.
+- MP3 windowed reads decode from the entry's first sample and slice, never seek: a libsndfile seek lands on the right sample but the following frames can decode wrong (bit reservoir / overlap state from unseen frames, reach depends on bitrate). Exact by construction; cost is O(end_time), so a late window in a long mp3 entry decodes everything before it.
 - Blob workers check for duplicate IDs before writing; set `overwrite=True` to skip
 - Archive byte offsets use [start_byte, end_byte) convention (end is exclusive)
 - Remote reads use HTTP 206 Partial Content with `Range` headers
