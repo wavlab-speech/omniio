@@ -1,32 +1,34 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "setuptools_scm[toml]>=6.2"]
+# setuptools_scm was listed but never wired up -- the version below is
+# static and the repository has no tags. Deriving it from tags instead is a
+# reasonable change, but it should be a deliberate one.
+requires = ["setuptools>=77"]  # 77 is where PEP 639 landed; see the license fields below
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "omniio"
-version = "0.1.0"
+version = "0.1.2"
 description = "Efficient multimedia I/O for binary archive blobs"
 readme = "README.md"
-requires-python = ">=3.8"
-license = {text = "MIT"}
+requires-python = ">=3.10"  # what CI tests; 3.8 and 3.9 are end-of-life
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
-    {name = "Your Name", email = "williamchen@cmu.edu"}
+    {name = "William Chen", email = "williamchen@cmu.edu"}
 ]
 maintainers = [
-    {name = "Your Name", email = "williamchen@cmu.edu"}
+    {name = "William Chen", email = "williamchen@cmu.edu"}
 ]
 keywords = ["multimedia", "audio", "video", "text", "archive", "blob", "io"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Sound/Audio",
     "Topic :: Multimedia :: Video",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -40,9 +42,19 @@ dependencies = [
     "zstandard>=0.19.0",
     "pyarrow>=10.0.0",
     "Pillow>=9.0.0",
+    # omniio/blob/blob.py imports it at module scope, so omniio.blob does not
+    # import at all without it. See #3.
+    "tqdm>=4.60.0",
 ]
 
 [project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    # tests/test_blob.py reads metadata back through pyarrow's pandas bridge.
+    "pandas>=1.3.0",
+]
+
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
@@ -59,14 +71,14 @@ Repository = "https://github.com/wavlab-speech/omniio"
 "Bug Tracker" = "https://github.com/wavlab-speech/omniio/issues"
 
 [tool.setuptools]
-packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image"]
-
-[tool.setuptools.package-data]
-omniio = ["py.typed"]
+packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image", "omniio.tools", "omniio.tools.kaldi"]
 
 [tool.black]
 line-length = 100
-target-version = ["py38", "py39", "py310", "py311", "py312"]
+# The minimum supported version is all black needs: it decides which syntax
+# it may emit, and listing newer ones only makes its AST check complain when
+# it runs on an older interpreter than the newest listed.
+target-version = ["py310"]
 include = '\.pyi?$'
 exclude = '''
 /(
@@ -83,7 +95,7 @@ line_length = 100
 skip_gitignore = true
 
 [tool.mypy]
-python_version = "3.8"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
