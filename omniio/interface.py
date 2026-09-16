@@ -121,6 +121,7 @@ def midi_read(
     channels: int = 1,
     soundfont: Optional[str] = None,
     backend: str = "auto",
+    frequency_shift: float = 0.0,
 ) -> MidiRead:
     """
     Read MIDI from archive, automatically routing to local or remote.
@@ -137,13 +138,16 @@ def midi_read(
         channels:        Synthesis channels (1 or 2)
         soundfont:       .sf2 path for the fluidsynth backend
         backend:         "auto" | "fluidsynth" | "sine"
+        frequency_shift: Transpose by this many semitones (fractional allowed); the MIDI,
+                         the notes table and the synthesized waveform are all shifted.
+                         Drums stay put; notes pushed outside 0..127 are dropped.
 
     Returns:
         MidiRead with the (sliced) PrettyMIDI, a notes table, and optional waveform
     """
     kwargs = dict(start_time=start_time, end_time=end_time, include_partial=include_partial,
                   synthesize=synthesize, sample_rate=sample_rate, channels=channels,
-                  soundfont=soundfont, backend=backend)
+                  soundfont=soundfont, backend=backend, frequency_shift=frequency_shift)
     if os.path.exists(archive_path):
         return midi_read_local(archive_path, start_offset, file_size, **kwargs)
     else:

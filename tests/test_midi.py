@@ -365,3 +365,91 @@ class TestBlobMidi:
         result = midi_read(row["path"], row["start_byte"],
                            row["end_byte"] - row["start_byte"], start_time=0.0, end_time=2.0)
         assert result.notes.shape[0] == 4
+
+
+class TestFrequencyShift:
+    def _archive(self, temp_dir, blobs):
+        return TestMidiRead._archive(self, temp_dir, blobs)
+
+    def test_transpose_moves_pitched_notes_and_leaves_drums(self):
+        from omniio.midi.common import transpose_midi
+        pm = _build_midi()
+        out = transpose_midi(pm, 5)
+        notes, orig = notes_from_midi(out), notes_from_midi(pm)
+        assert np.array_equal(notes["pitch"][~notes["is_drum"]], orig["pitch"][~orig["is_drum"]] + 5)
+        assert np.array_equal(notes["pitch"][notes["is_drum"]], orig["pitch"][orig["is_drum"]])
+        # timing, velocity and instrument assignment are untouched; the input was not modified
+        for col in ("onset", "offset", "velocity", "program", "is_drum"):
+            assert np.array_equal(notes[col], orig[col]), col
+        assert notes_from_midi(pm)["pitch"].tolist() == orig["pitch"].tolist()
+
+    def test_transpose_drops_notes_that_leave_the_midi_range(self):
+        from omniio.midi.common import transpose_midi
+        pm = _build_midi()                       # bass note at 40 -> gone at -41; piano 60/64/67 survive
+        out = transpose_midi(pm, -41)
+        notes = notes_from_midi(out)
+        pitched = notes[~notes["is_drum"]]
+        assert sorted(pitched["pitch"].tolist()) == [19, 23, 26]
+        assert notes["is_drum"].sum() == 1
+        assert notes_from_midi(transpose_midi(pm, 0))["pitch"].tolist() == notes_from_midi(pm)["pitch"].tolist()
+
+    def test_fractional_shift_becomes_a_pitch_bend(self):
+        from omniio.midi.common import BEND_UNITS, transpose_midi
+        pm = _build_midi()
+        out = transpose_midi(pm, 0.5)            # half a semitone: a quarter of the 2-semitone wheel
+        piano, bass, drums = out.instruments
+        assert notes_from_midi(out)["pitch"].tolist() == notes_from_midi(pm)["pitch"].tolist()
+        # the bass had no bends: one is inserted at t=0
+        assert [b.time for b in bass.pitch_bends] == [0.0]
+        assert bass.pitch_bends[0].pitch == BEND_UNITS // 4
+        # the piano's existing bend (1000 @ 1.0 s) is offset, and t=0 gets the offset alone
+        assert [(b.time, b.pitch) for b in piano.pitch_bends] == [(0.0, BEND_UNITS // 4), (1.0, 1000 + BEND_UNITS // 4)]
+        assert drums.pitch_bends == []
+        # a whole+fraction shift splits into both
+        out2 = transpose_midi(pm, -2.25)
+        assert notes_from_midi(out2)["pitch"][~notes_from_midi(out2)["is_drum"]].tolist() == \
+            (notes_from_midi(pm)["pitch"][~notes_from_midi(pm)["is_drum"]] - 2).tolist()
+        assert out2.instruments[1].pitch_bends[0].pitch == -BEND_UNITS // 8
+
+    def test_read_with_frequency_shift_shifts_notes_and_audio(self, temp_dir, sample_midi):
+        path, _ = sample_midi
+        raw, _ = midi_write(str(path), "m1")
+        archive, [(off, size)] = self._archive(temp_dir, [raw])
+        base = midi_read_local(archive, off, size, start_time=0.0, end_time=1.0,
+                               synthesize=True, sample_rate=8000, backend="sine")
+        up = midi_read_local(archive, off, size, start_time=0.0, end_time=1.0,
+                             synthesize=True, sample_rate=8000, backend="sine", frequency_shift=12)
+        assert up.frequency_shift == 12.0 and base.frequency_shift == 0.0
+        assert np.array_equal(up.notes["pitch"][~up.notes["is_drum"]], base.notes["pitch"][~base.notes["is_drum"]] + 12)
+        assert up.midi.instruments[0].notes[0].pitch == base.midi.instruments[0].notes[0].pitch + 12
+        # the waveform is an octave up: the spectral peak of the sine render doubles
+        def peak_hz(x):
+            spec = np.abs(np.fft.rfft(x[:, 0] * np.hanning(len(x))))
+            return np.fft.rfftfreq(len(x), 1 / 8000)[spec.argmax()]
+        assert abs(peak_hz(up.array) / peak_hz(base.array) - 2.0) < 0.05
+        # the same call through the routing interface
+        via = midi_read(archive, off, size, start_time=0.0, end_time=1.0, frequency_shift=12)
+        assert np.array_equal(via.notes["pitch"], up.notes["pitch"])
+
+    def test_synthesize_frequency_shift_does_not_mutate_the_input(self):
+        pm = _build_midi()
+        before = notes_from_midi(pm)["pitch"].tolist()
+        a = synthesize(pm, sample_rate=8000, backend="sine", duration=1.0, frequency_shift=7)
+        b = synthesize(pm, sample_rate=8000, backend="sine", duration=1.0)
+        assert notes_from_midi(pm)["pitch"].tolist() == before
+        assert a.shape == b.shape and not np.array_equal(a, b)
+
+    @pytest.mark.skipif(not fluidsynth_available(), reason="libfluidsynth not available")
+    def test_fluidsynth_fractional_shift_is_audible(self):
+        pm = pretty_midi.PrettyMIDI()
+        inst = pretty_midi.Instrument(program=73)        # flute: a clean, near-sinusoidal tone
+        inst.notes.append(pretty_midi.Note(100, 69, 0.0, 2.0))   # A4 = 440 Hz
+        pm.instruments.append(inst)
+        sr = 22050
+        def peak_hz(x):
+            seg = x[int(0.5 * sr):int(1.5 * sr), 0]
+            spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+            return np.fft.rfftfreq(len(seg), 1 / sr)[spec.argmax()]
+        base = peak_hz(synthesize(pm, sample_rate=sr, backend="fluidsynth", duration=2.0))
+        up = peak_hz(synthesize(pm, sample_rate=sr, backend="fluidsynth", duration=2.0, frequency_shift=0.5))
+        assert abs(up / base - 2 ** (0.5 / 12)) < 0.01     # a quarter-tone, via the pitch wheel

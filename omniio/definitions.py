@@ -11,6 +11,7 @@ class ArchiveRead:
 class AudioRead(ArchiveRead):
     sample_rate: int = None
     array: np.ndarray = None
+    frequency_shift: float = 0.0
 
 @dataclass
 class TextRead(ArchiveRead):
@@ -40,6 +41,7 @@ class MidiRead(ArchiveRead):
     `notes` is a structured array (see omniio.modalities.midi.common.NOTE_DTYPE) with onset/offset
     in seconds on the same clock; `duration` is the seconds the window covers.
     `sample_rate` / `array` (frames, channels) float32 are set only when synthesized.
+    `frequency_shift` records the transposition (semitones) applied on read, 0.0 if none.
     """
     midi: Any = None
     notes: np.ndarray = None
@@ -48,6 +50,7 @@ class MidiRead(ArchiveRead):
     end_time: float = None
     sample_rate: int = None
     array: np.ndarray = None
+    frequency_shift: float = 0.0
 
     def to_bytes(self) -> bytes:
         """Serialize `midi` (i.e. the window that was read) to Standard MIDI File bytes."""
