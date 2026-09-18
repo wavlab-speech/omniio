@@ -248,6 +248,7 @@ Key libraries used throughout the codebase:
 - WebM/Opus always uses 48kHz sample rate internally (PyAV handles resampling)
 - MP3: same-format writes are byte copies (`bit_depth` None); encoding is gapless, so `samples` matches the decoded length. Only MPEG rates (8k-48k) can be encoded.
 - MP3 windowed reads decode from the entry's first sample and slice, never seek: a libsndfile seek lands on the right sample but the following frames can decode wrong (bit reservoir / overlap state from unseen frames, reach depends on bitrate). Exact by construction; cost is O(end_time), so a late window in a long mp3 entry decodes everything before it.
+- WebM/Opus windowed reads seek, then trim. A WebM seek only lands on a cluster boundary (at or before the target), so the reader seeks 0.25 s early, maps the landing frame's pts onto the Opus frame grid — Matroska timestamps are milliseconds, i.e. +-24 samples at 48 kHz — and drops the samples that fall before the window. A window is then the samples a full decode has at that offset (matching to ~2e-4; the margin keeps the decoder warm). A seek that lands past the window falls back to decoding from the first sample.
 - Blob workers check for duplicate IDs before writing; set `overwrite=True` to skip
 - Archive byte offsets use [start_byte, end_byte) convention (end is exclusive)
 - Remote reads use HTTP 206 Partial Content with `Range` headers

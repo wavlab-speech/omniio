@@ -76,62 +76,165 @@ def _read_pcm(
     )
 
 
+# Opus keeps decoder state across frames, and WebM can only be seeked to a cluster
+# boundary, so a seek lands at or before the target time. The reader seeks early by this
+# margin and drops whatever lands before the window: the extra audio both covers the
+# codec's own 80 ms pre-roll and pushes the seek onto an earlier cluster, so the decoder
+# is warm by the time the window starts. Measured on a 10 s Opus file, the first samples
+# of a window differ from the same samples of a full decode by 0.09 at 80 ms of margin
+# and by 2e-4 at 250 ms; the extra quarter second of decoding costs ~1 ms.
+_OPUS_SEEK_MARGIN_S = 0.25
+
+
+def _frame_samples(frame) -> np.ndarray:
+    """A decoded audio frame as (channels, samples), planar or packed."""
+    arr = frame.to_ndarray()
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    if not frame.format.is_planar and arr.shape[0] == 1 and frame.samples:
+        arr = arr.reshape(frame.samples, -1).T  # packed: one plane, channels interleaved
+    return arr
+
+
+def _frame_grid(container, stream):
+    """The sample positions a frame is allowed to start at, as (first, steady) lengths.
+
+    Every Opus frame in a stream is the same length bar the first, which the encoder's
+    pre-skip trims, so frame k starts at `first + (k - 1) * steady`. None if the stream
+    is too short to tell. Decoding the head costs two packets and is what makes a seek
+    anchor exact (see `_snap_to_grid`).
+    """
+    container.seek(stream.start_time or 0, stream=stream)
+    lengths = []
+    for frame in container.decode(audio=0):
+        lengths.append(_frame_samples(frame).shape[1])
+        if len(lengths) == 2:
+            return lengths[0], lengths[1]
+    return None
+
+
+def _snap_to_grid(pos: int, grid, tol: int) -> int:
+    """Correct a pts-derived sample position onto the frame grid.
+
+    Matroska timestamps are milliseconds, so a position read off a frame's pts is out by
+    up to half a millisecond (+-24 samples at 48 kHz) — enough for a window to miss the
+    samples a full decode has at that offset. The frame the position belongs to starts on
+    exactly one grid point, so snap to it, and only within `tol`: on a stream whose frames
+    are not uniform, snapping can then never move a position further than the timestamp
+    quantisation already had.
+    """
+    if grid is None:
+        return pos
+    first, steady = grid
+    if not steady:
+        return pos
+    steps = max(0, round((pos - first) / steady))
+    candidates = (0, first + steps * steady)
+    best = min(candidates, key=lambda c: abs(c - pos))
+    return best if abs(best - pos) <= tol else pos
+
+
+def _webm_frames(container, stream, seek_sample: Optional[int]):
+    """Decode a WebM audio stream, yielding (index of the frame's first sample, frame).
+
+    Indices count from the stream's first sample, so they address the same array a full
+    read returns. `seek_sample` None decodes from wherever the container is; an int seeks
+    (to a cluster at or before it, minus the seek margin) and lets the caller trim.
+    The first frame's pts anchors the run and every frame after it is counted in samples,
+    which are exact where timestamps are not.
+    """
+    sr = stream.rate
+    time_base = stream.time_base
+    start_pts = stream.start_time or 0
+
+    grid = None
+    if seek_sample:
+        grid = _frame_grid(container, stream)
+    if seek_sample is not None:
+        seek_s = max(0.0, seek_sample / sr - _OPUS_SEEK_MARGIN_S)
+        container.seek(start_pts + int(seek_s / time_base), stream=stream)
+
+    tol = int(sr * time_base / 2) + 1
+    pos = None
+    for frame in container.decode(audio=0):
+        arr = _frame_samples(frame)
+        if pos is None:
+            pts = start_pts if frame.pts is None else frame.pts
+            pos = int(round(float((pts - start_pts) * time_base) * sr))
+            pos = _snap_to_grid(pos, grid, tol)
+        yield pos, arr
+        pos += arr.shape[1]
+
+
+def _gather_window(frames, start_sample: int, end_sample: Optional[int]):
+    """Trim decoded frames to [start_sample, end_sample).
+
+    Returns (chunks, overshot). `overshot` marks a seek that landed after the requested
+    start — the window cannot be built from these frames and the caller decodes from the
+    top instead.
+    """
+    chunks = []
+    for i, (pos, arr) in enumerate(frames):
+        if i == 0 and pos > start_sample:
+            return [], True
+        n = arr.shape[1]
+        if pos + n <= start_sample:                  # entirely before the window
+            continue
+        if end_sample is not None and pos >= end_sample:
+            break
+        lo = max(0, start_sample - pos)
+        hi = n if end_sample is None else min(n, end_sample - pos)
+        if hi > lo:
+            chunks.append(arr[:, lo:hi])
+        if end_sample is not None and pos + hi >= end_sample:
+            break
+    return chunks, False
+
+
 def _read_webm(
     blob: bytes,
     start_time: Optional[float],
     end_time: Optional[float],
 ) -> AudioRead:
     """Read WebM/Opus via PyAV, with optional time slicing."""
-    buf = io.BytesIO(blob)
-
-    with av.open(buf, mode="r") as container:
+    with av.open(io.BytesIO(blob), mode="r") as container:
         stream = container.streams.audio[0]
         sr = stream.rate
-        time_base = stream.time_base
+        channels = stream.channels
 
-        # Seek to start if requested
-        if start_time is not None and start_time > 0:
-            # av.open seeks in time_base units; use the stream's time_base
-            target_pts = int(start_time / time_base)
-            container.seek(target_pts, stream=stream)
+        start_sample = 0 if start_time is None else max(0, int(round(start_time * sr)))
+        end_sample = (
+            None if end_time is None else max(start_sample, int(round(end_time * sr)))
+        )
 
-        start_sample = 0 if start_time is None else int(start_time * sr)
-        end_sample = None if end_time is None else int(end_time * sr)
+        chunks, overshot = _gather_window(
+            _webm_frames(container, stream, start_sample or None), start_sample, end_sample
+        )
 
-        chunks = []
-        total_samples = 0
-
-        for frame in container.decode(audio=0):
-            arr = frame.to_ndarray()  # (channels, samples)
-            frame_samples = arr.shape[1]
-            frame_start_pts = frame.pts * float(time_base) * sr if frame.pts else total_samples
-
-            chunks.append(arr)
-            total_samples += frame_samples
-
-            if end_sample is not None and total_samples >= (end_sample - start_sample):
-                break
-
-        if not chunks:
-            return AudioRead(
-                file_type="webm",
-                modality="audio",
-                sample_rate=sr,
-                array=np.empty((0, stream.channels), dtype=np.float32),
+    if overshot:
+        # The seek landed after the window and nothing before it can be recovered from
+        # that container: decode the stream from the top in a fresh one, where the first
+        # decoded sample is sample 0 by construction.
+        with av.open(io.BytesIO(blob), mode="r") as container:
+            stream = container.streams.audio[0]
+            chunks, _ = _gather_window(
+                _webm_frames(container, stream, None), start_sample, end_sample
             )
 
-        raw = np.concatenate(chunks, axis=1)  # (channels, total)
-        data = raw.T.astype(np.float32)       # (frames, channels)
+    if not chunks:
+        return AudioRead(
+            file_type="webm",
+            modality="audio",
+            sample_rate=sr,
+            array=np.empty((0, channels), dtype=np.float32),
+        )
 
-        # Normalize integer formats to float
-        if np.issubdtype(raw.dtype, np.integer):
-            data /= float(np.iinfo(raw.dtype).max)
+    raw = np.concatenate(chunks, axis=1)  # (channels, window)
+    data = raw.T.astype(np.float32)       # (frames, channels)
 
-        # Trim to exact sample boundaries
-        # After seeking, PyAV may decode a few extra frames before/after
-        if end_sample is not None:
-            keep = end_sample - start_sample
-            data = data[:keep]
+    # Normalize integer formats to float
+    if np.issubdtype(raw.dtype, np.integer):
+        data /= float(np.iinfo(raw.dtype).max)
 
     return AudioRead(
         file_type="webm",
