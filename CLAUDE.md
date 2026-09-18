@@ -198,6 +198,7 @@ Key libraries used throughout the codebase:
 - Audio data is normalized to float32 in range [-1.0, 1.0] with shape (frames, channels)
 - Video frames are RGB24 format with shape (frames, height, width, 3) as uint8
 - WebM/Opus always uses 48kHz sample rate internally (PyAV handles resampling)
+- WebM/Opus windowed reads seek, then trim. A WebM seek only lands on a cluster boundary (at or before the target), so the reader seeks 0.25 s early, snaps the landing frame's timestamp onto the Opus frame grid — Matroska timestamps are milliseconds, i.e. +-24 samples at 48 kHz — and drops the samples that fall before the window. A window inside the first 0.25 s, or a stream with no start timestamp, decodes from the top instead: exact, and cheaper than a seek. A seek that lands past the window falls back to decoding from the first sample. Windows match a full decode to ~2e-4 (the margin keeps the decoder warm); a stream with timestamp gaps (DTX, dropped packets) is the exception — a seeked read follows the timestamps, a full decode just concatenates frames.
 - Blob workers check for duplicate IDs before writing; set `overwrite=True` to skip
 - Archive byte offsets use [start_byte, end_byte) convention (end is exclusive)
 - Remote reads use HTTP 206 Partial Content with `Range` headers
