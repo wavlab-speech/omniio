@@ -96,86 +96,94 @@ def _frame_samples(frame) -> np.ndarray:
     return arr
 
 
-def _frame_grid(container, stream):
-    """The sample positions a frame is allowed to start at, as (first, steady) lengths.
-
-    Every Opus frame in a stream is the same length bar the first, which the encoder's
-    pre-skip trims, so frame k starts at `first + (k - 1) * steady`. None if the stream
-    is too short to tell. Decoding the head costs two packets and is what makes a seek
-    anchor exact (see `_snap_to_grid`).
-    """
-    container.seek(stream.start_time or 0, stream=stream)
-    lengths = []
-    for frame in container.decode(audio=0):
-        lengths.append(_frame_samples(frame).shape[1])
-        if len(lengths) == 2:
-            return lengths[0], lengths[1]
-    return None
-
-
-def _snap_to_grid(pos: int, grid, tol: int) -> int:
+def _snap_to_grid(pos: int, frame_samples: int, tol: int) -> int:
     """Correct a pts-derived sample position onto the frame grid.
 
     Matroska timestamps are milliseconds, so a position read off a frame's pts is out by
     up to half a millisecond (+-24 samples at 48 kHz) — enough for a window to miss the
-    samples a full decode has at that offset. The frame the position belongs to starts on
-    exactly one grid point, so snap to it, and only within `tol`: on a stream whose frames
-    are not uniform, snapping can then never move a position further than the timestamp
-    quantisation already had.
+    samples a full decode has at that offset. A decode that starts at a seek begins on a
+    frame boundary (libavformat re-applies the codec delay there, so the run starts a
+    whole number of frames into the stream), and only one such boundary can be within a
+    timestamp tick of the estimate. Snapping is capped at `tol`, so on a stream that does
+    not hold to the grid it can never move a position further than the quantisation had.
     """
-    if grid is None:
+    if frame_samples <= 0:
         return pos
-    first, steady = grid
-    if not steady:
-        return pos
-    steps = max(0, round((pos - first) / steady))
-    candidates = (0, first + steps * steady)
-    best = min(candidates, key=lambda c: abs(c - pos))
-    return best if abs(best - pos) <= tol else pos
+    snapped = frame_samples * round(pos / frame_samples)
+    return snapped if abs(snapped - pos) <= tol else pos
+
+
+def _is_opus_frame_size(n: int, sr: int) -> bool:
+    """Opus codes 2.5, 5, 10, 20, 40 or 60 ms per frame — nothing else is a frame grid."""
+    return any(abs(n - round(sr * ms / 1000)) <= 1 for ms in (2.5, 5, 10, 20, 40, 60))
 
 
 def _webm_frames(container, stream, seek_sample: Optional[int]):
     """Decode a WebM audio stream, yielding (index of the frame's first sample, frame).
 
     Indices count from the stream's first sample, so they address the same array a full
-    read returns. `seek_sample` None decodes from wherever the container is; an int seeks
-    (to a cluster at or before it, minus the seek margin) and lets the caller trim.
-    The first frame's pts anchors the run and every frame after it is counted in samples,
-    which are exact where timestamps are not.
+    read returns. With `seek_sample` None the container is decoded from where it is — the
+    first sample of a fresh container is sample 0 by construction, no timestamps involved.
+    An int seeks (to a cluster at or before it, minus the seek margin), anchors the run on
+    the first frame's pts and counts samples from there; the caller trims what lands
+    before the window.
     """
     sr = stream.rate
     time_base = stream.time_base
+
+    if seek_sample is None:
+        pos = 0
+        for frame in container.decode(audio=0):
+            arr = _frame_samples(frame)
+            yield pos, arr
+            pos += arr.shape[1]
+        return
+
     start_pts = stream.start_time or 0
+    seek_s = max(0.0, seek_sample / sr - _OPUS_SEEK_MARGIN_S)
+    container.seek(start_pts + int(seek_s / time_base), stream=stream)
 
-    grid = None
-    if seek_sample:
-        grid = _frame_grid(container, stream)
-    if seek_sample is not None:
-        seek_s = max(0.0, seek_sample / sr - _OPUS_SEEK_MARGIN_S)
-        container.seek(start_pts + int(seek_s / time_base), stream=stream)
+    frames = container.decode(audio=0)
+    head = next(frames, None)
+    if head is None:
+        return
+    head_arr = _frame_samples(head)
+    # The frame after the first is a whole frame, which is the grid the run sits on. The
+    # first frame is not: libavformat trims the codec delay off it after a seek.
+    nxt = next(frames, None)
+    nxt_arr = None if nxt is None else _frame_samples(nxt)
+    grid = (nxt_arr if nxt_arr is not None else head_arr).shape[1]
 
-    tol = int(sr * time_base / 2) + 1
-    pos = None
-    for frame in container.decode(audio=0):
+    pts = start_pts if head.pts is None else head.pts
+    pos = int(round(float((pts - start_pts) * time_base) * sr))
+    if _is_opus_frame_size(grid, sr):
+        pos = _snap_to_grid(pos, grid, int(sr * time_base / 2) + 1)
+
+    yield pos, head_arr
+    pos += head_arr.shape[1]
+    if nxt_arr is not None:
+        yield pos, nxt_arr
+        pos += nxt_arr.shape[1]
+    for frame in frames:
         arr = _frame_samples(frame)
-        if pos is None:
-            pts = start_pts if frame.pts is None else frame.pts
-            pos = int(round(float((pts - start_pts) * time_base) * sr))
-            pos = _snap_to_grid(pos, grid, tol)
         yield pos, arr
         pos += arr.shape[1]
 
 
-def _gather_window(frames, start_sample: int, end_sample: Optional[int]):
+def _gather_window(
+    frames, start_sample: int, end_sample: Optional[int], detect_overshoot: bool = True
+):
     """Trim decoded frames to [start_sample, end_sample).
 
     Returns (chunks, overshot). `overshot` marks a seek that landed after the requested
     start — the window cannot be built from these frames and the caller decodes from the
-    top instead.
+    top instead. A run that did not seek starts at the stream's first sample, so there is
+    nothing earlier to recover and `detect_overshoot` is off: whatever it yields is the
+    beginning of the stream.
     """
     chunks = []
     for i, (pos, arr) in enumerate(frames):
-        if i == 0 and pos > start_sample:
+        if i == 0 and detect_overshoot and pos > start_sample:
             return [], True
         n = arr.shape[1]
         if pos + n <= start_sample:                  # entirely before the window
@@ -207,8 +215,18 @@ def _read_webm(
             None if end_time is None else max(start_sample, int(round(end_time * sr)))
         )
 
+        # Seek only when it can actually skip work and there is a timeline to seek
+        # against: a window inside the first `margin` seconds would seek to sample 0
+        # anyway, and decoding from the top is both exact and cheaper than a seek that
+        # makes libavformat re-apply the codec delay.
+        seeking = (
+            start_sample > _OPUS_SEEK_MARGIN_S * sr and stream.start_time is not None
+        )
         chunks, overshot = _gather_window(
-            _webm_frames(container, stream, start_sample or None), start_sample, end_sample
+            _webm_frames(container, stream, start_sample if seeking else None),
+            start_sample,
+            end_sample,
+            detect_overshoot=seeking,
         )
 
     if overshot:
@@ -218,7 +236,10 @@ def _read_webm(
         with av.open(io.BytesIO(blob), mode="r") as container:
             stream = container.streams.audio[0]
             chunks, _ = _gather_window(
-                _webm_frames(container, stream, None), start_sample, end_sample
+                _webm_frames(container, stream, None),
+                start_sample,
+                end_sample,
+                detect_overshoot=False,
             )
 
     if not chunks:

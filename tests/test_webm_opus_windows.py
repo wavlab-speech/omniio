@@ -8,6 +8,8 @@ every window must be the same samples the full decode has at that offset.
 """
 
 import io
+from fractions import Fraction
+from types import SimpleNamespace
 
 import av
 import numpy as np
@@ -15,7 +17,9 @@ import pytest
 
 from omniio.modalities.audio.read import (
     _gather_window,
+    _is_opus_frame_size,
     _read_webm,
+    _snap_to_grid,
     audio_read_local,
     audio_read_remote,
 )
@@ -439,6 +443,15 @@ class TestGatherWindow:
         chunks, overshot = _gather_window(frames((5000, 960)), 1000, 2000)
         assert overshot and chunks == []
 
+    def test_overshoot_detection_is_off_for_a_run_from_the_top(self):
+        """Nothing was seeked, so the first frame is the stream's first sample: it is the
+        beginning of the file, not a seek that went too far."""
+        chunks, overshot = _gather_window(
+            frames((5000, 960)), 1000, 6000, detect_overshoot=False
+        )
+        assert not overshot
+        assert np.concatenate(chunks, axis=1).shape[1] == 960
+
     def test_no_overshoot_when_frame_starts_exactly_at_the_window(self):
         chunks, overshot = _gather_window(frames((1000, 960)), 1000, 2000)
         assert not overshot and chunks
@@ -476,3 +489,262 @@ class TestOvershootFallback:
         assert window.shape == (2 * SR, 1)
         assert best_lag(window[:, 0], mono_full[5 * SR: 7 * SR, 0]) == 0
         assert rel_rms(window[:, 0], mono_full[5 * SR: 7 * SR, 0]) < 0.01
+
+
+# ---- streams that real ffmpeg will not easily produce -----------------------------------
+# A fake container models the decode the reader has to cope with: a first frame shortened
+# by the codec delay, frames handed back in cluster-sized runs, millisecond timestamps,
+# and — after a seek — libavformat re-applying the codec delay, which is what puts a
+# seeked run on a whole-frame boundary. The signal is a ramp, so every sample says which
+# index it is and the assertions can be exact.
+
+class FakeFormat:
+    is_planar = True
+
+
+class FakeFrame:
+    format = FakeFormat()
+
+    def __init__(self, pts, data):
+        self.pts = pts
+        self._data = data
+        self.samples = data.shape[1]
+
+    def to_ndarray(self):
+        return self._data
+
+
+class FakeStream:
+    def __init__(self, rate, time_base, start_time, channels):
+        self.rate = rate
+        self.time_base = time_base
+        self.start_time = start_time
+        self.channels = channels
+
+
+class FakeContainer:
+    """A decodable audio stream with controllable framing, timestamps and clusters."""
+
+    def __init__(self, samples, rate=SR, frame=960, delay=312, cluster_frames=100,
+                 start_time=7, tick=Fraction(1, 1000), gap_after=None, gap_frames=0):
+        self.rate = rate
+        self.frame = frame
+        self.delay = delay
+        self.cluster_frames = cluster_frames
+        self.tick = tick
+        self.gap_after = gap_after          # index of the frame the gap follows
+        self.gap_frames = gap_frames        # frames dropped from the stream (DTX-like)
+        self.signal = np.arange(samples, dtype=np.float64)[None, :]
+        self.n_frames = (samples + delay + frame - 1) // frame
+        self.streams = SimpleNamespace(audio=[FakeStream(rate, tick, start_time, 1)])
+        self.seeks = []
+        self._cursor = 0
+
+    # --- the stream's own layout -------------------------------------------------------
+    def _span(self, k):
+        """(index of the first sample, index past the last) of frame k, index 0 being the
+        stream's first decoded sample."""
+        lo = max(0, k * self.frame - self.delay)
+        hi = min(self.signal.shape[1], (k + 1) * self.frame - self.delay)
+        return lo, hi
+
+    def _pts(self, k):
+        """Frame k's timestamp: the frame's position in time, quantised to the tick."""
+        base = self.streams.audio[0].start_time or 0
+        if k == 0:
+            return base
+        emitted = k - self.gap_frames if self.gap_after is not None and k > self.gap_after else k
+        return base + int(round((emitted * self.frame / self.rate) / float(self.tick)))
+
+    def _dropped(self, k):
+        return (
+            self.gap_after is not None
+            and self.gap_after < k <= self.gap_after + self.gap_frames
+        )
+
+    # --- the container API the reader uses ---------------------------------------------
+    def seek(self, timestamp, stream=None, **kwargs):
+        self.seeks.append(timestamp)
+        base = self.streams.audio[0].start_time or 0
+        target = max(0, timestamp - base)
+        frames_in = int(target * float(self.tick) * self.rate) // self.frame
+        self._cursor = min(frames_in - frames_in % self.cluster_frames, self.n_frames)
+
+    def decode(self, audio=0):
+        for k in range(self._cursor, self.n_frames):
+            if self._dropped(k):
+                continue
+            lo, hi = self._span(k)
+            if hi <= lo:
+                continue
+            # After a seek onto frame k > 0, libavformat drops the codec delay again.
+            if k == self._cursor and k > 0:
+                lo = min(hi, lo + self.delay)
+            yield FakeFrame(self._pts(k), self.signal[:, lo:hi].copy())
+        self._cursor = self.n_frames
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_read(blob_key, factory, start_time, end_time, monkeypatch):
+    """Run _read_webm against a fresh FakeContainer, recording the containers it opened."""
+    import omniio.modalities.audio.read as read_mod
+
+    opened = []
+
+    def fake_open(buf, mode="r", **kwargs):
+        container = factory()
+        opened.append(container)
+        return container
+
+    monkeypatch.setattr(read_mod.av, "open", fake_open)
+    result = read_mod._read_webm(blob_key, start_time, end_time)
+    return result, opened
+
+
+class TestSyntheticStreams:
+    """Position arithmetic on streams whose framing and timestamps are pinned by hand."""
+
+    @pytest.mark.parametrize("start,end", [
+        (1.0, 2.0), (2.5, 3.5), (0.9999, 1.9999), (5.0, None), (0.5, 0.75), (4.0, 4.001),
+    ])
+    def test_window_is_exact(self, monkeypatch, start, end):
+        total = 10 * SR
+        result, _ = fake_read(b"", lambda: FakeContainer(total), start, end, monkeypatch)
+        lo = int(round(start * SR))
+        hi = total if end is None else int(round(end * SR))
+        assert list(result.array[:, 0]) == list(range(lo, hi))
+
+    @pytest.mark.parametrize("delay", [0, 120, 312, 900])
+    def test_any_codec_delay(self, monkeypatch, delay):
+        result, _ = fake_read(
+            b"", lambda: FakeContainer(10 * SR, delay=delay), 3.0, 4.0, monkeypatch
+        )
+        assert list(result.array[:, 0]) == list(range(3 * SR, 4 * SR))
+
+    @pytest.mark.parametrize("frame", [120, 240, 480, 960, 1920, 2880])
+    def test_any_opus_frame_size(self, monkeypatch, frame):
+        result, _ = fake_read(
+            b"",
+            lambda: FakeContainer(10 * SR, frame=frame, delay=frame // 4,
+                                  cluster_frames=max(1, 96000 // frame)),
+            3.0, 4.0, monkeypatch,
+        )
+        assert list(result.array[:, 0]) == list(range(3 * SR, 4 * SR))
+
+    @pytest.mark.parametrize("cluster_frames", [1, 7, 50, 100, 1000])
+    def test_any_cluster_size(self, monkeypatch, cluster_frames):
+        result, _ = fake_read(
+            b"", lambda: FakeContainer(10 * SR, cluster_frames=cluster_frames),
+            6.0, 7.0, monkeypatch,
+        )
+        assert list(result.array[:, 0]) == list(range(6 * SR, 7 * SR))
+
+    @pytest.mark.parametrize("start_time", [0, 7, 5000, 123456])
+    def test_stream_starting_at_any_timestamp(self, monkeypatch, start_time):
+        result, _ = fake_read(
+            b"", lambda: FakeContainer(10 * SR, start_time=start_time), 3.0, 4.0, monkeypatch
+        )
+        assert list(result.array[:, 0]) == list(range(3 * SR, 4 * SR))
+
+    @pytest.mark.parametrize("tick", [Fraction(1, 1000), Fraction(1, 100), Fraction(1, 48000)])
+    def test_any_timestamp_resolution(self, monkeypatch, tick):
+        result, _ = fake_read(
+            b"", lambda: FakeContainer(10 * SR, tick=tick), 3.0, 4.0, monkeypatch
+        )
+        assert list(result.array[:, 0]) == list(range(3 * SR, 4 * SR))
+
+    def test_stream_without_a_start_timestamp_is_decoded_from_the_top(self, monkeypatch):
+        """No timeline to seek against: decode from the first sample rather than guess."""
+        result, opened = fake_read(
+            b"", lambda: FakeContainer(10 * SR, start_time=None), 5.0, 6.0, monkeypatch
+        )
+        assert opened[0].seeks == []
+        assert list(result.array[:, 0]) == list(range(5 * SR, 6 * SR))
+
+    def test_window_inside_the_seek_margin_does_not_seek(self, monkeypatch):
+        result, opened = fake_read(
+            b"", lambda: FakeContainer(10 * SR), 0.1, 0.6, monkeypatch
+        )
+        assert opened[0].seeks == []
+        assert list(result.array[:, 0]) == list(range(int(0.1 * SR), int(0.6 * SR)))
+
+    def test_far_window_does_seek(self, monkeypatch):
+        _, opened = fake_read(b"", lambda: FakeContainer(10 * SR), 5.0, 6.0, monkeypatch)
+        assert opened[0].seeks and opened[0].seeks[0] < 5000
+
+    def test_single_frame_stream(self, monkeypatch):
+        result, _ = fake_read(b"", lambda: FakeContainer(600, frame=960), None, None, monkeypatch)
+        assert list(result.array[:, 0]) == list(range(600))
+
+    def test_frames_the_grid_does_not_describe_stay_within_the_tick(self, monkeypatch):
+        """A non-Opus frame length (Vorbis in WebM, say) is not snapped: the position then
+        carries the container's own timestamp error, and no more."""
+        result, _ = fake_read(
+            b"", lambda: FakeContainer(10 * SR, frame=1024, delay=0, cluster_frames=90),
+            3.0, 4.0, monkeypatch,
+        )
+        got = result.array[:, 0]
+        assert got.size == SR
+        assert abs(int(got[0]) - 3 * SR) <= 24        # half a millisecond at 48 kHz
+
+    @pytest.mark.parametrize("frame,cluster_frames", [(120, 7), (240, 3), (480, 13), (120, 31)])
+    def test_cluster_boundaries_off_the_millisecond_grid(self, monkeypatch, frame, cluster_frames):
+        """Short Opus frames put cluster boundaries on half-milliseconds, which is exactly
+        where a timestamp-derived position rounds to the wrong sample."""
+        result, _ = fake_read(
+            b"",
+            lambda: FakeContainer(10 * SR, frame=frame, delay=frame // 4,
+                                  cluster_frames=cluster_frames),
+            5.0, 5.25, monkeypatch,
+        )
+        assert list(result.array[:, 0]) == list(range(5 * SR, 5 * SR + SR // 4))
+
+    def test_timestamps_with_a_gap_follow_the_timeline(self, monkeypatch):
+        """Frames missing from the stream (DTX, dropped packets) shift what a timestamp
+        points at. A seeked read follows the timestamps, so it returns the audio the
+        container says is at that time — which is NOT the same index a full decode has,
+        because a full decode just concatenates what it is given."""
+        def factory():
+            return FakeContainer(10 * SR, gap_after=200, gap_frames=50)
+
+        windowed, _ = fake_read(b"", factory, 5.0, 5.5, monkeypatch)
+        full, _ = fake_read(b"", factory, None, None, monkeypatch)
+
+        gap = 50 * 960
+        assert list(windowed.array[:, 0]) == list(range(5 * SR + gap, 5 * SR + gap + SR // 2))
+        assert list(full.array[: SR, 0]) == list(range(SR))     # full read stays on samples
+
+
+class TestSnapToGrid:
+    def test_snaps_within_the_tick(self):
+        assert _snap_to_grid(383976, 960, 25) == 384000
+        assert _snap_to_grid(384024, 960, 25) == 384000
+
+    def test_leaves_a_position_that_is_already_on_the_grid(self):
+        assert _snap_to_grid(384000, 960, 25) == 384000
+
+    def test_never_moves_further_than_the_tolerance(self):
+        assert _snap_to_grid(384500, 960, 25) == 384500
+
+    def test_zero_is_on_the_grid(self):
+        assert _snap_to_grid(0, 960, 25) == 0
+        assert _snap_to_grid(12, 960, 25) == 0
+
+    def test_degenerate_frame_size(self):
+        assert _snap_to_grid(1234, 0, 25) == 1234
+
+    @pytest.mark.parametrize("n,expected", [
+        (120, True), (240, True), (480, True), (960, True), (1920, True), (2880, True),
+        (1024, False), (576, False), (0, False), (4096, False),
+    ])
+    def test_opus_frame_sizes(self, n, expected):
+        assert _is_opus_frame_size(n, SR) is expected
+
+    def test_opus_frame_sizes_at_other_rates(self):
+        assert _is_opus_frame_size(320, 16000)       # 20 ms at 16 kHz
+        assert not _is_opus_frame_size(1024, 16000)
