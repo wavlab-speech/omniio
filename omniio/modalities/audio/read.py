@@ -97,14 +97,51 @@ def _detect_format(header: bytes) -> str:
             return fmt
     raise ValueError(f"Unknown audio format (header bytes: {header[:8].hex()})")
 
+class _ArchiveWindow(io.RawIOBase):
+    """Bytes `[offset, offset + size)` of an open archive as a seekable read-only file.
+
+    Lets the decoder seek inside one entry and pull only the frames a time window needs,
+    instead of the whole entry being read first: a 3 s crop of a 15 min FLAC is a few
+    hundred KB of I/O rather than ~40 MB, which is what dominates random-window loading
+    from a parallel filesystem."""
+
+    def __init__(self, f, offset: int, size: int):
+        self._f, self._offset, self._size, self._pos = f, int(offset), int(size), 0
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, pos: int, whence: int = io.SEEK_SET) -> int:
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}[whence]
+        self._pos = min(max(base + int(pos), 0), self._size)
+        return self._pos
+
+    def readinto(self, b) -> int:
+        n = min(len(b), self._size - self._pos)
+        if n <= 0:
+            return 0
+        self._f.seek(self._offset + self._pos)
+        data = self._f.read(n)
+        b[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+
 def _read_pcm(
-    blob: bytes,
+    blob,
     fmt: str,
     start_time: Optional[float],
     end_time: Optional[float],
 ) -> AudioRead:
-    """Read FLAC/WAV/OGG via soundfile, with optional time slicing."""
-    buf = io.BytesIO(blob)
+    """Read FLAC/WAV/OGG via soundfile, with optional time slicing. `blob` is the entry's
+    bytes or a seekable file object positioned over it."""
+    buf = io.BytesIO(blob) if isinstance(blob, (bytes, bytearray, memoryview)) else blob
     info = sf.info(buf)
     sr = info.samplerate
 
@@ -447,10 +484,14 @@ def audio_read_local(
     """
     with open(archive_path, "rb") as f:
         f.seek(start_offset)
+        fmt = _detect_format(f.read(16))
+        if fmt != "webm" and (start_time is not None or end_time is not None):
+            # A time window of a seekable PCM/FLAC entry: decode in place, reading only
+            # what the decoder asks for.
+            window = io.BufferedReader(_ArchiveWindow(f, start_offset, file_size), 1 << 18)
+            return _read_pcm(window, fmt, start_time, end_time)
+        f.seek(start_offset)
         blob = f.read(file_size)
-
-    header = blob[:16]
-    fmt = _detect_format(header)
 
     if fmt == "webm":
         return _read_webm(blob, start_time, end_time)
