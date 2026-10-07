@@ -3,7 +3,7 @@
 import pytest
 import pyarrow as pa
 
-from omniio.blob.blob import Blob
+from omniio.blob.blob import Blob, SkippedItemsWarning
 from pathlib import Path
 
 class TestBlobInit:
@@ -630,7 +630,7 @@ class TestBlobSkipErrors:
     @pytest.mark.parametrize("num_workers", [0, 2])
     def test_skip_errors_writes_the_rest(self, temp_dir, sample_audio_wav, num_workers):
         blob = Blob(archive_dir=str(temp_dir / f"skip{num_workers}"), modality="audio")
-        with pytest.warns(UserWarning, match="Skipped 2 item"):
+        with pytest.warns(SkippedItemsWarning, match="Skipped 2 item"):
             failed = blob.append(items=self._items(temp_dir, sample_audio_wav),
                                  ids=list("abcde"), num_workers=num_workers,
                                  skip_errors=True, target_format="wav")

@@ -2,8 +2,9 @@
 
 Two backends:
 
-* ``fluidsynth`` — real GM instruments through a SoundFont. Needs ``pyfluidsynth`` plus
-  the ``libfluidsynth`` shared library (``conda install -c conda-forge fluidsynth``).
+* ``fluidsynth`` — real GM instruments through a SoundFont. Needs ``pyfluidsynth``
+  (``pip install 'omniio[synth]'``) plus the ``libfluidsynth`` shared library
+  (``conda install -c conda-forge fluidsynth``).
   Unlike ``PrettyMIDI.fluidsynth`` this renders every instrument through one synthesizer
   (one MIDI channel per track, drums on channel 9) and keeps the synthesizer — with its
   loaded SoundFont — cached per process, so a large SoundFont is loaded once per worker
@@ -58,8 +59,9 @@ def resolve_backend(backend: str) -> str:
         if not _warned_fallback:
             warnings.warn(
                 "pyfluidsynth/libfluidsynth not available; MIDI synthesis falls back to "
-                "additive sine tones (backend='sine'). Install fluidsynth for real "
-                "instrument sounds.",
+                "additive sine tones (backend='sine'). For real instrument sounds: "
+                "pip install 'omniio[synth]' plus libfluidsynth "
+                "(conda install -c conda-forge fluidsynth).",
                 stacklevel=3,
             )
             _warned_fallback = True
@@ -68,8 +70,9 @@ def resolve_backend(backend: str) -> str:
         raise ValueError(f"backend must be 'auto', 'fluidsynth' or 'sine', got {backend!r}")
     if backend == "fluidsynth" and not fluidsynth_available():
         raise ImportError(
-            "backend='fluidsynth' requires pyfluidsynth and libfluidsynth "
-            "(pip install pyfluidsynth; conda install -c conda-forge fluidsynth)"
+            "backend='fluidsynth' requires pyfluidsynth and libfluidsynth: "
+            "pip install 'omniio[synth]' plus libfluidsynth "
+            "(conda install -c conda-forge fluidsynth)"
         )
     return backend
 

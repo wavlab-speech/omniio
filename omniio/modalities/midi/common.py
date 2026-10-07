@@ -4,8 +4,9 @@ Everything here is seconds-based. A MIDI file's tick grid and tempo map are reso
 ``pretty_midi`` on load, so notes carry absolute onset/offset times that line up with the
 audio the file was recorded against — which is what a transcription pipeline needs.
 
-``pretty_midi`` is imported lazily so that ``omniio`` keeps working (for audio/text/...)
-when it is not installed.
+``pretty_midi`` is an optional dependency (``pip install 'omniio[midi]'``) and is imported
+lazily, so ``omniio`` keeps working for audio/text/... when it is not installed; only the
+MIDI entry points raise.
 """
 import io
 from typing import Any, Dict, Optional, Tuple
@@ -32,7 +33,7 @@ def load_pretty_midi():
         import pretty_midi
     except ImportError as e:  # pragma: no cover - exercised only without the dependency
         raise ImportError(
-            "MIDI support requires pretty_midi (pip install pretty_midi)"
+            "MIDI support requires pretty_midi: pip install 'omniio[midi]'"
         ) from e
     return pretty_midi
 

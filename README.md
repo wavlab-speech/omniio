@@ -31,8 +31,21 @@ Most multimedia datasets outgrow naive storage approaches quickly. Omni-IO is de
 ```bash
 git clone https://github.com/wavlab-speech/omniio.git
 cd omniio
-pip install -e .
+pip install -e .              # audio, video, text, image
+pip install -e '.[midi]'      # + MIDI (pretty_midi)
+pip install -e '.[synth]'     # + MIDI synthesis (pyfluidsynth; also needs libfluidsynth, see below)
 ```
+
+MIDI support is an extra so that tools that use omniio only for audio or text do not pull
+in `pretty_midi`. Without it everything else works, and the MIDI entry points raise an
+`ImportError` naming the extra.
+
+### Import paths
+
+Import a modality from `omniio.<modality>` (`omniio.audio`, `omniio.midi`, ...), never from
+`omniio.modalities.<modality>`. The `modalities/` directory is where the code happens to
+live; the short paths are the stable public ones and keep working when the tree is
+reorganised (see `omniio/__init__.py`).
 
 ## Quick Start
 
@@ -334,8 +347,8 @@ The metadata table contains:
 - requests
 - zstandard
 - pyarrow
-- pretty_midi (MIDI)
-- pyfluidsynth + libfluidsynth (optional, MIDI synthesis)
+- pretty_midi (optional: `omniio[midi]`, MIDI read/write)
+- pyfluidsynth + libfluidsynth (optional: `omniio[synth]`, MIDI synthesis)
 
 ## License
 

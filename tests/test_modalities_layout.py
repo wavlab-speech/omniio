@@ -34,3 +34,28 @@ def test_from_import_and_attribute_access():
     assert "midi" in dir(omniio) and "audio" in dir(omniio)
     from omniio import interface                     # the documented entry points still resolve
     assert callable(interface.midi_read) and callable(interface.audio_read)
+
+
+def test_package_imports_without_pretty_midi():
+    """pretty_midi is an extra: the non-MIDI entry points must import without it, and
+    the MIDI ones must fail with an ImportError that names the extra."""
+    import subprocess
+    import sys
+
+    code = """
+import sys
+sys.modules["pretty_midi"] = None           # make `import pretty_midi` raise ImportError
+import omniio.interface, omniio.blob.blob    # the modality registries import eagerly
+import omniio.midi, omniio.midi.read, omniio.midi.write
+from omniio.midi.common import midi_from_bytes
+try:
+    midi_from_bytes(b"MThd" + bytes(10))
+except ImportError as e:
+    assert "omniio[midi]" in str(e), str(e)
+else:
+    raise AssertionError("expected ImportError")
+print("ok")
+"""
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "ok"

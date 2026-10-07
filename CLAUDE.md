@@ -12,7 +12,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The library is organized by data modality, with each supporting read and write operations:
 
-- **modalities/**: the per-modality packages below; imported through the short public paths (`omniio.audio`, `omniio.midi`, ...) via the aliases in `omniio/__init__.py`
+- **modalities/**: the per-modality packages below; imported through the short public paths (`omniio.audio`, `omniio.midi`, ...) via the aliases in `omniio/__init__.py`. New code and docs import from `omniio.<modality>`, never from `omniio.modalities.<modality>`
 - **modalities/audio/**: Audio file I/O (FLAC, WAV, WebM/Opus)
 - **modalities/video/**: Video file I/O (MP4 with audio streams)
 - **modalities/text/**: Text file I/O (zstandard compressed)
@@ -36,7 +36,10 @@ they are, but the stable import paths are the short ones (`omniio.kaldi`, not
 `omniio.tools.kaldi`). A meta path finder built from the `_ALIASES` dict maps
 public names -- and their submodules -- onto the real ones, lazily, so
 `import omniio` pulls in nothing extra. To relocate a subpackage, move it and
-add a line to `_ALIASES`; importers do not change. The finder is *prepended* to
+add a line to `_ALIASES`; importers do not change. `_ALIASES` is append-only:
+downstream code (ESPnet's SpeechLM loaders, for one) imports through these
+names inside `try/except ImportError` blocks, so dropping an entry is a
+breaking change that would not even fail at import time there. The finder is *prepended* to
 `sys.meta_path` on purpose: left to the normal path finder, a submodule such as
 `omniio.kaldi.compression` would be loaded a second time under the alias, with
 duplicate module state, because the aliased parent's `__path__` still points at
@@ -237,8 +240,8 @@ Key libraries used throughout the codebase:
 - **requests**: HTTP range requests for remote reading
 - **zstandard**: Text compression/decompression
 - **pyarrow/parquet**: Efficient metadata storage and operations
-- **pretty_midi** (+ mido): MIDI parsing/serialization; ships the TimGM6mb GM SoundFont
-- **pyfluidsynth** (optional, needs libfluidsynth): MIDI synthesis backend
+- **pretty_midi** (+ mido; optional, `omniio[midi]`): MIDI parsing/serialization; ships the TimGM6mb GM SoundFont
+- **pyfluidsynth** (optional, `omniio[synth]`, needs libfluidsynth): MIDI synthesis backend
 
 ## Common Implementation Notes
 
@@ -248,5 +251,6 @@ Key libraries used throughout the codebase:
 - Blob workers check for duplicate IDs before writing; set `overwrite=True` to skip
 - Archive byte offsets use [start_byte, end_byte) convention (end is exclusive)
 - Remote reads use HTTP 206 Partial Content with `Range` headers
-- `pretty_midi` is imported lazily inside `omniio/modalities/midi/` so the rest of the library works without it
+- `pretty_midi` is an optional extra (`omniio[midi]`) imported lazily inside `omniio/modalities/midi/`, so the rest of the library works without it; the MIDI entry points raise an `ImportError` naming the extra
+- `Blob.append(skip_errors=True)` reports dropped items with `SkippedItemsWarning` (`omniio/blob/blob.py`), so callers can filter or escalate exactly that event
 - Run tests with `python -m pytest tests -o addopts=""` when `pytest-cov` is not installed (pyproject's addopts require it)
