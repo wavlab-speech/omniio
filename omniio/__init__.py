@@ -12,6 +12,15 @@ All three work regardless of where the code actually sits, so subpackages can
 be reorganised without breaking importers.  To relocate one, move it and add a
 line to :data:`_ALIASES` -- nothing else has to change.
 
+Entries in :data:`_ALIASES` are **permanent**.  They are the contract that keeps
+downstream code working: ESPnet, for one, does
+``from omniio.text.read import text_read_local`` inside a ``try/except
+ImportError`` that falls back to ``None``, so dropping an entry would not fail
+at import time there -- it would surface later as ``'NoneType' object is not
+callable``, far from the cause.  Removing or renaming an entry is a breaking
+change, even when the public name looks like dead weight because nothing in
+this repository uses it any more.
+
 The aliases resolve lazily: importing :mod:`omniio` does not pull in any of the
 aliased subpackages or their dependencies.
 """
@@ -21,11 +30,16 @@ import importlib.abc
 import importlib.util
 import sys
 
-#: Public import path -> where the module actually lives.
+#: Public import path -> where the module actually lives.  Append-only: see the
+#: module docstring.
 _ALIASES = {
     "omniio.kaldi": "omniio.tools.kaldi",
-    # e.g. when the modality packages move under omniio/modalities/:
-    #   "omniio.audio": "omniio.modalities.audio",
+    # the modality packages live under omniio/modalities/
+    "omniio.audio": "omniio.modalities.audio",
+    "omniio.video": "omniio.modalities.video",
+    "omniio.text": "omniio.modalities.text",
+    "omniio.image": "omniio.modalities.image",
+    "omniio.midi": "omniio.modalities.midi",
 }
 
 

@@ -9,6 +9,7 @@ import shutil
 import threading
 import time
 import traceback
+import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
@@ -21,6 +22,15 @@ import pyarrow.parquet as pq
 from omniio.blob.write import modality_writer
 
 
+class SkippedItemsWarning(UserWarning):
+    """Issued by :meth:`Blob.append` when ``skip_errors=True`` dropped one or more items.
+
+    A dedicated category so a multi-hour dataset build can filter for exactly this
+    data-integrity event (``warnings.filterwarnings("error", category=SkippedItemsWarning)``
+    to turn it fatal, or ``"ignore"`` to silence it) without touching other warnings.
+    """
+
+
 def _worker_process(
     worker_id: int,
     items_with_ids: List[Tuple[Any, str]],
@@ -31,7 +41,8 @@ def _worker_process(
     modality_kwargs: dict,
     max_bin_size: int,
     progress_file: Optional[str] = None,
-) -> Tuple[int, List[Tuple[str, str, int]]]:
+    skip_errors: bool = False,
+) -> Tuple[int, List[Tuple[str, str, int]], List[Tuple[str, str]]]:
     """
     Worker function that runs in a separate process.
     Writes items to one or more shard bin files in shard_dir, splitting into a
@@ -41,12 +52,14 @@ def _worker_process(
     Worker 0 optionally writes its per-item count to progress_file so the
     main process can approximate overall progress.
 
-    Returns:
-        (worker_id, [(bin_path, meta_path, n_rows), ...])
-    """
-    import warnings
+    With ``skip_errors`` an item whose write_fn raises is logged and skipped instead of
+    aborting the worker (which would lose every item the worker had already written).
 
+    Returns:
+        (worker_id, [(bin_path, meta_path, n_rows), ...], [(item_id, error), ...])
+    """
     write_fn = modality_writer[modality]
+    failed: List[Tuple[str, str]] = []
 
     def _make_paths(bid: int) -> Tuple[str, str]:
         bp = os.path.join(shard_dir, f"shard_{worker_id}_{bid}.bin")
@@ -60,7 +73,9 @@ def _worker_process(
     metadata_rows: list = []
     offset = 0
     cur_bin_size = 0
-    n_written = 0
+    # Items consumed from items_with_ids, written or not: it only drives the progress
+    # bar, which counts every item; shard row counts come from len(metadata_rows).
+    n_processed = 0
     _last_progress_write = 0.0
 
     f = open(bin_path, "wb")
@@ -71,9 +86,17 @@ def _worker_process(
                     f"Skipping duplicate id already in archive: {item_id}. "
                     "Pass allow_duplicate_ids=True to write it anyway."
                 )
+                n_processed += 1
                 continue
 
-            raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+            try:
+                raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+            except Exception as exc:
+                if not skip_errors:
+                    raise
+                failed.append((str(item_id), f"{type(exc).__name__}: {exc}"))
+                n_processed += 1
+                continue
             n_bytes = len(raw_bytes)
 
             # Roll over to a new bin when the current one is non-empty and full
@@ -100,13 +123,13 @@ def _worker_process(
             metadata_rows.append(meta_dict)
             offset += n_bytes
             cur_bin_size += n_bytes
-            n_written += 1
+            n_processed += 1
 
             if progress_file is not None:
                 now = time.time()
                 if now - _last_progress_write >= 0.5:
                     with open(progress_file, "w") as pf:
-                        pf.write(str(n_written))
+                        pf.write(str(n_processed))
                     _last_progress_write = now
     finally:
         f.close()
@@ -119,7 +142,7 @@ def _worker_process(
     elif os.path.exists(bin_path):
         os.remove(bin_path)
 
-    return worker_id, sub_results
+    return worker_id, sub_results, failed
 
 
 class Blob:
@@ -158,6 +181,8 @@ class Blob:
         self.data: Optional[pa.Table] = None
         if self.metadata_file.exists():
             self.data = self._read_metadata()
+        # (item_id, error) pairs skipped by the most recent append(skip_errors=True)
+        self.last_failed: List[Tuple[str, str]] = []
 
         if name is not None:
             self.name = name
@@ -281,6 +306,7 @@ class Blob:
         allow_duplicate_ids: bool = False,
         progress: bool = True,
         reshard: bool = False,
+        skip_errors: bool = False,
         **modality_kwargs,
     ):
         """
@@ -306,6 +332,18 @@ class Blob:
                          If False (default), each shard bin is simply moved into
                          the archive as its own blob file — much faster, at the
                          cost of producing more bin files.
+            skip_errors: If True, an item whose write_fn raises (corrupt file,
+                         unparsable bytes, ...) is skipped and the rest of the
+                         batch is written; a `SkippedItemsWarning` summarises the
+                         skipped items at the end. If False (default), the first
+                         error aborts that worker and is re-raised after the other
+                         workers' shards have been merged. Skipped ids are returned
+                         and also recorded on `self.last_failed`.
+
+        Returns:
+            List of (item_id, error_message) for the items skipped. Empty unless
+            `skip_errors` is set.
+
             **modality_kwargs: Forwarded to the modality write_fn.
         """
         if ids is None:
@@ -331,6 +369,7 @@ class Blob:
         log_dir = self.archive_path.parent / "logs"
         log_dir.mkdir(exist_ok=True)
 
+        failed: List[Tuple[str, str]] = []
         try:
             # Each entry: (worker_id, [(bin_path, meta_path, n_rows), ...])
             completed_results: List[Tuple[int, List[Tuple[str, str, int]]]] = []
@@ -340,8 +379,6 @@ class Blob:
 
             if num_workers <= 0:
                 # ---- single-process path (per-item progress) ----
-                import warnings as _warnings
-
                 write_fn = modality_writer[self.modality]
 
                 def _sp_paths(bid: int) -> Tuple[str, str]:
@@ -362,13 +399,20 @@ class Blob:
                     try:
                         for item, item_id in zip(items, ids):
                             if item_id in existing_ids and not allow_duplicate_ids:
-                                _warnings.warn(
+                                warnings.warn(
                                     f"Skipping duplicate id already in archive: {item_id}. "
                                     "Pass allow_duplicate_ids=True to write it anyway."
                                 )
                                 pbar.update(1)
                                 continue
-                            raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+                            try:
+                                raw_bytes, meta_dict = write_fn(item, item_id, **modality_kwargs)
+                            except Exception as exc:
+                                if not skip_errors:
+                                    raise
+                                failed.append((str(item_id), f"{type(exc).__name__}: {exc}"))
+                                pbar.update(1)
+                                continue
                             n_bytes = len(raw_bytes)
 
                             if cur_bin_size > 0 and cur_bin_size + n_bytes > self.max_bin_size:
@@ -444,13 +488,15 @@ class Blob:
                             existing_ids, allow_duplicate_ids, modality_kwargs,
                             self.max_bin_size,
                             progress_file if wid == 0 else None,
+                            skip_errors,
                         )
                         futures[fut] = wid
 
                     for fut in as_completed(futures):
                         try:
-                            result = fut.result()
-                            completed_results.append(result)
+                            wid, sub_results, w_failed = fut.result()
+                            completed_results.append((wid, sub_results))
+                            failed.extend(w_failed)
                         except Exception as exc:
                             if first_error is None:
                                 first_error = exc
@@ -480,6 +526,18 @@ class Blob:
 
         finally:
             shutil.rmtree(log_dir, ignore_errors=True)
+
+        failed.sort()
+        self.last_failed = failed
+        if failed:
+            preview = "; ".join(f"{i}: {e}" for i, e in failed[:5])
+            more = f" (+{len(failed) - 5} more)" if len(failed) > 5 else ""
+            warnings.warn(
+                f"Skipped {len(failed)} item(s) that failed to write: {preview}{more}",
+                SkippedItemsWarning,
+                stacklevel=2,
+            )
+        return failed
 
     # ------------------------------------------------------------------ #
     # Shard concatenation

@@ -19,7 +19,7 @@ authors = [
 maintainers = [
     {name = "William Chen", email = "williamchen@cmu.edu"}
 ]
-keywords = ["multimedia", "audio", "video", "text", "archive", "blob", "io"]
+keywords = ["multimedia", "audio", "video", "text", "midi", "archive", "blob", "io"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -48,9 +48,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# omniio/modalities/midi imports pretty_midi lazily, so the base install (and the
+# downstream tools that import omniio for audio/text, e.g. ESPnet) does not pull
+# in pretty_midi, mido and the bundled SoundFont. The MIDI entry points raise an
+# ImportError naming this extra when it is missing.
+midi = [
+    "pretty_midi>=0.2.10",
+]
+synth = [
+    "pretty_midi>=0.2.10",
+    "pyfluidsynth>=1.3.0",   # MIDI synthesis; also needs libfluidsynth (conda install -c conda-forge fluidsynth)
+]
 test = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "pretty_midi>=0.2.10",   # tests/test_midi.py skips without it
     # tests/test_blob.py reads metadata back through pyarrow's pandas bridge.
     "pandas>=1.3.0",
 ]
@@ -71,7 +83,7 @@ Repository = "https://github.com/wavlab-speech/omniio"
 "Bug Tracker" = "https://github.com/wavlab-speech/omniio/issues"
 
 [tool.setuptools]
-packages = ["omniio", "omniio.audio", "omniio.video", "omniio.text", "omniio.blob", "omniio.image", "omniio.tools", "omniio.tools.kaldi"]
+packages = ["omniio", "omniio.modalities", "omniio.modalities.audio", "omniio.modalities.video", "omniio.modalities.text", "omniio.modalities.image", "omniio.modalities.midi", "omniio.blob", "omniio.tools", "omniio.tools.kaldi"]
 
 [tool.black]
 line-length = 100
