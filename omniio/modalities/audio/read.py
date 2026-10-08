@@ -96,6 +96,22 @@ def _is_opus_frame_size(n: int, sr: int) -> bool:
     return any(abs(n - round(sr * ms / 1000)) <= 1 for ms in (2.5, 5, 10, 20, 40, 60))
 
 
+def _decode_packets(container, stream):
+    """Decode `stream` from the container's current position, yielding (packet pts, frame).
+
+    The packet's pts rather than the frame's. After a seek the decoder discards the codec
+    delay from the first frame again, and a PyAV that sets the decoder's packet time base
+    (13.0 and later, on ffmpeg 7) moves that frame's pts past the discarded samples,
+    rounded to the container tick: a frame trimmed by 312 samples reports 7 ms after its
+    packet, 336 samples at 48 kHz, which is not where it sits. Older builds left the
+    frame's pts equal to the packet's. The packet's pts is the same in both and is what
+    the anchor below is defined on.
+    """
+    for packet in container.demux(stream):
+        for frame in packet.decode():
+            yield packet.pts, frame
+
+
 def _webm_frames(container, stream, seek_sample: Optional[int]):
     """Decode a WebM audio stream, yielding (index of the frame's first sample, frame).
 
@@ -103,15 +119,23 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
     read returns. With `seek_sample` None the container is decoded from where it is — the
     first sample of a fresh container is sample 0 by construction, no timestamps involved.
     An int seeks (to a cluster at or before it, minus the seek margin), anchors the run on
-    the first frame's pts and counts samples from there; the caller trims what lands
+    the first packet's pts and counts samples from there; the caller trims what lands
     before the window.
+
+    Why the packet's pts is the anchor: a packet at pts P decodes to a whole frame whose
+    samples sit at [P, P + frame) on the stream's timeline, and a full decode discards the
+    first `delay` samples of the stream, so that frame's first sample is output sample
+    P - delay. After a seek the decoder discards `delay` samples again, from the head
+    frame, so the head's first surviving sample is stream sample P + delay, i.e. output
+    sample P. The trimmed head therefore starts exactly at its packet's pts, whatever the
+    codec delay is.
     """
     sr = stream.rate
     time_base = stream.time_base
 
     if seek_sample is None:
         pos = 0
-        for frame in container.decode(audio=0):
+        for _, frame in _decode_packets(container, stream):
             arr = _frame_samples(frame)
             yield pos, arr
             pos += arr.shape[1]
@@ -121,18 +145,19 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
     seek_s = max(0.0, seek_sample / sr - _OPUS_SEEK_MARGIN_S)
     container.seek(start_pts + int(seek_s / time_base), stream=stream)
 
-    frames = container.decode(audio=0)
-    head = next(frames, None)
-    if head is None:
+    frames = _decode_packets(container, stream)
+    first = next(frames, None)
+    if first is None:
         return
+    head_pts, head = first
     head_arr = _frame_samples(head)
     # The frame after the first is a whole frame, which is the grid the run sits on. The
-    # first frame is not: libavformat trims the codec delay off it after a seek.
+    # first frame is not: the decoder trims the codec delay off it after a seek.
     nxt = next(frames, None)
-    nxt_arr = None if nxt is None else _frame_samples(nxt)
+    nxt_arr = None if nxt is None else _frame_samples(nxt[1])
     grid = (nxt_arr if nxt_arr is not None else head_arr).shape[1]
 
-    pts = start_pts if head.pts is None else head.pts
+    pts = start_pts if head_pts is None else head_pts
     pos = int(round(float((pts - start_pts) * time_base) * sr))
     if _is_opus_frame_size(grid, sr):
         pos = _snap_to_grid(pos, grid, int(sr * time_base / 2) + 1)
@@ -142,7 +167,7 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
     if nxt_arr is not None:
         yield pos, nxt_arr
         pos += nxt_arr.shape[1]
-    for frame in frames:
+    for _, frame in frames:
         arr = _frame_samples(frame)
         yield pos, arr
         pos += arr.shape[1]

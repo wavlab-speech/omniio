@@ -494,8 +494,11 @@ class TestOvershootFallback:
 # ---- streams that real ffmpeg will not easily produce -----------------------------------
 # A fake container models the decode the reader has to cope with: a first frame shortened
 # by the codec delay, frames handed back in cluster-sized runs, millisecond timestamps,
-# and — after a seek — libavformat re-applying the codec delay, which is what puts a
-# seeked run on a whole-frame boundary. The signal is a ramp, so every sample says which
+# and — after a seek — the decoder discarding the codec delay again, which is what puts a
+# seeked run on a whole-frame boundary. Whether the trimmed frame's pts then stays equal
+# to its packet's (PyAV before 13) or is moved past the discarded samples (PyAV 13 on
+# ffmpeg 7, rounded to the tick) is a decoder detail the reader must not depend on, so
+# every synthetic test runs both ways. The signal is a ramp, so every sample says which
 # index it is and the assertions can be exact.
 
 class FakeFormat:
@@ -514,6 +517,15 @@ class FakeFrame:
         return self._data
 
 
+class FakePacket:
+    def __init__(self, pts, frames):
+        self.pts = pts
+        self._frames = frames
+
+    def decode(self):
+        return list(self._frames)
+
+
 class FakeStream:
     def __init__(self, rate, time_base, start_time, channels):
         self.rate = rate
@@ -524,6 +536,10 @@ class FakeStream:
 
 class FakeContainer:
     """A decodable audio stream with controllable framing, timestamps and clusters."""
+
+    # Newer PyAV moves a trimmed frame's pts past the samples it discarded; the
+    # synthetic tests flip this for every case (see `decoder_pts_behaviour`).
+    advance_trimmed_pts = False
 
     def __init__(self, samples, rate=SR, frame=960, delay=312, cluster_frames=100,
                  start_time=7, tick=Fraction(1, 1000), gap_after=None, gap_frames=0):
@@ -570,18 +586,33 @@ class FakeContainer:
         frames_in = int(target * float(self.tick) * self.rate) // self.frame
         self._cursor = min(frames_in - frames_in % self.cluster_frames, self.n_frames)
 
-    def decode(self, audio=0):
+    def demux(self, stream=None):
+        """Packets from the cursor on, each decoding to at most one frame, then the flush
+        packet PyAV appends. The packet's pts is the frame's position in the stream; the
+        frame's pts is the same unless `advance_trimmed_pts` says the decoder moved it."""
         for k in range(self._cursor, self.n_frames):
             if self._dropped(k):
                 continue
+            pts = self._pts(k)
             lo, hi = self._span(k)
             if hi <= lo:
+                yield FakePacket(pts, [])      # swallowed whole by the codec delay
                 continue
-            # After a seek onto frame k > 0, libavformat drops the codec delay again.
+            frame_pts = pts
+            # After a seek onto frame k > 0, the decoder drops the codec delay again.
             if k == self._cursor and k > 0:
-                lo = min(hi, lo + self.delay)
-            yield FakeFrame(self._pts(k), self.signal[:, lo:hi].copy())
+                trimmed = min(hi - lo, self.delay)
+                lo += trimmed
+                if self.advance_trimmed_pts:
+                    frame_pts = pts + int(round(trimmed / self.rate / float(self.tick)))
+            frames = [FakeFrame(frame_pts, self.signal[:, lo:hi].copy())] if hi > lo else []
+            yield FakePacket(pts, frames)
+        yield FakePacket(None, [])
         self._cursor = self.n_frames
+
+    def decode(self, audio=0):
+        for packet in self.demux():
+            yield from packet.decode()
 
     def __enter__(self):
         return self
@@ -607,6 +638,10 @@ def fake_read(blob_key, factory, start_time, end_time, monkeypatch):
 
 
 class TestSyntheticStreams:
+    @pytest.fixture(autouse=True, params=[False, True], ids=["pts=packet", "pts=advanced"])
+    def decoder_pts_behaviour(self, request, monkeypatch):
+        monkeypatch.setattr(FakeContainer, "advance_trimmed_pts", request.param)
+
     """Position arithmetic on streams whose framing and timestamps are pinned by hand."""
 
     @pytest.mark.parametrize("start,end", [
