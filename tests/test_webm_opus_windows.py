@@ -495,11 +495,13 @@ class TestOvershootFallback:
 # A fake container models the decode the reader has to cope with: a first frame shortened
 # by the codec delay, frames handed back in cluster-sized runs, millisecond timestamps,
 # and — after a seek — the decoder discarding the codec delay again, which is what puts a
-# seeked run on a whole-frame boundary. Whether the trimmed frame's pts then stays equal
-# to its packet's (PyAV before 13) or is moved past the discarded samples (PyAV 13 on
-# ffmpeg 7, rounded to the tick) is a decoder detail the reader must not depend on, so
-# every synthetic test runs both ways. The signal is a ramp, so every sample says which
-# index it is and the assertions can be exact.
+# seeked run on a whole-frame boundary. Two things differ between PyAV/ffmpeg builds and
+# the reader must not depend on either, so every synthetic test runs all four ways:
+# whether the trimmed frame's pts stays equal to its packet's or is moved past the
+# discarded samples (rounded to the tick), and whether `stream.start_time` is the first
+# packet's pts (PyAV <= 16) or the first frame's presentation time, packet pts plus the
+# codec delay (PyAV >= 17). The signal is a ramp, so every sample says which index it is
+# and the assertions can be exact.
 
 class FakeFormat:
     is_planar = True
@@ -537,9 +539,12 @@ class FakeStream:
 class FakeContainer:
     """A decodable audio stream with controllable framing, timestamps and clusters."""
 
-    # Newer PyAV moves a trimmed frame's pts past the samples it discarded; the
-    # synthetic tests flip this for every case (see `decoder_pts_behaviour`).
+    # Build-dependent timestamp details, flipped for every synthetic test (see
+    # `decoder_pts_behaviour`): whether a trimmed frame's pts is moved past the samples it
+    # discarded, and whether stream.start_time is the first packet's pts or the first
+    # frame's presentation time (packet pts + codec delay).
     advance_trimmed_pts = False
+    start_time_is_first_frame = False
 
     def __init__(self, samples, rate=SR, frame=960, delay=312, cluster_frames=100,
                  start_time=7, tick=Fraction(1, 1000), gap_after=None, gap_frames=0):
@@ -552,7 +557,11 @@ class FakeContainer:
         self.gap_frames = gap_frames        # frames dropped from the stream (DTX-like)
         self.signal = np.arange(samples, dtype=np.float64)[None, :]
         self.n_frames = (samples + delay + frame - 1) // frame
-        self.streams = SimpleNamespace(audio=[FakeStream(rate, tick, start_time, 1)])
+        self._base = start_time                 # pts of the first packet
+        reported = start_time
+        if start_time is not None and self.start_time_is_first_frame:
+            reported = start_time + int(round(delay / rate / float(tick)))
+        self.streams = SimpleNamespace(audio=[FakeStream(rate, tick, reported, 1)])
         self.seeks = []
         self._cursor = 0
 
@@ -566,7 +575,7 @@ class FakeContainer:
 
     def _pts(self, k):
         """Frame k's timestamp: the frame's position in time, quantised to the tick."""
-        base = self.streams.audio[0].start_time or 0
+        base = self._base or 0
         if k == 0:
             return base
         emitted = k - self.gap_frames if self.gap_after is not None and k > self.gap_after else k
@@ -581,7 +590,7 @@ class FakeContainer:
     # --- the container API the reader uses ---------------------------------------------
     def seek(self, timestamp, stream=None, **kwargs):
         self.seeks.append(timestamp)
-        base = self.streams.audio[0].start_time or 0
+        base = self._base or 0
         target = max(0, timestamp - base)
         frames_in = int(target * float(self.tick) * self.rate) // self.frame
         self._cursor = min(frames_in - frames_in % self.cluster_frames, self.n_frames)
@@ -638,9 +647,16 @@ def fake_read(blob_key, factory, start_time, end_time, monkeypatch):
 
 
 class TestSyntheticStreams:
-    @pytest.fixture(autouse=True, params=[False, True], ids=["pts=packet", "pts=advanced"])
+    @pytest.fixture(
+        autouse=True,
+        params=[(False, False), (True, False), (False, True), (True, True)],
+        ids=["pts=packet,start=packet", "pts=advanced,start=packet",
+             "pts=packet,start=frame", "pts=advanced,start=frame"],
+    )
     def decoder_pts_behaviour(self, request, monkeypatch):
-        monkeypatch.setattr(FakeContainer, "advance_trimmed_pts", request.param)
+        advance, start_is_frame = request.param
+        monkeypatch.setattr(FakeContainer, "advance_trimmed_pts", advance)
+        monkeypatch.setattr(FakeContainer, "start_time_is_first_frame", start_is_frame)
 
     """Position arithmetic on streams whose framing and timestamps are pinned by hand."""
 

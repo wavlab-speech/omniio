@@ -112,6 +112,23 @@ def _decode_packets(container, stream):
             yield packet.pts, frame
 
 
+def _first_packet_pts(container, stream) -> Optional[int]:
+    """pts of the stream's first packet: the origin of the timeline the anchor is on.
+
+    Not ``stream.start_time``. PyAV 16 and earlier report the first packet's pts there;
+    PyAV 17 and later (newer libavformat) report the first *frame's* presentation time,
+    which is the packet's pts plus the codec delay, rounded to the tick -- so an anchor
+    measured from ``start_time`` is off by the delay on those builds. The first packet's
+    own pts is the same number everywhere.
+    """
+    for packet in container.demux(stream):
+        if packet.pts is not None:
+            return packet.pts
+        if packet.size == 0:            # the flush packet: the stream had no packets
+            break
+    return None
+
+
 def _webm_frames(container, stream, seek_sample: Optional[int]):
     """Decode a WebM audio stream, yielding (index of the frame's first sample, frame).
 
@@ -119,8 +136,8 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
     read returns. With `seek_sample` None the container is decoded from where it is — the
     first sample of a fresh container is sample 0 by construction, no timestamps involved.
     An int seeks (to a cluster at or before it, minus the seek margin), anchors the run on
-    the first packet's pts and counts samples from there; the caller trims what lands
-    before the window.
+    the first packet's pts, measured from the pts of the stream's first packet, and counts
+    samples from there; the caller trims what lands before the window.
 
     Why the packet's pts is the anchor: a packet at pts P decodes to a whole frame whose
     samples sit at [P, P + frame) on the stream's timeline, and a full decode discards the
@@ -141,7 +158,9 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
             pos += arr.shape[1]
         return
 
-    start_pts = stream.start_time or 0
+    start_pts = _first_packet_pts(container, stream)
+    if start_pts is None:
+        start_pts = stream.start_time or 0
     seek_s = max(0.0, seek_sample / sr - _OPUS_SEEK_MARGIN_S)
     container.seek(start_pts + int(seek_s / time_base), stream=stream)
 
