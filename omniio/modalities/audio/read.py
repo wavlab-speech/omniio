@@ -1,12 +1,68 @@
 import io
 import requests
-from typing import Optional
+import warnings
+from typing import Optional, Tuple
 
 import av
 import numpy as np
 import soundfile as sf
 
 from omniio.definitions import AudioRead
+
+
+class PyAVCompatibilityWarning(UserWarning):
+    """The installed PyAV / ffmpeg is outside the range WebM/Opus windowed reads were
+    validated on. Full reads are unaffected; windows decode but their alignment has not
+    been checked on this build (see README, "Windowed reads of WebM/Opus")."""
+
+
+# The range swept by scripts/sweep_pyav_webm.sh: PyAV 9.2-18.1 on ffmpeg 4.4-8.1. The
+# timestamps a seek produces changed twice inside it (PyAV 17 moved stream.start_time by
+# the codec delay; every build moves the trimmed head frame's pts), so a build outside it
+# may have changed them again. Widen after rerunning the sweep, not before.
+_TESTED_PYAV = ((9, 2), (18, 1))
+_TESTED_LIBAVCODEC = ((58, 134), (62, 28))
+
+
+def _version_tuple(text: str) -> Tuple[int, ...]:
+    out = []
+    for part in text.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+def pyav_compatibility() -> Optional[str]:
+    """``None`` when the installed PyAV / libavcodec lie inside the validated range, else
+    a message saying which one does not."""
+    pyav = _version_tuple(getattr(av, "__version__", ""))[:2]
+    lavc = tuple(av.library_versions.get("libavcodec", ())[:2])
+    problems = []
+    if not pyav or not (_TESTED_PYAV[0] <= pyav <= _TESTED_PYAV[1]):
+        problems.append(f"PyAV {av.__version__}")
+    if not lavc or not (_TESTED_LIBAVCODEC[0] <= lavc <= _TESTED_LIBAVCODEC[1]):
+        problems.append(
+            "libavcodec " + ".".join(map(str, lavc)) if lavc else "an unknown libavcodec"
+        )
+    if not problems:
+        return None
+    verb = "are" if len(problems) > 1 else "is"
+    return (
+        f"omniio: {' and '.join(problems)} {verb} outside the range WebM/Opus windowed reads "
+        f"were validated on (PyAV {_TESTED_PYAV[0][0]}.{_TESTED_PYAV[0][1]}-"
+        f"{_TESTED_PYAV[1][0]}.{_TESTED_PYAV[1][1]}, libavcodec "
+        f"{_TESTED_LIBAVCODEC[0][0]}.{_TESTED_LIBAVCODEC[0][1]}-"
+        f"{_TESTED_LIBAVCODEC[1][0]}.{_TESTED_LIBAVCODEC[1][1]}). Windows of WebM/Opus "
+        "entries may be misaligned on this build; full reads are unaffected. Run "
+        "scripts/sweep_pyav_webm.sh to check, or read from 0 and slice."
+    )
+
+
+_compat = pyav_compatibility()
+if _compat is not None:
+    warnings.warn(_compat, PyAVCompatibilityWarning, stacklevel=2)
 
 # Magic bytes for format detection
 _MAGIC = {

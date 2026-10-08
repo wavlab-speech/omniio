@@ -83,32 +83,16 @@ window is the same samples a full decode has at that offset, with two documented
   the timestamps, a full decode concatenates frames, so the two disagree by the size of
   any gap before the window.
 
-The reader anchors a seeked run on the first packet's pts, measured from the pts of the
-stream's first packet. That is the one timestamp that means the same thing across
-PyAV/ffmpeg builds; the two it deliberately does not use both changed:
+Windowed WebM/Opus reads are validated against these PyAV / ffmpeg combinations
+(`tests/test_webm_opus_windows.py`, reproducible with `scripts/sweep_pyav_webm.sh`):
 
-| PyAV | ffmpeg (libavcodec) | trimmed frame's pts after a seek | `stream.start_time` | windowed reads |
-|---|---|---|---|---|
-| 9.2 (conda-forge) | 4.4 (58.134) | moved past the discarded samples | first packet's pts | correct on pre-encoded files (48 windows, 3 files); the test fixtures cannot be encoded there (no libopus encoder in that build) |
-| 10.0 (conda-forge) | 5.1 (59.37) | moved | first packet's pts; files muxed *by* ffmpeg 5.1 start at -7 ms | correct |
-| 10.0, 11.0 (conda-forge) | 6.0 (60.3), 6.1 (60.31) | moved | first packet's pts | correct |
-| 12.0, 12.3 | 6.1 (60.31) | moved | first packet's pts | correct |
-| 13.0, 13.1 | 7.0 (61.3) | moved | first packet's pts | correct |
-| 14.0, 14.2, 15.1 | 7.1 (61.19) | moved | first packet's pts | correct |
-| 16.1 | 8.0 (62.11) | moved | first packet's pts | correct |
-| 17.1, 18.1 | 8.1 (62.28) | moved | first packet's pts **plus the codec delay** | correct |
+- PyAV 12.0 to 18.1 PyPI wheels, which bundle ffmpeg 6.1 to 8.1
+- PyAV 9.2, 10.0 and 11.0 from conda-forge on ffmpeg 4.4, 5.1, 6.0 and 6.1
 
-Rows without a channel are the PyPI wheels, which bundle their own ffmpeg; the conda-forge
-rows pair the same PyAV source with a conda ffmpeg and show the same timestamps as the
-wheels of that ffmpeg generation (PyAV 12 and later require ffmpeg 6.1 or newer). "Correct"
-means `tests/test_webm_opus_windows.py` passes in full (139 cases on real libopus files
-across mux layouts, source rates, channel counts and window edges, plus 152 on synthetic
-streams that pin the framing by hand). The wheel sweep is reproducible with
-`scripts/sweep_pyav_webm.sh`. Earlier anchors fail on every build in the table: measuring
-from the trimmed frame's pts puts every seeked window one codec delay (336 samples at
-48 kHz) late, and measuring from `stream.start_time` is off by the same amount on PyAV 17
-and later. A build we could not test is one whose decoder does not discard the codec delay
-after a seek; the real-file tests would catch that at once.
+In short: PyAV 9.2 through 18.1 on ffmpeg 4.4 through 8.1 (libavcodec 58.134 to 62.28).
+Importing the audio reader on a PyAV or ffmpeg outside that range raises a
+`PyAVCompatibilityWarning`: windows still decode, but their alignment has not been
+checked on that build. Full reads are unaffected.
 
 #### Video
 

@@ -16,7 +16,11 @@ import numpy as np
 import pytest
 
 from omniio.audio.read import (
+    PyAVCompatibilityWarning,
+    _TESTED_LIBAVCODEC,
+    _TESTED_PYAV,
     _gather_window,
+    pyav_compatibility,
     _is_opus_frame_size,
     _read_webm,
     _snap_to_grid,
@@ -799,3 +803,40 @@ class TestSnapToGrid:
     def test_opus_frame_sizes_at_other_rates(self):
         assert _is_opus_frame_size(320, 16000)       # 20 ms at 16 kHz
         assert not _is_opus_frame_size(1024, 16000)
+
+
+class TestPyAVCompatibilityCheck:
+    """The import-time check names a PyAV or libavcodec outside the swept range and is
+    silent inside it."""
+
+    def _with(self, monkeypatch, pyav, lavc):
+        import omniio.audio.read as read_mod
+        monkeypatch.setattr(read_mod.av, "__version__", pyav)
+        monkeypatch.setattr(read_mod.av, "library_versions", {"libavcodec": lavc})
+        return pyav_compatibility()
+
+    def test_inside_the_range_is_silent(self, monkeypatch):
+        assert self._with(monkeypatch, "17.1.0", (62, 28, 100)) is None
+        assert self._with(monkeypatch, "9.2.0", (58, 134, 100)) is None
+
+    def test_pyav_outside_the_range(self, monkeypatch):
+        msg = self._with(monkeypatch, "19.0.0", (62, 28, 100))
+        assert msg and "PyAV 19.0.0" in msg and "libavcodec 62.28" not in msg
+
+    def test_libavcodec_outside_the_range(self, monkeypatch):
+        msg = self._with(monkeypatch, "18.1.0", (63, 2, 100))
+        assert msg and "libavcodec 63.2" in msg and "PyAV 18.1.0" not in msg
+
+    def test_prerelease_version_string_is_parsed(self, monkeypatch):
+        assert self._with(monkeypatch, "18.1.0rc1", (62, 28, 100)) is None
+
+    def test_the_installed_build_is_in_the_range_or_warned_about(self):
+        import av
+        msg = pyav_compatibility()
+        if msg is None:
+            return
+        pytest.skip(f"PyAV {av.__version__} is outside the swept range: {msg}")
+
+    def test_warning_category_is_filterable(self):
+        assert issubclass(PyAVCompatibilityWarning, UserWarning)
+        assert _TESTED_PYAV[0] < _TESTED_PYAV[1] and _TESTED_LIBAVCODEC[0] < _TESTED_LIBAVCODEC[1]
