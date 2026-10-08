@@ -69,6 +69,31 @@ print(f"Sample rate: {result.sample_rate}")
 print(f"Audio shape: {result.array.shape}")  # (frames, channels)
 ```
 
+##### Windowed reads of WebM/Opus
+
+FLAC, WAV and OGG windows are seeked by sample through libsndfile and are exact. WebM can
+only be seeked to a cluster boundary, so for WebM/Opus the reader seeks 0.25 s early,
+places the decoded frames on the stream's own sample timeline, and trims to the window. A
+window is the same samples a full decode has at that offset, with two documented limits:
+
+- **Not bit-exact after a seek.** The decoder starts cold at a cluster, so the first
+  samples of a seeked window differ from a full decode by about 2e-4 relative RMS. If you
+  need bit-exact windows, read from 0 and slice.
+- **Streams with timestamp gaps** (DTX silence, dropped packets): a seeked read follows
+  the timestamps, a full decode concatenates frames, so the two disagree by the size of
+  any gap before the window.
+
+Windowed WebM/Opus reads are validated against these PyAV / ffmpeg combinations
+(`tests/test_webm_opus_windows.py`, reproducible with `scripts/sweep_pyav_webm.sh`):
+
+- PyAV 12.0 to 18.1 PyPI wheels, which bundle ffmpeg 6.1 to 8.1
+- PyAV 9.2, 10.0 and 11.0 from conda-forge on ffmpeg 4.4, 5.1, 6.0 and 6.1
+
+In short: PyAV 9.2 through 18.1 on ffmpeg 4.4 through 8.1 (libavcodec 58.134 to 62.28).
+Importing the audio reader on a PyAV or ffmpeg outside that range raises a
+`PyAVCompatibilityWarning`: windows still decode, but their alignment has not been
+checked on that build. Full reads are unaffected.
+
 #### Video
 
 ```python
