@@ -1,6 +1,21 @@
-# scripts/
+# tests/tools/
 
-Things you run by hand, not part of the installed package.
+Development tools you run by hand; not part of the installed package.
+
+## `sweep_pyav_webm.sh`
+
+Reruns `tests/test_webm_opus_windows.py` against several PyAV wheels, each installed
+into its own directory and put on `PYTHONPATH` for that run only, and prints one row
+per version: the `av` it actually imported, the bundled libavcodec, what the build
+reports for `stream.start_time` and for the first frame after a seek, and the test
+result. A row whose imported `av` does not match the requested version is reported
+as a mismatch rather than labelled. Used to set the validated range in
+`omniio/modalities/audio/read.py` (`_TESTED_PYAV`, `_TESTED_LIBAVCODEC`).
+
+```bash
+tests/tools/sweep_pyav_webm.sh                 # one wheel per ffmpeg generation
+tests/tools/sweep_pyav_webm.sh 18.1.0 19.0.0   # specific versions
+```
 
 ## `compare_with_kaldiio.py`
 
@@ -10,7 +25,7 @@ you already have, rather than against fixtures someone else wrote.
 
 ```bash
 pip install omniio kaldiio
-python scripts/compare_with_kaldiio.py /path/to/your/dump
+python tests/tools/compare_with_kaldiio.py /path/to/your/dump
 ```
 
 Exits non-zero if anything mismatched, so it works as a gate.

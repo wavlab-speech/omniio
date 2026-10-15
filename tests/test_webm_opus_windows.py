@@ -8,14 +8,17 @@ every window must be the same samples the full decode has at that offset.
 """
 
 import io
+import warnings
 from fractions import Fraction
 from types import SimpleNamespace
 
 import av
 import numpy as np
 import pytest
+import soundfile as sf
 
 from omniio.audio.read import (
+    _read_pcm,
     PyAVCompatibilityWarning,
     _TESTED_LIBAVCODEC,
     _TESTED_PYAV,
@@ -806,8 +809,8 @@ class TestSnapToGrid:
 
 
 class TestPyAVCompatibilityCheck:
-    """The import-time check names a PyAV or libavcodec outside the swept range and is
-    silent inside it."""
+    """The build check names a PyAV or libavcodec outside the swept range and is silent
+    inside it; the warning is raised once, on the first windowed WebM read only."""
 
     def _with(self, monkeypatch, pyav, lavc):
         import omniio.audio.read as read_mod
@@ -829,6 +832,36 @@ class TestPyAVCompatibilityCheck:
 
     def test_prerelease_version_string_is_parsed(self, monkeypatch):
         assert self._with(monkeypatch, "18.1.0rc1", (62, 28, 100)) is None
+
+    def test_a_bare_major_version_is_unknown_not_in_range(self, monkeypatch):
+        from omniio.audio.read import _version_tuple
+        assert _version_tuple("18") == ()
+        msg = self._with(monkeypatch, "18", (62, 28, 100))
+        assert msg and "PyAV 18" in msg
+
+    def test_missing_library_versions_attribute_is_reported_not_raised(self, monkeypatch):
+        import omniio.audio.read as read_mod
+        monkeypatch.setattr(read_mod.av, "__version__", "18.1.0")
+        monkeypatch.delattr(read_mod.av, "library_versions", raising=False)
+        msg = pyav_compatibility()
+        assert msg and "unknown libavcodec" in msg
+
+    def test_warns_once_and_only_on_a_windowed_webm_read(self, monkeypatch):
+        import omniio.audio.read as read_mod
+        monkeypatch.setattr(read_mod.av, "__version__", "99.0.0")
+        monkeypatch.setattr(read_mod, "_warned_untested_build", False)
+        blob = encode_webm(tone_ladder())
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            read_mod._read_webm(blob, None, None)            # whole entry: silent
+            flac = io.BytesIO()
+            sf.write(flac, tone_ladder()[:48000], SR, format="FLAC")
+            read_mod._read_pcm(flac.getvalue(), "flac", 0.1, 0.2)   # other format: silent
+            assert not [w for w in caught if issubclass(w.category, PyAVCompatibilityWarning)]
+            read_mod._read_webm(blob, 1.0, 2.0)              # first window: one warning
+            read_mod._read_webm(blob, 3.0, 4.0)              # later windows: none
+        hits = [w for w in caught if issubclass(w.category, PyAVCompatibilityWarning)]
+        assert len(hits) == 1 and "PyAV 99.0.0" in str(hits[0].message)
 
     def test_the_installed_build_is_in_the_range_or_warned_about(self):
         import av

@@ -84,15 +84,17 @@ window is the same samples a full decode has at that offset, with two documented
   any gap before the window.
 
 Windowed WebM/Opus reads are validated against these PyAV / ffmpeg combinations
-(`tests/test_webm_opus_windows.py`, reproducible with `scripts/sweep_pyav_webm.sh`):
+(`tests/test_webm_opus_windows.py`, reproducible with `tests/tools/sweep_pyav_webm.sh`):
 
 - PyAV 12.0 to 18.1 PyPI wheels, which bundle ffmpeg 6.1 to 8.1
 - PyAV 9.2, 10.0 and 11.0 from conda-forge on ffmpeg 4.4, 5.1, 6.0 and 6.1
 
 In short: PyAV 9.2 through 18.1 on ffmpeg 4.4 through 8.1 (libavcodec 58.134 to 62.28).
-Importing the audio reader on a PyAV or ffmpeg outside that range raises a
-`PyAVCompatibilityWarning`: windows still decode, but their alignment has not been
-checked on that build. Full reads are unaffected.
+The lower edge is the dependency floor (`av>=9.2`). A newer PyAV or ffmpeg is untested
+rather than known bad, so it is not refused at install time: the first windowed
+WebM/Opus read in a process on such a build raises a `PyAVCompatibilityWarning` (once;
+filterable by category). Windows still decode, but their alignment has not been checked
+on that build. Full reads and the other formats are unaffected and never warn.
 
 #### Video
 

@@ -16,32 +16,39 @@ class PyAVCompatibilityWarning(UserWarning):
     been checked on this build (see README, "Windowed reads of WebM/Opus")."""
 
 
-# The range swept by scripts/sweep_pyav_webm.sh: PyAV 9.2-18.1 on ffmpeg 4.4-8.1. The
-# timestamps a seek produces changed twice inside it (PyAV 17 moved stream.start_time by
-# the codec delay; every build moves the trimmed head frame's pts), so a build outside it
-# may have changed them again. Widen after rerunning the sweep, not before.
+# The range swept by tests/tools/sweep_pyav_webm.sh: PyAV 9.2-18.1 on ffmpeg 4.4-8.1. The
+# lower edge is the package's dependency floor (pyproject: av>=9.2); the upper edge is
+# deliberately not a dependency cap, because a newer PyAV is untested rather than known
+# bad, and only WebM/Opus windows are affected. The timestamps a seek produces changed
+# twice inside the range (PyAV 17 moved stream.start_time by the codec delay; every build
+# moves the trimmed head frame's pts), so a build outside it may have changed them
+# again. libavcodec cannot be expressed as a dependency at all: it is inside the PyAV
+# wheel, and conda-forge builds pair one PyAV with several ffmpegs. Widen after
+# rerunning the sweep, not before.
 _TESTED_PYAV = ((9, 2), (18, 1))
 _TESTED_LIBAVCODEC = ((58, 134), (62, 28))
 
 
 def _version_tuple(text: str) -> Tuple[int, ...]:
+    """``"18.1.0rc1"`` -> ``(18, 1, 0)``; anything with fewer than two numeric components
+    is unknown and returns ``()``, so a bare ``"18"`` cannot pass a range check."""
     out = []
     for part in text.split("."):
         digits = "".join(ch for ch in part if ch.isdigit())
         if not digits:
             break
         out.append(int(digits))
-    return tuple(out)
+    return tuple(out) if len(out) >= 2 else ()
 
 
 def pyav_compatibility() -> Optional[str]:
     """``None`` when the installed PyAV / libavcodec lie inside the validated range, else
     a message saying which one does not."""
     pyav = _version_tuple(getattr(av, "__version__", ""))[:2]
-    lavc = tuple(av.library_versions.get("libavcodec", ())[:2])
+    lavc = tuple(getattr(av, "library_versions", {}).get("libavcodec", ())[:2])
     problems = []
     if not pyav or not (_TESTED_PYAV[0] <= pyav <= _TESTED_PYAV[1]):
-        problems.append(f"PyAV {av.__version__}")
+        problems.append(f"PyAV {getattr(av, '__version__', 'of unknown version')}")
     if not lavc or not (_TESTED_LIBAVCODEC[0] <= lavc <= _TESTED_LIBAVCODEC[1]):
         problems.append(
             "libavcodec " + ".".join(map(str, lavc)) if lavc else "an unknown libavcodec"
@@ -56,13 +63,24 @@ def pyav_compatibility() -> Optional[str]:
         f"{_TESTED_LIBAVCODEC[0][0]}.{_TESTED_LIBAVCODEC[0][1]}-"
         f"{_TESTED_LIBAVCODEC[1][0]}.{_TESTED_LIBAVCODEC[1][1]}). Windows of WebM/Opus "
         "entries may be misaligned on this build; full reads are unaffected. Run "
-        "scripts/sweep_pyav_webm.sh to check, or read from 0 and slice."
+        "tests/tools/sweep_pyav_webm.sh to check, or read from 0 and slice."
     )
 
 
-_compat = pyav_compatibility()
-if _compat is not None:
-    warnings.warn(_compat, PyAVCompatibilityWarning, stacklevel=2)
+_warned_untested_build = False
+
+
+def _warn_if_untested_build() -> None:
+    """Once per process, on the first windowed WebM/Opus read only: the check is about
+    window alignment, so readers of FLAC/WAV/OGG or of whole WebM entries never see it."""
+    global _warned_untested_build
+    if _warned_untested_build:
+        return
+    _warned_untested_build = True
+    message = pyav_compatibility()
+    if message is not None:
+        # _read_webm <- audio_read_local/_remote <- interface.audio_read <- the caller
+        warnings.warn(message, PyAVCompatibilityWarning, stacklevel=4)
 
 # Magic bytes for format detection
 _MAGIC = {
@@ -283,6 +301,8 @@ def _read_webm(
     end_time: Optional[float],
 ) -> AudioRead:
     """Read WebM/Opus via PyAV, with optional time slicing."""
+    if start_time is not None or end_time is not None:
+        _warn_if_untested_build()
     with av.open(io.BytesIO(blob), mode="r") as container:
         stream = container.streams.audio[0]
         sr = stream.rate
