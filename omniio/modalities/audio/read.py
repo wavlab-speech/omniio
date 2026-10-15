@@ -17,9 +17,10 @@ class PyAVCompatibilityWarning(UserWarning):
 
 
 # The range swept by tests/tools/sweep_pyav_webm.sh: PyAV 9.2-18.1 on ffmpeg 4.4-8.1. The
-# lower edge is the package's dependency floor (pyproject: av>=9.2); the upper edge is
-# deliberately not a dependency cap, because a newer PyAV is untested rather than known
-# bad, and only WebM/Opus windows are affected. The timestamps a seek produces changed
+# package's dependency floor is av>=10.0.0 (the whole test suite passes there); 9.2 is
+# validated for windowed *reads* only, from a conda-forge build without an Opus encoder.
+# The upper edge is deliberately not a dependency cap, because a newer PyAV is untested
+# rather than known bad, and only WebM/Opus windows are affected. The timestamps a seek produces changed
 # twice inside the range (PyAV 17 moved stream.start_time by the codec delay; every build
 # moves the trimmed head frame's pts), so a build outside it may have changed them
 # again. libavcodec cannot be expressed as a dependency at all: it is inside the PyAV
