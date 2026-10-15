@@ -104,11 +104,11 @@ jobs:
       # tree, so this starts green. Widening it means running black and isort
       # over the rest first; that is a diff worth making on its own.
       - name: black
-        run: black --check omniio/__init__.py omniio/tools tests/test_kaldi.py tests/test_kaldi_interop.py
+        run: black --check omniio/__init__.py omniio/tools scripts tests/test_kaldi.py tests/test_kaldi_interop.py
       - name: isort
-        run: isort --check-only omniio/__init__.py omniio/tools tests/test_kaldi.py tests/test_kaldi_interop.py
+        run: isort --check-only omniio/__init__.py omniio/tools scripts tests/test_kaldi.py tests/test_kaldi_interop.py
       - name: flake8
-        run: flake8 --max-line-length 100 --extend-ignore E203 omniio/__init__.py omniio/tools tests/test_kaldi.py tests/test_kaldi_interop.py
+        run: flake8 --max-line-length 100 --extend-ignore E203 omniio/__init__.py omniio/tools scripts tests/test_kaldi.py tests/test_kaldi_interop.py
 
   coderabbit-config:
     name: .coderabbit.yaml
