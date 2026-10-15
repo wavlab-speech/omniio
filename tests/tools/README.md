@@ -17,6 +17,16 @@ tests/tools/sweep_pyav_webm.sh                 # one wheel per ffmpeg generation
 tests/tools/sweep_pyav_webm.sh 18.1.0 19.0.0   # specific versions
 ```
 
+## `webm_decode_check.py`
+
+The decode-only half of the sweep, for a PyAV that has no Opus encoder (the
+conda-forge 9.2 build for linux-aarch64 is one): give it a WebM/Opus blob
+encoded elsewhere and it reads 25 windows through `omniio` and compares them
+with the full decode. Exit status 1 means a window was misaligned. Builds that
+cannot be installed from PyPI wheels (PyAV 9.2, 10.0, 11.0 need Python <= 3.10)
+come from conda-forge: `conda create -p ENV -c conda-forge python=3.10 av=9.2.0
+numpy pytest requests pysoundfile`, then `pip install zstandard pyarrow` into it.
+
 ## `compare_with_kaldiio.py`
 
 Reads every Kaldi archive under some directories with **both** `omniio` and
