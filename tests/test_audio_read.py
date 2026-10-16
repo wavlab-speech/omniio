@@ -281,3 +281,15 @@ class TestRangedSliceRead:
         got = audio_read_remote(url, offset, size, start_time=10.0, end_time=11.0).array
         np.testing.assert_array_equal(got, full[160000:176000])
         assert counting[-1] < size
+
+
+def test_slice_bounds_round_rather_than_truncate(sample_binary_archive, sample_audio_wav):
+    """258.52 * 16000 == 4136319.9999999995: int() would start a sample early."""
+    import soundfile as sf
+
+    archive_path, start_offset, file_size = sample_binary_archive
+    full, sr = sf.read(sample_audio_wav[0], dtype="float32", always_2d=True)
+    start, end = 1.001, 1.5  # 1.001 * 16000 == 16015.999999999998
+    assert int(start * sr) != round(start * sr)
+    got = audio_read_local(archive_path, start_offset, file_size, start_time=start, end_time=end)
+    np.testing.assert_array_equal(got.array, full[round(start * sr) : round(end * sr)])

@@ -162,8 +162,10 @@ def _read_pcm(
     # which is a round trip per open on a remote entry.
     with sf.SoundFile(buf) as f:
         sr = f.samplerate
-        start_frame = 0 if start_time is None else int(start_time * sr)
-        end_frame = f.frames if end_time is None else int(end_time * sr)
+        # round, not int: 258.52 s * 16 kHz is 4136319.99..., and truncating it
+        # starts the slice one sample early (lhotse and Kaldi round too)
+        start_frame = 0 if start_time is None else round(start_time * sr)
+        end_frame = f.frames if end_time is None else round(end_time * sr)
         start_frame, end_frame, _ = slice(start_frame, end_frame).indices(f.frames)
         f.seek(start_frame)
         data = f.read(max(end_frame - start_frame, 0), dtype="float32", always_2d=True)
@@ -195,8 +197,8 @@ def _read_webm(
             target_pts = int(start_time / time_base)
             container.seek(target_pts, stream=stream)
 
-        start_sample = 0 if start_time is None else int(start_time * sr)
-        end_sample = None if end_time is None else int(end_time * sr)
+        start_sample = 0 if start_time is None else round(start_time * sr)
+        end_sample = None if end_time is None else round(end_time * sr)
 
         chunks = []
         total_samples = 0
