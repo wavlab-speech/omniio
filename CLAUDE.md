@@ -157,6 +157,7 @@ blob.append(
     num_workers=4,  # 0 for single-process
     overwrite=False,  # True to skip duplicates
     skip_errors=False,  # True: skip items whose writer raises (returned as [(id, error)], also blob.last_failed)
+    metadata=[{"speaker": "S1"}, ...],  # optional per-item extra columns for metadata.parquet
     target_format="flac",  # modality-specific kwargs
     target_bit_depth=16
 )

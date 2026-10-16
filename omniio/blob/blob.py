@@ -31,9 +31,24 @@ class SkippedItemsWarning(UserWarning):
     """
 
 
+def _rows_to_table(rows: List[dict]) -> pa.Table:
+    """``pa.Table.from_pylist`` over the union of the rows' keys.
+
+    ``from_pylist`` takes its columns from the first row alone, so a key that
+    first appears later -- a writer field only some code paths set, or per-item
+    metadata given for some items -- would be silently dropped.
+    """
+    keys = list(dict.fromkeys(k for row in rows for k in row))
+    return pa.Table.from_pylist([{k: row.get(k) for k in keys} for row in rows])
+
+
+# Columns Blob itself writes; per-item metadata may not set them.
+_RESERVED_COLUMNS = frozenset({"id", "start_byte", "end_byte", "bin_index", "path"})
+
+
 def _worker_process(
     worker_id: int,
-    items_with_ids: List[Tuple[Any, str]],
+    items_with_ids: List[Tuple[Any, str, Optional[dict]]],
     modality: str,
     shard_dir: str,
     existing_ids: Set[str],
@@ -80,7 +95,7 @@ def _worker_process(
 
     f = open(bin_path, "wb")
     try:
-        for item, item_id in items_with_ids:
+        for item, item_id, extra in items_with_ids:
             if item_id in existing_ids and not allow_duplicate_ids:
                 warnings.warn(
                     f"Skipping duplicate id already in archive: {item_id}. "
@@ -103,7 +118,7 @@ def _worker_process(
             if cur_bin_size > 0 and cur_bin_size + n_bytes > max_bin_size:
                 f.close()
                 if metadata_rows:
-                    table = pa.Table.from_pylist(metadata_rows)
+                    table = _rows_to_table(metadata_rows)
                     pq.write_table(table, meta_path)
                     sub_results.append((bin_path, meta_path, len(metadata_rows)))
                 else:
@@ -116,6 +131,8 @@ def _worker_process(
                 cur_bin_size = 0
 
             f.write(raw_bytes)
+            if extra:
+                meta_dict.update(extra)
             meta_dict["id"] = item_id
             meta_dict["start_byte"] = offset
             meta_dict["end_byte"] = offset + n_bytes
@@ -136,7 +153,7 @@ def _worker_process(
 
     # Flush final bin
     if metadata_rows:
-        table = pa.Table.from_pylist(metadata_rows)
+        table = _rows_to_table(metadata_rows)
         pq.write_table(table, meta_path)
         sub_results.append((bin_path, meta_path, len(metadata_rows)))
     elif os.path.exists(bin_path):
@@ -307,6 +324,7 @@ class Blob:
         progress: bool = True,
         reshard: bool = False,
         skip_errors: bool = False,
+        metadata: Optional[List[Optional[dict]]] = None,
         **modality_kwargs,
     ):
         """
@@ -339,6 +357,12 @@ class Blob:
                          error aborts that worker and is re-raised after the other
                          workers' shards have been merged. Skipped ids are returned
                          and also recorded on `self.last_failed`.
+            metadata:    Optional per-item dicts, aligned with ``items``, whose
+                         keys become extra columns of ``metadata.parquet``
+                         (e.g. ``recording_id``, ``speaker``).  They override
+                         same-named keys from the modality writer; the
+                         bookkeeping columns (``id``, ``start_byte``,
+                         ``end_byte``, ``bin_index``, ``path``) are reserved.
 
         Returns:
             List of (item_id, error_message) for the items skipped. Empty unless
@@ -351,6 +375,16 @@ class Blob:
         else:
             assert len(items) == len(ids), "items and ids must be the same length"
 
+        if metadata is None:
+            metadata = [None] * len(items)
+        else:
+            if len(metadata) != len(items):
+                raise ValueError("items and metadata must be the same length")
+            for extra in metadata:
+                clash = _RESERVED_COLUMNS.intersection(extra or ())
+                if clash:
+                    raise ValueError(f"metadata uses reserved column(s): {sorted(clash)}")
+
         # --- Check uniqueness of incoming ids -------------------------
         seen = set(ids)
         if len(seen) != len(ids):
@@ -361,9 +395,11 @@ class Blob:
 
         # --- Partition work -------------------------------------------
         effective_workers = max(num_workers, 1)
-        chunks: List[List[Tuple[Any, str]]] = [[] for _ in range(effective_workers)]
-        for i, (item, item_id) in enumerate(zip(items, ids)):
-            chunks[i % effective_workers].append((item, item_id))
+        chunks: List[List[Tuple[Any, str, Optional[dict]]]] = [
+            [] for _ in range(effective_workers)
+        ]
+        for i, triple in enumerate(zip(items, ids, metadata)):
+            chunks[i % effective_workers].append(triple)
         chunks = [c for c in chunks if c]
 
         log_dir = self.archive_path.parent / "logs"
@@ -397,7 +433,7 @@ class Blob:
                 try:
                     f = open(bin_path, "wb")
                     try:
-                        for item, item_id in zip(items, ids):
+                        for item, item_id, extra in zip(items, ids, metadata):
                             if item_id in existing_ids and not allow_duplicate_ids:
                                 warnings.warn(
                                     f"Skipping duplicate id already in archive: {item_id}. "
@@ -418,7 +454,7 @@ class Blob:
                             if cur_bin_size > 0 and cur_bin_size + n_bytes > self.max_bin_size:
                                 f.close()
                                 if metadata_rows:
-                                    table = pa.Table.from_pylist(metadata_rows)
+                                    table = _rows_to_table(metadata_rows)
                                     pq.write_table(table, meta_path)
                                     sub_results.append((bin_path, meta_path, len(metadata_rows)))
                                 else:
@@ -431,6 +467,8 @@ class Blob:
                                 cur_bin_size = 0
 
                             f.write(raw_bytes)
+                            if extra:
+                                meta_dict.update(extra)
                             meta_dict["id"] = item_id
                             meta_dict["start_byte"] = offset
                             meta_dict["end_byte"] = offset + n_bytes
@@ -443,7 +481,7 @@ class Blob:
                         f.close()
 
                     if metadata_rows:
-                        table = pa.Table.from_pylist(metadata_rows)
+                        table = _rows_to_table(metadata_rows)
                         pq.write_table(table, meta_path)
                         sub_results.append((bin_path, meta_path, len(metadata_rows)))
                     elif os.path.exists(bin_path):
