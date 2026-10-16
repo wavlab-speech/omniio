@@ -121,8 +121,11 @@ class SegmentReader:
     ) -> pa.Table:
         """Index rows of the supervisions that match, by ``(recording_id, start)``.
 
-        ``start``/``end`` keep the segments that overlap ``[start, end)``.
-        Reads no archive bytes.
+        ``start``/``end`` keep the segments that overlap ``[start, end)`` by
+        any amount: a segment ending 20 ms into the window is kept (lhotse's
+        cut windows may drop it), one ending exactly at ``start`` is not.
+        Segments are returned whole, not clipped to the window.  Reads no
+        archive bytes.
         """
         table = self._require_sups()
         mask = None

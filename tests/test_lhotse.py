@@ -312,6 +312,8 @@ class TestReader:
         ]
         assert reader.supervisions(speaker="S1").column("id").to_pylist() == ["MEET-a", "MEET-c"]
         assert reader.supervisions("MEET", 2.5, 3.2).num_rows == 0  # MEET-a ends at 2.5
+        # any overlap counts: MEET-a (0.5-2.5) reaches 20 ms into [2.48, 3.0)
+        assert reader.supervisions("MEET", 2.48, 3.0).column("id").to_pylist() == ["MEET-a"]
 
     def test_window_payloads_in_one_read(self, reader, monkeypatch):
         calls = []
