@@ -195,3 +195,89 @@ class TestAudioReadWebM:
         expected_frames = int((end_time - start_time) * sample_rate)
         # Allow some tolerance due to frame boundaries
         assert abs(result.array.shape[0] - expected_frames) < sample_rate * 0.1
+
+
+class TestRangedSliceRead:
+    """A time slice reads only the bytes it needs, and returns exactly what a
+    full read followed by slicing would."""
+
+    @pytest.fixture
+    def long_archive(self, temp_dir):
+        """A 60 s mono WAV and a 60 s mono FLAC, behind some leading junk."""
+        import soundfile as sf
+
+        sr = 16000
+        rng = np.random.default_rng(0)
+        audio = (rng.standard_normal((60 * sr, 1)) * 0.1).astype(np.float32)
+        entries = {}
+        archive = temp_dir / "blob_0.bin"
+        with open(archive, "wb") as f:
+            f.write(b"\0" * 1000)
+            for fmt in ("WAV", "FLAC"):
+                buf = io.BytesIO()
+                sf.write(buf, audio, sr, format=fmt, subtype="PCM_16")
+                entries[fmt.lower()] = (f.tell(), len(buf.getvalue()))
+                f.write(buf.getvalue())
+        return archive, entries
+
+    @pytest.fixture
+    def counting(self, monkeypatch):
+        """Record ``bytes_read`` of every range reader that is closed."""
+        from omniio.modalities.audio import read as read_mod
+
+        seen = []
+
+        class Counting(read_mod._RangeReader):
+            def close(self):
+                if not self.closed:
+                    seen.append(self.bytes_read)
+                super().close()
+
+        monkeypatch.setattr(read_mod, "_RangeReader", Counting)
+        return seen
+
+    @pytest.mark.parametrize("fmt", ["wav", "flac"])
+    @pytest.mark.parametrize(
+        "start,end", [(30.25, 31.5), (0.0, 0.1), (59.5, None), (None, 0.5), (59.0, 70.0)]
+    )
+    def test_matches_full_read(self, long_archive, counting, fmt, start, end):
+        archive, entries = long_archive
+        offset, size = entries[fmt]
+        full = audio_read_local(str(archive), offset, size).array
+        got = audio_read_local(str(archive), offset, size, start_time=start, end_time=end)
+        lo = 0 if start is None else int(start * 16000)
+        hi = len(full) if end is None else int(end * 16000)
+        np.testing.assert_array_equal(got.array, full[lo:hi])
+        assert got.file_type == fmt
+        assert counting and counting[-1] < size
+
+    def test_reads_a_fraction_of_the_entry(self, long_archive, counting):
+        archive, entries = long_archive
+        offset, size = entries["wav"]  # ~1.9 MB
+        audio_read_local(str(archive), offset, size, start_time=30.0, end_time=31.0)
+        assert counting[-1] < size // 5
+
+    @pytest.mark.parametrize("fmt", ["wav", "flac"])
+    def test_remote(self, long_archive, counting, fmt):
+        import socket
+        import threading
+        import time
+
+        from omniio.audio.read import audio_read_remote
+        from omniio.remote import serve
+
+        archive, entries = long_archive
+        offset, size = entries[fmt]
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        threading.Thread(
+            target=serve, args=(port, str(archive.parent), "127.0.0.1"), daemon=True
+        ).start()
+        time.sleep(0.5)
+
+        url = f"http://127.0.0.1:{port}/{archive.name}"
+        full = audio_read_remote(url, offset, size).array
+        got = audio_read_remote(url, offset, size, start_time=10.0, end_time=11.0).array
+        np.testing.assert_array_equal(got, full[160000:176000])
+        assert counting[-1] < size
