@@ -13,7 +13,7 @@ Efficient Python library for reading and writing multimedia data (audio, video, 
 - **Streaming operations**: Memory-efficient handling of large multimedia files
 
 - **Kaldi ark/scp compatibility** via `omniio.kaldi`, an MIT-licensed drop-in for `kaldiio`
-- **lhotse conversion** via `omniio.lhotse`: pack a lhotse corpus (recordings, supervisions or cuts) into archives
+- **lhotse conversion** via `omniio.lhotse`: pack a lhotse corpus (recordings and supervisions) into archives
 
 ## Why Omni-IO?
 
@@ -317,7 +317,8 @@ from omniio import lhotse as olh
 
 olh.from_lhotse("ami", recordings="ami-ihm_recordings_dev.jsonl.gz",
                 supervisions="ami-ihm_supervisions_dev.jsonl.gz", name="ihm_dev")
-olh.from_lhotse("ami", cuts="ami-mdm_cuts_dev.jsonl.gz", name="mdm_dev")  # reuses stored audio
+olh.from_lhotse("ami", "ami-mdm_recordings_dev.jsonl.gz",
+                "ami-mdm_supervisions_dev.jsonl.gz", name="mdm_dev")  # reuses stored audio
 
 reader = olh.SegmentReader("ami/audio", "ami/supervisions_ihm_dev")  # or http(s) URLs
 rows = reader.supervisions("IB4010", start=300, end=330, speaker="MIO036")  # index only
@@ -333,9 +334,10 @@ wav = reader.audio("IB4010", 300, 330)  # (frames, channels), every source of th
   stored files.
 - **Supervisions point at sources (`audio_ids`), not at lhotse channel indices.**
   The same index names a different microphone in each variant.
-- **Cuts are not stored.** A cut is reduced to its recording and to its
-  supervisions in recording time. Fixed windows can be recomputed with
-  `olh.windows(duration, length)`.
+- **Cuts are not an input.** Recordings and supervisions are the source of
+  truth, and a cut is just a window over them. If a corpus is only available as
+  a `CutSet`, run `recordings, supervisions, _ = cuts.decompose()` first; that
+  also moves supervisions back to recording time.
 
 The converter needs `pip install 'omniio[lhotse]'`. The reader does not need lhotse.
 

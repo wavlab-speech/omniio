@@ -236,7 +236,7 @@ license forbids redistribution, which is the reason this module exists.
 ## lhotse Conversion
 
 The code lives in `omniio/tools/lhotse/` and is imported as `omniio.lhotse`.
-`from_lhotse(out_dir, recordings, supervisions, cuts, name=...)` writes
+`from_lhotse(out_dir, recordings, supervisions, name=...)` writes
 `out_dir/audio` (`Blob` audio, one entry per `AudioSource`, id = file stem) and
 `out_dir/supervisions_<name>` (`Blob` text, one entry per supervision).
 `SegmentReader` reads them back, locally or over HTTP, without lhotse.
@@ -251,10 +251,10 @@ The code lives in `omniio/tools/lhotse/` and is imported as `omniio.lhotse`.
   Supervisions are written in `(recording_id, start)` order with
   `num_workers=0`, so the segments of a window are adjacent and
   `SegmentReader.payloads` fetches them in one coalesced read.
-- Cuts are reduced to recordings plus supervisions in recording time. An
-  alignment inside a cut is shifted only if it falls within the supervision's
-  cut-relative span. AMI's 30 s cutsets keep absolute word times next to
-  cut-relative starts.
+- Cuts are deliberately not an input: recordings and supervisions are the
+  source of truth. For a cuts-only corpus, use lhotse's `cuts.decompose()`.
+  On AMI's 30 s cutset (cut-relative starts, absolute word times) it returns
+  every supervision once, in recording time.
 - `SegmentReader.audio` reads local sources sequentially (measured faster than
   a pool) and remote ones in a persistent thread pool.
 - Supervision rows also carry `audio_channels`, which runs parallel to

@@ -23,13 +23,12 @@ speaker, language, gender -- go into ``metadata.parquet`` so they can be
 filtered without reading the archive; text, alignments and ``custom`` are the
 entry's payload, zstd-compressed JSON written through the text modality.
 
-Cuts are not stored.  A recording-level cut is the recording, a per-segment cut
-is a supervision, and fixed windows are a rule over the two (see
-:func:`omniio.lhotse.windows`).  Cuts given as input are reduced to their
-recordings and supervisions.
+Only recordings and supervisions are converted, not cuts: they are the source
+of truth, and a cut is a window over them.  A corpus distributed only as a
+``CutSet`` can be converted after ``recordings, supervisions, _ =
+cuts.decompose()``, which also puts supervisions back in recording time.
 """
 
-import dataclasses
 import json
 import warnings
 from pathlib import Path
@@ -65,60 +64,6 @@ def _source_id(rec, src) -> str:
         if stem:
             return stem
     return f"{rec.id}_ch{'-'.join(str(c) for c in src.channels)}"
-
-
-def _shift_alignment(sup, cut_start: float, cut_relative_start: float):
-    """Alignment of a supervision taken from a cut, in recording time.
-
-    lhotse keeps a cut's supervision times relative to the cut, but alignments
-    are not always moved with them: AMI's 30 s cuts pair a cut-relative
-    ``start`` with absolute word times.  An alignment that falls inside the
-    supervision's cut-relative span is shifted; one that does not is taken to be
-    in recording time already.
-    """
-    if not sup.alignment:
-        return sup.alignment
-    items = [it for tier in sup.alignment.values() for it in tier]
-    if not items:
-        return sup.alignment
-    lo, hi = cut_relative_start - 0.5, cut_relative_start + sup.duration + 0.5
-    if all(lo <= it.start <= hi for it in items):
-        return {k: [it.with_offset(cut_start) for it in tier] for k, tier in sup.alignment.items()}
-    return sup.alignment
-
-
-def _from_cuts(cuts) -> Tuple[Dict[str, object], Dict[str, object]]:
-    """Recordings and recording-time supervisions found in a CutSet."""
-    recordings: Dict[str, object] = {}
-    sups: Dict[str, object] = {}
-    skipped: Dict[str, int] = {}
-    dropped = set()
-    for cut in cuts:
-        rec = getattr(cut, "recording", None)
-        if rec is None:  # MixedCut, PaddingCut, feature-only cuts
-            name = type(cut).__name__
-            skipped[name] = skipped.get(name, 0) + 1
-            continue
-        if getattr(cut, "has_features", False):
-            dropped.add("features")
-        if getattr(cut, "custom", None):
-            dropped.add("cut custom fields")
-        recordings.setdefault(rec.id, rec)
-        for sup in cut.supervisions:
-            if sup.id in sups:
-                continue
-            # with_offset moves start only; the alignment needs its own decision
-            sups[sup.id] = dataclasses.replace(
-                sup.with_offset(cut.start), alignment=_shift_alignment(sup, cut.start, sup.start)
-            )
-    if skipped:
-        warnings.warn(
-            "Skipped cuts without a single recording (not representable as recordings + "
-            f"supervisions): {skipped}"
-        )
-    if dropped:
-        warnings.warn(f"Cut-level data is not stored: {sorted(dropped)}")
-    return recordings, sups
 
 
 def _audio_ids_for(
@@ -160,9 +105,8 @@ def _payload(sup) -> str:
 
 def from_lhotse(
     out_dir: Union[str, Path],
-    recordings=None,
+    recordings,
     supervisions=None,
-    cuts=None,
     *,
     name: str = "default",
     target_format: Optional[str] = None,
@@ -178,10 +122,6 @@ def from_lhotse(
         out_dir:          Directory holding the archives; created if missing.
         recordings:       ``RecordingSet`` or a path to one.
         supervisions:     ``SupervisionSet`` or a path to one.
-        cuts:             ``CutSet`` or a path to one.  Its recordings and
-                          supervisions (moved to recording time and
-                          de-duplicated by id) are added to the above; a
-                          supervision given in ``supervisions`` wins.
         name:             Suffix of the supervisions archive, e.g. ``"ihm_dev"``,
                           so several variants can share one ``audio/``.
         target_format:    ``None`` byte-copies file sources (and writes FLAC for
@@ -201,18 +141,8 @@ def from_lhotse(
     """
     recs = _manifest(recordings, "RecordingSet")
     sups = _manifest(supervisions, "SupervisionSet")
-    cut_set = _manifest(cuts, "CutSet")
-    if recs is None and cut_set is None:
-        raise ValueError("Give recordings or cuts: there is no audio to convert.")
-
-    rec_by_id: Dict[str, object] = {}
-    sup_by_id: Dict[str, object] = {}
-    if cut_set is not None:
-        rec_by_id, sup_by_id = _from_cuts(cut_set)
-    if recs is not None:
-        rec_by_id.update((r.id, r) for r in recs)
-    if sups is not None:
-        sup_by_id.update((s.id, s) for s in sups)
+    rec_by_id = {r.id: r for r in recs}
+    sup_by_id = {s.id: s for s in sups} if sups is not None else {}
 
     out_dir = Path(out_dir)
     audio = Blob(str(out_dir / "audio"), modality="audio", max_bin_size=max_bin_size)

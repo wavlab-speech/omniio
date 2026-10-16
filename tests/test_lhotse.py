@@ -12,7 +12,6 @@ lhotse = pytest.importorskip("lhotse")
 from lhotse import (  # noqa: E402
     AudioSource,
     CutSet,
-    MonoCut,
     Recording,
     RecordingSet,
     SupervisionSegment,
@@ -204,11 +203,6 @@ class TestConvert:
         ref = slow.load_audio().T[8000:16000]
         np.testing.assert_allclose(got, ref, atol=1e-4)
 
-    def test_needs_audio(self, corpus):
-        _, sups, tmp = corpus
-        with pytest.raises(ValueError, match="no audio"):
-            olh.from_lhotse(tmp / "out", supervisions=sups)
-
     def test_manifest_paths(self, corpus):
         recs, sups, tmp = corpus
         recs.to_file(tmp / "recs.jsonl.gz")
@@ -219,66 +213,22 @@ class TestConvert:
         assert len(audio) == 3 and len(sup_blob) == 4
 
 
-class TestCuts:
-    def _index(self, sup_blob):
-        return {r["id"]: r for r in sup_blob.get_metadata().to_pylist()}
-
-    def test_windows_reduce_to_the_supervisions(self, corpus):
-        recs, sups, tmp = corpus
-        olh.from_lhotse(tmp / "ref", recs, sups, progress=False)
-        windows = CutSet.from_manifests(recordings=recs, supervisions=sups).cut_into_windows(2.0)
-        _, sup_blob = olh.from_lhotse(tmp / "out", cuts=windows, progress=False)
-        ref = olh.SegmentReader(
-            str(tmp / "ref" / "audio"), str(tmp / "ref" / "supervisions_default")
-        )
-        got = olh.SegmentReader(
-            str(tmp / "out" / "audio"), str(tmp / "out" / "supervisions_default")
-        )
-        assert set(self._index(sup_blob)) == {s.id for s in sups}
-        for s in sups:
-            a = ref.supervisions().to_pylist()
-            r = next(x for x in a if x["id"] == s.id)
-            g = next(x for x in got.supervisions().to_pylist() if x["id"] == s.id)
-            assert g["start"] == pytest.approx(r["start"]) and g["duration"] == pytest.approx(
-                r["duration"]
-            )
-            assert got.payloads([s.id]) == ref.payloads([s.id])
-
-    def test_absolute_alignment_in_a_cut_is_not_shifted(self, corpus):
-        """AMI's 30 s cuts: cut-relative supervision start, absolute word times."""
-        recs, _, tmp = corpus
-        sup = _sup("S", "MEET", 0.2, 0.5, 0, [("WORD", 3.2, 0.5)])  # cut starts at 3.0
-        cut = MonoCut(
-            id="c", start=3.0, duration=2.0, channel=0, recording=recs["MEET"], supervisions=[sup]
-        )
-        _, sup_blob = olh.from_lhotse(tmp / "out", cuts=CutSet.from_cuts([cut]), progress=False)
-        reader = olh.SegmentReader(
-            str(tmp / "out" / "audio"), str(tmp / "out" / "supervisions_default")
-        )
-        assert self._index(sup_blob)["S"]["start"] == pytest.approx(3.2)
-        assert reader.payloads(["S"])[0]["alignment"]["word"][0][1] == pytest.approx(3.2)
-
-    def test_relative_alignment_in_a_cut_is_shifted(self, corpus):
-        recs, _, tmp = corpus
-        sup = _sup("S", "MEET", 0.2, 0.5, 0, [("WORD", 0.2, 0.5)])
-        cut = MonoCut(
-            id="c", start=3.0, duration=2.0, channel=0, recording=recs["MEET"], supervisions=[sup]
-        )
-        olh.from_lhotse(tmp / "out", cuts=CutSet.from_cuts([cut]), progress=False)
-        reader = olh.SegmentReader(
-            str(tmp / "out" / "audio"), str(tmp / "out" / "supervisions_default")
-        )
-        assert reader.payloads(["S"])[0]["alignment"]["word"][0][1] == pytest.approx(3.2)
-
-    def test_mixed_cuts_are_skipped_with_a_warning(self, corpus):
-        recs, sups, tmp = corpus
-        cuts = CutSet.from_manifests(recordings=recs, supervisions=sups)
-        mixed = cuts["MEET"] if "MEET" in cuts else next(iter(cuts))
-        mixed = mixed.pad(duration=mixed.duration + 1.0)  # a MixedCut
-        with pytest.warns(UserWarning, match="MixedCut"):
-            olh.from_lhotse(
-                tmp / "out", recordings=recs, cuts=CutSet.from_cuts([mixed]), progress=False
-            )
+def test_cut_only_corpus_via_decompose(corpus):
+    """Cuts are not an input; lhotse's decompose() gives recordings and
+    recording-time supervisions, e.g. from windows that split the corpus."""
+    recs, sups, tmp = corpus
+    olh.from_lhotse(tmp / "ref", recs, sups, progress=False)
+    windows = CutSet.from_manifests(recordings=recs, supervisions=sups).cut_into_windows(2.0)
+    d_recs, d_sups, _ = windows.decompose()
+    olh.from_lhotse(tmp / "out", d_recs, d_sups, progress=False)
+    ref = olh.SegmentReader(str(tmp / "ref" / "audio"), str(tmp / "ref" / "supervisions_default"))
+    got = olh.SegmentReader(str(tmp / "out" / "audio"), str(tmp / "out" / "supervisions_default"))
+    cols = ["id", "start", "duration", "audio_ids", "speaker"]
+    assert (
+        got.supervisions().select(cols).to_pylist() == ref.supervisions().select(cols).to_pylist()
+    )
+    ids = [s.id for s in sups]
+    assert got.payloads(ids) == ref.payloads(ids)
 
 
 class TestReader:
