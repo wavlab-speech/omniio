@@ -358,3 +358,57 @@ else:
     raise SystemExit("from_lhotse should need lhotse")
 """
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+class TestIndex:
+    @pytest.fixture
+    def reader(self, corpus):
+        recs, sups, tmp = corpus
+        olh.from_lhotse(tmp / "out", recs, sups, progress=False)
+        return olh.SegmentReader(
+            str(tmp / "out" / "audio"), str(tmp / "out" / "supervisions_default")
+        )
+
+    def test_overlap_query_matches_a_scan(self, reader):
+        rng = np.random.default_rng(5)
+        table = reader.sup_index.to_pylist()
+        for _ in range(300):
+            rid = rng.choice(["MEET", "ROOM"])
+            a = rng.uniform(-1, 7)
+            b = a + rng.uniform(0, 3)
+            want = sorted(
+                (r["start"], r["id"])
+                for r in table
+                if r["recording_id"] == rid and r["start"] < b and r["start"] + r["duration"] > a
+            )
+            got = reader.supervisions(rid, a, b).to_pylist()
+            assert [r["id"] for r in got] == [i for _, i in want]
+
+    def test_sources_follow_the_variant_in_channel_order(self, corpus):
+        recs, sups, tmp = corpus
+        # write Headset-1 first, so archive order is not channel order
+        h0, h1 = recs["MEET"].sources
+        first = Recording(
+            id="MEET",
+            sources=[AudioSource("file", [0], h1.source)],
+            sampling_rate=SR,
+            num_samples=6 * SR,
+            duration=6.0,
+        )
+        olh.from_lhotse(tmp / "out", RecordingSet.from_recordings([first]), progress=False)
+        olh.from_lhotse(tmp / "out", recs, sups, name="all", progress=False)
+        olh.from_lhotse(
+            tmp / "out",
+            RecordingSet.from_recordings([first]),
+            SupervisionSet.from_segments([_sup("x", "MEET", 1.0, 1.0, 0, text="X")]),
+            name="one",
+            progress=False,
+        )
+        audio = str(tmp / "out" / "audio")
+        assert olh.SegmentReader(audio, str(tmp / "out" / "supervisions_all")).sources("MEET") == [
+            "MEET.Headset-0",
+            "MEET.Headset-1",
+        ]
+        one = olh.SegmentReader(audio, str(tmp / "out" / "supervisions_one"))
+        assert one.sources("MEET") == ["MEET.Headset-1"] and one.recording_ids == ["MEET"]
+        assert one.audio("MEET", 0.0, 1.0).array.shape == (SR, 1)

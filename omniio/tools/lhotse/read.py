@@ -20,6 +20,8 @@ from omniio.definitions import AudioRead
 from omniio.interface import audio_read
 from omniio.remote import load as remote_load
 
+_NO_ROWS = np.empty(0, dtype=np.int64)
+
 # Neighbouring payloads closer than this are fetched with one read.
 _COALESCE_GAP = 64 * 1024
 
@@ -88,15 +90,47 @@ class SegmentReader:
 
         self._audio_rows: Dict[str, dict] = {}
         self._rec_sources: Dict[str, List[str]] = {}
-        cols = ["id", "path", "start_byte", "end_byte", "sample_rate", "recording_id"]
+        cols = ["id", "path", "start_byte", "end_byte", "sample_rate", "recording_id", "duration"]
         for row in self.audio_index.select(cols).to_pylist():
             self._audio_rows[row["id"]] = row
             self._rec_sources.setdefault(row["recording_id"], []).append(row["id"])
 
         self._sup_pos: Dict[str, int] = {}
+        # recording_id -> (row positions, starts, ends, running max of ends),
+        # all sorted by start: overlap queries are two binary searches
+        self._by_rec: Dict[str, Tuple[np.ndarray, ...]] = {}
         if self.sup_index is not None:
             ids = self.sup_index.column("id").to_pylist()
             self._sup_pos = {sid: i for i, sid in enumerate(ids)}
+            rec = np.asarray(self.sup_index.column("recording_id").to_pylist(), dtype=object)
+            st = self.sup_index.column("start").to_numpy(zero_copy_only=False)
+            en = st + self.sup_index.column("duration").to_numpy(zero_copy_only=False)
+            order = np.lexsort((st, rec.astype(str)))
+            bounds = np.flatnonzero(rec[order][1:] != rec[order][:-1]) + 1
+            for rows in np.split(order, bounds) if len(order) else []:
+                s, e = st[rows], en[rows]
+                self._by_rec[rec[rows[0]]] = (rows, s, e, np.maximum.accumulate(e))
+        # Sources the supervisions refer to, per recording, in lhotse channel
+        # order: several variants can share one audio archive (AMI IHM, SDM and
+        # MDM), so a reader opened on one of them must not read the others'
+        # mics, and the archive's own order is write order, not array geometry
+        self._sources: Dict[str, List[str]] = dict(self._rec_sources)
+        if self.sup_index is not None:
+            aids = self.sup_index.column("audio_ids").to_pylist()
+            chans = (
+                self.sup_index.column("audio_channels").to_pylist()
+                if "audio_channels" in self.sup_index.column_names
+                else [None] * len(aids)
+            )
+            pos = {a: i for i, a in enumerate(self._audio_rows)}
+            for rid, (rows, *_rest) in self._by_rec.items():
+                rank: Dict[str, float] = {}
+                for r in rows:
+                    for k, a in enumerate(aids[r] or ()):
+                        ch = chans[r][k] if chans[r] is not None else pos.get(a, 0)
+                        rank[a] = min(rank.get(a, ch), ch)
+                self._sources[rid] = sorted(rank, key=lambda a: (rank[a], pos.get(a, 0)))
+        self._durations: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ #
     # Index
@@ -104,13 +138,38 @@ class SegmentReader:
 
     @property
     def recording_ids(self) -> List[str]:
-        return list(self._rec_sources)
+        """Recordings of the supervisions archive (all of the audio archive's
+        without one)."""
+        return list(self._by_rec) if self.sup_index is not None else list(self._rec_sources)
 
     def recording_duration(self, recording_id: str) -> float:
-        """Shortest source of a recording, in seconds: the span :meth:`audio` returns
-        for every channel."""
-        mask = pc.equal(self.audio_index.column("recording_id"), recording_id)
-        return float(pc.min(self.audio_index.filter(mask).column("duration")).as_py())
+        """Shortest of the recording's sources (see :meth:`sources`), in seconds:
+        the span :meth:`audio` returns for every channel."""
+        if recording_id not in self._durations:
+            durs = [self._audio_rows[a]["duration"] for a in self.sources(recording_id)]
+            self._durations[recording_id] = float(min(durs))
+        return self._durations[recording_id]
+
+    def sources(self, recording_id: str) -> List[str]:
+        """Default audio ids of a recording, in lhotse channel order.
+
+        With a supervisions archive these are the sources its supervisions
+        refer to: one ``audio/`` archive can hold several variants of a corpus
+        (AMI IHM, SDM and MDM), and a reader opened on IHM should read the
+        headsets, not the arrays.  A source no supervision refers to is left out.
+        """
+        return self._sources[recording_id]
+
+    def _overlapping(self, recording_id: str, start: float, end: float) -> np.ndarray:
+        """Row positions of a recording's supervisions overlapping ``(start, end)``,
+        by start time.  O(log n + k)."""
+        if recording_id not in self._by_rec:
+            return _NO_ROWS
+        rows, s, e, emax = self._by_rec[recording_id]
+        lo = int(np.searchsorted(emax, start, side="right"))  # first that may end after start
+        hi = int(np.searchsorted(s, end, side="left"))  # past the last starting before end
+        k = np.arange(lo, hi)
+        return rows[k[e[lo:hi] > start]]
 
     def supervisions(
         self,
@@ -128,6 +187,13 @@ class SegmentReader:
         archive bytes.
         """
         table = self._require_sups()
+        if recording_id is not None and (start is not None or end is not None):
+            lo = -np.inf if start is None else start
+            hi = np.inf if end is None else end
+            out = table.take(self._overlapping(recording_id, lo, hi))
+            if speaker is not None:
+                out = out.filter(pc.equal(out.column("speaker"), speaker))
+            return out
         mask = None
 
         def _and(m):
@@ -157,7 +223,7 @@ class SegmentReader:
         """
         table = self._require_sups()
         if not isinstance(rows, pa.Table):
-            rows = table.take([self._sup_pos[i] for i in rows])
+            rows = table.take(np.array([self._sup_pos[i] for i in rows], dtype=np.int64))
         spans = rows.select(["path", "start_byte", "end_byte"]).to_pylist()
 
         order = sorted(range(len(spans)), key=lambda i: (spans[i]["path"], spans[i]["start_byte"]))
@@ -203,12 +269,12 @@ class SegmentReader:
     ) -> AudioRead:
         """``[start, end)`` of a recording as ``(frames, channels)``.
 
-        ``audio_ids`` picks and orders the sources (default: all of the
-        recording's, in archive order).  Each source is one ranged read (in
+        ``audio_ids`` picks and orders the sources (default:
+        :meth:`sources`).  Each source is one ranged read (in
         parallel when remote); channels are concatenated and cut to the
         shortest source.
         """
-        ids = list(audio_ids) if audio_ids is not None else self._rec_sources[recording_id]
+        ids = list(audio_ids) if audio_ids is not None else self._sources[recording_id]
         rows = [self._audio_rows[i] for i in ids]
         rates = {r["sample_rate"] for r in rows}
         if len(rates) > 1:

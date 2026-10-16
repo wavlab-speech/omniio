@@ -121,15 +121,24 @@ def _from_cuts(cuts) -> Tuple[Dict[str, object], Dict[str, object]]:
     return recordings, sups
 
 
-def _audio_ids_for(sup, rec, source_ids: List[Tuple[List[int], str]]) -> List[str]:
-    """Ids of the audio entries that hold the channels a supervision covers."""
+def _audio_ids_for(
+    sup, rec, source_ids: List[Tuple[List[int], str]]
+) -> Tuple[List[str], List[int]]:
+    """Audio entries holding the channels a supervision covers, by channel, and
+    the first lhotse channel of each.
+
+    The channel numbers are what fixes the order of a variant's sources -- an
+    array's geometry -- since the audio archive's own order is write order,
+    shared between variants.
+    """
     if sup.channel is None:
         wanted = set(rec.channel_ids)
     elif isinstance(sup.channel, int):
         wanted = {sup.channel}
     else:
         wanted = set(sup.channel)
-    return [aid for chans, aid in source_ids if wanted.intersection(chans)]
+    hits = sorted((min(chans), aid) for chans, aid in source_ids if wanted.intersection(chans))
+    return [aid for _, aid in hits], [ch for ch, _ in hits]
 
 
 def _payload(sup) -> str:
@@ -275,6 +284,7 @@ def from_lhotse(
         items.append(_payload(sup))
         ids.append(sup.id)
         channel = sup.channel
+        audio_ids, audio_channels = _audio_ids_for(sup, rec, source_ids[rec.id])
         extras.append(
             {
                 "recording_id": sup.recording_id,
@@ -285,7 +295,8 @@ def from_lhotse(
                     if channel is None
                     else ([channel] if isinstance(channel, int) else list(channel))
                 ),
-                "audio_ids": _audio_ids_for(sup, rec, source_ids[rec.id]),
+                "audio_ids": audio_ids,
+                "audio_channels": audio_channels,
                 "speaker": sup.speaker,
                 "language": sup.language,
                 "gender": sup.gender,

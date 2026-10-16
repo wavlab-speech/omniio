@@ -257,6 +257,17 @@ The code lives in `omniio/tools/lhotse/` and is imported as `omniio.lhotse`.
   cut-relative starts.
 - `SegmentReader.audio` reads local sources sequentially (measured faster than
   a pool) and remote ones in a persistent thread pool.
+- Supervision rows also carry `audio_channels`, which runs parallel to
+  `audio_ids` and holds the variant's first lhotse channel for each source.
+  `SegmentReader.sources(rid)` uses it to put a variant's sources in channel
+  order (array geometry), because the shared audio archive is in write order.
+  `recording_ids` and the default sources are scoped to the supervisions
+  archive, so an IHM reader does not read the arrays of a shared archive.
+- `supervisions(rid, start, end)` does two `searchsorted` calls over each
+  recording's sorted starts and running maximum of ends, not a table scan.
+- Sampling training items (fixed-length chunks that avoid cutting words,
+  utterance groups) is deliberately not here: that is dataloader policy, and
+  it belongs in the consumer (ESPnet).
 - `tests/test_lhotse.py` skips without lhotse.
 
 ## Dependencies
