@@ -19,8 +19,9 @@ The library is organized by data modality, with each supporting read and write o
 - **modalities/image/**: PNG/JPEG I/O
 - **modalities/midi/**: Standard MIDI File I/O, seconds-based time slicing, FluidSynth/sine synthesis
 - **blob/**: Binary archive management with PyArrow metadata
-- **tools/**: Format-specific helpers that are not omniio's own archive layout;
-  currently **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`)
+- **tools/**: Format-specific helpers that are not omniio's own archive layout:
+  **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`), and
+  **tools/lhotse/** (`omniio.lhotse`), which packs lhotse corpora into archives
 
 ### Core Components
 
@@ -232,6 +233,32 @@ skips unless `kaldiio` happens to be installed, and then asserts byte-identical
 output in both directions. `kaldiio` must never become a dependency: its
 license forbids redistribution, which is the reason this module exists.
 
+## lhotse Conversion
+
+The code lives in `omniio/tools/lhotse/` and is imported as `omniio.lhotse`.
+`from_lhotse(out_dir, recordings, supervisions, cuts, name=...)` writes
+`out_dir/audio` (`Blob` audio, one entry per `AudioSource`, id = file stem) and
+`out_dir/supervisions_<name>` (`Blob` text, one entry per supervision).
+`SegmentReader` reads them back, locally or over HTTP, without lhotse.
+
+- Audio rows carry `recording_id`, `source` and `source_type`. A source already
+  in `audio/` is skipped, so several variants share audio. If the same stem
+  comes from two different files, the converter raises an error rather than
+  merging them.
+- Supervision index columns are `recording_id, start, duration, channel,
+  audio_ids, speaker, language, gender`. The payload is JSON:
+  `{"text", "alignment": {tier: [[symbol, start, dur(, score)]]}, "custom"}`.
+  Supervisions are written in `(recording_id, start)` order with
+  `num_workers=0`, so the segments of a window are adjacent and
+  `SegmentReader.payloads` fetches them in one coalesced read.
+- Cuts are reduced to recordings plus supervisions in recording time. An
+  alignment inside a cut is shifted only if it falls within the supervision's
+  cut-relative span. AMI's 30 s cutsets keep absolute word times next to
+  cut-relative starts.
+- `SegmentReader.audio` reads local sources sequentially (measured faster than
+  a pool) and remote ones in a persistent thread pool.
+- `tests/test_lhotse.py` skips without lhotse.
+
 ## Dependencies
 
 Key libraries used throughout the codebase:
@@ -243,6 +270,7 @@ Key libraries used throughout the codebase:
 - **pyarrow/parquet**: Efficient metadata storage and operations
 - **pretty_midi** (+ mido; optional, `omniio[midi]`): MIDI parsing/serialization; ships the TimGM6mb GM SoundFont
 - **pyfluidsynth** (optional, `omniio[synth]`, needs libfluidsynth): MIDI synthesis backend
+- **lhotse** (optional, `omniio[lhotse]`): only for `omniio.lhotse.from_lhotse`; imported lazily
 
 ## Common Implementation Notes
 
