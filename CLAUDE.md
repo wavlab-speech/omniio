@@ -19,8 +19,9 @@ The library is organized by data modality, with each supporting read and write o
 - **modalities/image/**: PNG/JPEG I/O
 - **modalities/midi/**: Standard MIDI File I/O, seconds-based time slicing, FluidSynth/sine synthesis
 - **blob/**: Binary archive management with PyArrow metadata
-- **tools/**: Format-specific helpers that are not omniio's own archive layout;
-  currently **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`)
+- **tools/**: Format-specific helpers that are not omniio's own archive layout:
+  **tools/kaldi/**, a `ark`/`scp` compatibility layer (drop-in for `kaldiio`), and
+  **tools/lhotse/** (`omniio.lhotse`), which packs lhotse corpora into archives
 
 ### Core Components
 
@@ -157,6 +158,7 @@ blob.append(
     num_workers=4,  # 0 for single-process
     overwrite=False,  # True to skip duplicates
     skip_errors=False,  # True: skip items whose writer raises (returned as [(id, error)], also blob.last_failed)
+    metadata=[{"speaker": "S1"}, ...],  # optional per-item extra columns for metadata.parquet
     target_format="flac",  # modality-specific kwargs
     target_bit_depth=16
 )
@@ -231,6 +233,43 @@ skips unless `kaldiio` happens to be installed, and then asserts byte-identical
 output in both directions. `kaldiio` must never become a dependency: its
 license forbids redistribution, which is the reason this module exists.
 
+## lhotse Conversion
+
+The code lives in `omniio/tools/lhotse/` and is imported as `omniio.lhotse`.
+`from_lhotse(out_dir, recordings, supervisions, name=...)` writes
+`out_dir/audio` (`Blob` audio, one entry per `AudioSource`, id = file stem) and
+`out_dir/supervisions_<name>` (`Blob` text, one entry per supervision).
+`SegmentReader` reads them back, locally or over HTTP, without lhotse.
+
+- Audio rows carry `recording_id`, `source` and `source_type`. A source already
+  in `audio/` is skipped, so several variants share audio. If the same stem
+  comes from two different files, the converter raises an error rather than
+  merging them.
+- Supervision index columns are `recording_id, start, duration, channel,
+  audio_ids, speaker, language, gender`. The payload is JSON:
+  `{"text", "alignment": {tier: [[symbol, start, dur(, score)]]}, "custom"}`.
+  Supervisions are written in `(recording_id, start)` order with
+  `num_workers=0`, so the segments of a window are adjacent and
+  `SegmentReader.payloads` fetches them in one coalesced read.
+- Cuts are deliberately not an input: recordings and supervisions are the
+  source of truth. For a cuts-only corpus, use lhotse's `cuts.decompose()`.
+  On AMI's 30 s cutset (cut-relative starts, absolute word times) it returns
+  every supervision once, in recording time.
+- `SegmentReader.audio` reads local sources sequentially (measured faster than
+  a pool) and remote ones in a persistent thread pool.
+- Supervision rows also carry `audio_channels`, which runs parallel to
+  `audio_ids` and holds the variant's first lhotse channel for each source.
+  `SegmentReader.sources(rid)` uses it to put a variant's sources in channel
+  order (array geometry), because the shared audio archive is in write order.
+  `recording_ids` and the default sources are scoped to the supervisions
+  archive, so an IHM reader does not read the arrays of a shared archive.
+- `supervisions(rid, start, end)` does two `searchsorted` calls over each
+  recording's sorted starts and running maximum of ends, not a table scan.
+- Sampling training items (fixed-length chunks that avoid cutting words,
+  utterance groups) is deliberately not here: that is dataloader policy, and
+  it belongs in the consumer (ESPnet).
+- `tests/test_lhotse.py` skips without lhotse.
+
 ## Dependencies
 
 Key libraries used throughout the codebase:
@@ -242,6 +281,7 @@ Key libraries used throughout the codebase:
 - **pyarrow/parquet**: Efficient metadata storage and operations
 - **pretty_midi** (+ mido; optional, `omniio[midi]`): MIDI parsing/serialization; ships the TimGM6mb GM SoundFont
 - **pyfluidsynth** (optional, `omniio[synth]`, needs libfluidsynth): MIDI synthesis backend
+- **lhotse** (optional, `omniio[lhotse]`): only for `omniio.lhotse.from_lhotse`; imported lazily
 
 ## Common Implementation Notes
 
@@ -251,6 +291,7 @@ Key libraries used throughout the codebase:
 - Blob workers check for duplicate IDs before writing; set `overwrite=True` to skip
 - Archive byte offsets use [start_byte, end_byte) convention (end is exclusive)
 - Remote reads use HTTP 206 Partial Content with `Range` headers
+- A time-sliced audio read (`start_time`/`end_time`) does not fetch the whole entry: soundfile gets a `_RangeReader` (`omniio/modalities/audio/read.py`) over the entry's byte range that fetches aligned blocks on demand (64 KB local, 256 KB remote), so a slice of a long recording costs the header plus the slice. Unsliced reads and WebM still read the entry in one go
 - `pretty_midi` is an optional extra (`omniio[midi]`) imported lazily inside `omniio/modalities/midi/`, so the rest of the library works without it; the MIDI entry points raise an `ImportError` naming the extra
 - `Blob.append(skip_errors=True)` reports dropped items with `SkippedItemsWarning` (`omniio/blob/blob.py`), so callers can filter or escalate exactly that event
 - Run tests with `python -m pytest tests -o addopts=""` when `pytest-cov` is not installed (pyproject's addopts require it)

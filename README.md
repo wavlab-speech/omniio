@@ -13,6 +13,7 @@ Efficient Python library for reading and writing multimedia data (audio, video, 
 - **Streaming operations**: Memory-efficient handling of large multimedia files
 
 - **Kaldi ark/scp compatibility** via `omniio.kaldi`, an MIT-licensed drop-in for `kaldiio`
+- **lhotse conversion** via `omniio.lhotse`: pack a lhotse corpus (recordings and supervisions) into archives
 
 ## Why Omni-IO?
 
@@ -298,6 +299,47 @@ letting it wrap.
 This code is written against the format description in Kaldi itself
 (Apache-2.0) and carries omniio's MIT license; `kaldiio` is not a dependency
 and none of its code is used.
+
+## Converting lhotse Corpora
+
+`omniio.lhotse` packs a lhotse corpus into two archives that share `recording_id`:
+
+```
+ami/
+  audio/                one entry per audio source file, byte-copied by default
+  supervisions_<name>/  one entry per supervision; times, speaker, language,
+                        gender and audio_ids are index columns, while text,
+                        alignment and custom are a zstd JSON payload
+```
+
+```python
+from omniio import lhotse as olh
+
+olh.from_lhotse("ami", recordings="ami-ihm_recordings_dev.jsonl.gz",
+                supervisions="ami-ihm_supervisions_dev.jsonl.gz", name="ihm_dev")
+olh.from_lhotse("ami", "ami-mdm_recordings_dev.jsonl.gz",
+                "ami-mdm_supervisions_dev.jsonl.gz", name="mdm_dev")  # reuses stored audio
+
+reader = olh.SegmentReader("ami/audio", "ami/supervisions_ihm_dev")  # or http(s) URLs
+rows = reader.supervisions("IB4010", start=300, end=330, speaker="MIO036")  # index only
+payloads = reader.payloads(rows)        # [{"text", "alignment", "custom"}, ...], one read
+seg = reader.segment("IB4010-0-18")     # index row + payload + seg["audio"] (AudioRead)
+wav = reader.audio("IB4010", 300, 330)  # (frames, channels), every source of the recording
+```
+
+- **Audio is stored per source, not per recording.** In AMI each microphone is its
+  own WAV. Keeping them separate means you can read one channel without decoding
+  the others, and it avoids FLAC's 8-channel limit (MDM has 16). When several
+  variants (IHM, SDM, MDM) are converted into the same directory, they share the
+  stored files.
+- **Supervisions point at sources (`audio_ids`), not at lhotse channel indices.**
+  The same index names a different microphone in each variant.
+- **Cuts are not an input.** Recordings and supervisions are the source of
+  truth, and a cut is just a window over them. If a corpus is only available as
+  a `CutSet`, run `recordings, supervisions, _ = cuts.decompose()` first; that
+  also moves supervisions back to recording time.
+
+The converter needs `pip install 'omniio[lhotse]'`. The reader does not need lhotse.
 
 ## Archive Structure
 
