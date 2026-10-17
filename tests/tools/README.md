@@ -1,6 +1,31 @@
-# scripts/
+# tests/tools/
 
-Things you run by hand, not part of the installed package.
+Development tools you run by hand; not part of the installed package.
+
+## `sweep_pyav_webm.sh`
+
+Reruns `tests/test_webm_opus_windows.py` against several PyAV wheels, each installed
+into its own directory and put on `PYTHONPATH` for that run only, and prints one row
+per version: the `av` it actually imported, the bundled libavcodec, what the build
+reports for `stream.start_time` and for the first frame after a seek, and the test
+result. A row whose imported `av` does not match the requested version is reported
+as a mismatch rather than labelled. Used to set the validated range in
+`omniio/modalities/audio/read.py` (`_TESTED_PYAV`, `_TESTED_LIBAVCODEC`).
+
+```bash
+tests/tools/sweep_pyav_webm.sh                 # one wheel per ffmpeg generation
+tests/tools/sweep_pyav_webm.sh 18.1.0 19.0.0   # specific versions
+```
+
+## `webm_decode_check.py`
+
+The decode-only half of the sweep, for a PyAV that has no Opus encoder (the
+conda-forge 9.2 build for linux-aarch64 is one): give it a WebM/Opus blob
+encoded elsewhere and it reads 25 windows through `omniio` and compares them
+with the full decode. Exit status 1 means a window was misaligned. Builds that
+cannot be installed from PyPI wheels (PyAV 9.2, 10.0, 11.0 need Python <= 3.10)
+come from conda-forge: `conda create -p ENV -c conda-forge python=3.10 av=9.2.0
+numpy pytest requests pysoundfile`, then `pip install zstandard pyarrow` into it.
 
 ## `compare_with_kaldiio.py`
 
@@ -10,7 +35,7 @@ you already have, rather than against fixtures someone else wrote.
 
 ```bash
 pip install omniio kaldiio
-python scripts/compare_with_kaldiio.py /path/to/your/dump
+python tests/tools/compare_with_kaldiio.py /path/to/your/dump
 ```
 
 Exits non-zero if anything mismatched, so it works as a gate.
