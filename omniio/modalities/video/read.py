@@ -11,6 +11,89 @@ import requests
 
 from omniio.definitions import VideoRead
 
+# The windowed-read machinery the audio reader already has: seek a little early, anchor
+# the decoded run on the landing packet's pts measured from the first packet's pts, place
+# every frame on the stream's own sample timeline, trim to the window, and decode from the
+# top instead when the seek overshoots. Imported rather than lifted into a shared module
+# so that the definitions, the comments recording which PyAV builds the timestamps hold
+# on, and the tests that pin them (tests/test_webm_opus_windows.py) all stay in one place.
+# `_webm_frames` is named for the container that forced it into existence, but nothing in
+# it is WebM-only: the one Opus-shaped step, snapping a position onto the codec's frame
+# grid, checks the frame size first and is a no-op for AAC's 1024.
+from omniio.modalities.audio.read import (
+    _OPUS_SEEK_MARGIN_S,
+    _gather_window,
+    _warn_if_untested_build,
+    _webm_frames,
+)
+
+
+def _decode_audio_window(
+    buf: io.BytesIO,
+    start_sample: int,
+    end_sample: Optional[int],
+    channels: int,
+) -> np.ndarray:
+    """Decode [start_sample, end_sample) of the container's first audio stream.
+
+    A pass of its own over a second container: the video pass has already seeked the
+    first one to a keyframe before the requested frame, which is not where the audio
+    window begins.
+
+    This used to append every frame the decoder produced from wherever its seek landed and
+    then keep the first (end - start) samples of that, so the audio began at the seek
+    landing rather than at the requested time -- on WebM, where a seek lands on a cluster
+    boundary, seconds away from it. Going through _webm_frames/_gather_window places each
+    decoded frame on the stream's sample timeline and trims the lead-in against it.
+
+    Returns (samples, channels) float32, integer sample formats scaled by their dtype max.
+    """
+    buf.seek(0)
+    with av.open(buf, mode="r") as container:
+        stream = container.streams.audio[0]
+        # Seek only where it can skip real work and there is a timeline to seek against:
+        # a window inside the first margin would seek to the start anyway, and decoding
+        # from the top is both exact and cheaper than a seek that makes libavformat
+        # re-apply the codec delay.
+        seeking = (
+            start_sample > _OPUS_SEEK_MARGIN_S * stream.rate
+            and stream.start_time is not None
+        )
+        if seeking and "matroska" in (container.format.name or ""):
+            # A window of a Matroska/WebM entry now rides on exactly the seek timestamps
+            # the audio reader's windows are anchored on, so the same build check applies.
+            _warn_if_untested_build()
+        chunks, overshot = _gather_window(
+            _webm_frames(container, stream, start_sample if seeking else None),
+            start_sample,
+            end_sample,
+            detect_overshoot=seeking,
+        )
+
+    if overshot:
+        # The seek landed after the window and nothing before it can be recovered from
+        # that container: decode from the top in a fresh one, where the first decoded
+        # sample is sample 0 by construction.
+        buf.seek(0)
+        with av.open(buf, mode="r") as container:
+            stream = container.streams.audio[0]
+            chunks, _ = _gather_window(
+                _webm_frames(container, stream, None),
+                start_sample,
+                end_sample,
+                detect_overshoot=False,
+            )
+
+    if not chunks:
+        return np.empty((0, channels), dtype=np.float32)
+
+    raw = np.concatenate(chunks, axis=1)  # (channels, window)
+    audio_array = raw.T.astype(np.float32)  # (samples, channels)
+    if np.issubdtype(raw.dtype, np.integer):
+        audio_array /= float(np.iinfo(raw.dtype).max)
+    return audio_array
+
+
 def _decode_video(
     blob: bytes,
     start_frame: Optional[int] = None,
@@ -65,14 +148,32 @@ def _decode_video(
         if start_frame is None:
             start_frame = 0
 
-        # Compute time boundaries for audio slicing
+        # Compute time boundaries for audio slicing.
+        #
+        # The audio window is cut on the video frame grid, not at the raw
+        # start_time/end_time. video_array begins at start_frame, so audio beginning at
+        # start_time instead would be out of step with it by up to one frame period
+        # (40 ms at 25 fps, more wherever the frame rate is fractional). The two arrays
+        # describing the same span is what a video reader owes its caller; a caller who
+        # wants sample-exact audio bounds has omniio.audio.read for that. With no video
+        # stream, or none that declares a frame rate, there is no grid to snap to and the
+        # requested times are used as given -- such a container used to be handed
+        # t_start = 0 and silently return audio from the beginning of the file.
         audio_start_sample = None
         audio_end_sample = None
         if audio_stream and sample_rate:
-            t_start = start_frame / fps if fps else 0
-            t_end = end_frame / fps if (end_frame and fps) else None
-            audio_start_sample = int(t_start * sample_rate)
-            audio_end_sample = int(t_end * sample_rate) if t_end else None
+            if fps:
+                t_start = start_frame / fps
+                t_end = end_frame / fps if end_frame is not None else None
+            else:
+                t_start = start_time or 0.0
+                t_end = end_time
+            audio_start_sample = max(0, int(round(t_start * sample_rate)))
+            audio_end_sample = (
+                None
+                if t_end is None
+                else max(audio_start_sample, int(round(t_end * sample_rate)))
+            )
 
         # --- Seek to nearest keyframe before start_frame -------------
         if start_frame > 0 and video_stream and fps:
@@ -118,42 +219,12 @@ def _decode_video(
         # --- Decode audio (separate pass) ----------------------------
         audio_array = None
         if audio_stream:
-            buf.seek(0)
-            with av.open(buf, mode="r") as audio_container:
-                a_stream = audio_container.streams.audio[0]
-
-                # Seek for audio if needed
-                if audio_start_sample and audio_start_sample > 0 and sample_rate:
-                    target_sec = audio_start_sample / sample_rate
-                    target_pts = int(target_sec / a_stream.time_base)
-                    audio_container.seek(target_pts, stream=a_stream)
-
-                audio_chunks = []
-                total_audio_samples = 0
-
-                for frame in audio_container.decode(audio=0):
-                    arr = frame.to_ndarray()  # (channels, samples)
-                    audio_chunks.append(arr)
-                    total_audio_samples += arr.shape[1]
-
-                    if (audio_end_sample is not None
-                            and total_audio_samples >= audio_end_sample):
-                        break
-
-                if audio_chunks:
-                    raw_audio = np.concatenate(audio_chunks, axis=1)  # (ch, samples)
-                    audio_array = raw_audio.T.astype(np.float32)      # (samples, ch)
-
-                    if np.issubdtype(raw_audio.dtype, np.integer):
-                        audio_array /= float(np.iinfo(raw_audio.dtype).max)
-
-                    if audio_end_sample is not None:
-                        keep = audio_end_sample - (audio_start_sample or 0)
-                        audio_array = audio_array[:keep]
-                else:
-                    audio_array = np.empty(
-                        (0, audio_stream.channels), dtype=np.float32
-                    )
+            audio_array = _decode_audio_window(
+                buf,
+                audio_start_sample or 0,
+                audio_end_sample,
+                audio_stream.channels,
+            )
 
     return VideoRead(
         file_type="mp4",

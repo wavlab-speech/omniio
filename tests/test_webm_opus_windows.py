@@ -311,6 +311,119 @@ class TestSourceRates:
         assert dominant_hz(result.array[:, 0]) == pytest.approx(3000, abs=25)
 
 
+class TestShortOpusFrames:
+    """Opus codes 2.5 to 60 ms per packet, and the encoder's pre-skip shrinks with the
+    frame size, so on short frames the head packet can be consumed by the pre-skip whole.
+
+    Measured on this encoder, feeding it one frame at a time: at 20 ms the head packet is
+    pts=-7, duration=20, delay=312 and decodes to 648 samples; at 5 ms it is pts=-3,
+    duration=5, delay=120 and decodes to 120; at 2.5 ms it is pts=-3, duration=2,
+    delay=120 and decodes to **nothing**, so a full decode's sample 0 belongs to the
+    packet after it and `_first_output_packet` skips it -- the same rule AAC in MP4 needs.
+
+    Review raised the opposite worry: that skipping a head packet is wrong for Opus,
+    because the decoder re-applies the pre-skip after a seek, and that a 5 ms stream would
+    be skipped and come back a packet late. Neither happens. 5 ms is not skipped -- its
+    pre-skip shrinks with it, so the packet still runs past zero -- and at 2.5 ms, where
+    the skip does fire, the windows land exactly, while not skipping puts them 2.5 to
+    3.5 ms early. This class pins that, so the rule cannot be narrowed back without the
+    numbers to justify it.
+    """
+
+    TOL = SR // 1000            # 1 ms: these all land inside one Matroska tick
+
+    @staticmethod
+    def encode_framewise(signal, frame_ms):
+        """WebM/Opus, encoded one `frame_ms` frame at a time with explicit timestamps.
+
+        How a real-time or streaming writer produces short frames, and what makes the
+        head packet carry its true negative pts: handing the encoder the whole signal at
+        once instead leaves ffmpeg clamping that pts to 0 (it says so, `failed to avoid
+        negative pts`), and then nothing is skipped and the case is not exercised.
+        """
+        n = int(round(SR * frame_ms / 1000))
+        pcm = (np.clip(signal, -1, 1) * 32767).astype(np.int16)[None, :]
+        buf = io.BytesIO()
+        with av.open(buf, mode="w", format="webm") as container:
+            stream = container.add_stream("libopus", rate=SR)
+            stream.layout = "mono"
+            stream.options = {"frame_duration": str(frame_ms)}
+            pts = 0
+            for i in range(0, pcm.shape[1], n):
+                block = np.ascontiguousarray(pcm[:, i:i + n])
+                frame = av.AudioFrame.from_ndarray(block, format="s16p", layout="mono")
+                frame.sample_rate = SR
+                frame.pts = pts
+                frame.time_base = Fraction(1, SR)
+                pts += block.shape[1]
+                container.mux(stream.encode(frame))
+            container.mux(stream.encode(None))
+        return buf.getvalue()
+
+    # The frame size at which the head packet is consumed by the pre-skip whole, and
+    # `_first_output_packet` therefore skips it. Asserted below, not assumed: it is the
+    # whole point of the fixture that exactly one of these takes that branch.
+    HEAD_CONSUMED = {"20": False, "10": False, "5": False, "2.5": True}
+
+    @pytest.fixture(scope="class", params=sorted(HEAD_CONSUMED, key=float))
+    def clip(self, request):
+        """(frame size, blob, full decode) for one Opus frame size. Broadband noise,
+        because a tone localises only to its own period and the error guarded against
+        here is 120 to 168 samples."""
+        rng = np.random.default_rng(4711)
+        signal = (0.3 * rng.standard_normal(SR * 15)).astype(np.float32)
+        try:
+            blob = self.encode_framewise(signal, float(request.param))
+        except av.FFmpegError as exc:            # pragma: no cover - build-dependent
+            # Only ffmpeg refusing the frame size. Anything else -- a PyAV API that moved
+            # under this fixture, say -- must fail, not quietly take the whole frame size
+            # out of the suite.
+            pytest.skip(f"this build will not encode {request.param} ms Opus: {exc}")
+        return request.param, blob, _read_webm(blob, None, None).array
+
+    def test_the_fixture_takes_the_branch_it_claims(self, clip):
+        """Guard on the fixture, stated as the reader's own condition.
+
+        `_first_output_packet` skips a head packet when `pts + duration <= 0`. A head
+        packet can start before zero and still end after it -- that is exactly what 5 ms
+        does -- so asserting only a negative pts would let the 2.5 ms case pass without
+        ever reaching the branch it exists to cover, and a muxer that clamped the pts to
+        0 would take every case out of it silently.
+        """
+        frame_ms, blob, _ = clip
+        with av.open(io.BytesIO(blob)) as container:
+            stream = container.streams.audio[0]
+            head = next(p for p in container.demux(stream) if p.pts is not None)
+        assert head.pts < 0, (
+            f"head packet is at pts {head.pts}, not before zero; this muxer clamped it "
+            "and this frame size proves nothing"
+        )
+        assert head.duration, "head packet carries no duration; the skip cannot be judged"
+        consumed = head.pts + head.duration <= 0
+        assert consumed is self.HEAD_CONSUMED[frame_ms], (
+            f"at {frame_ms} ms the head packet is pts={head.pts} duration={head.duration},"
+            f" so it is {'' if consumed else 'not '}consumed whole; expected the opposite"
+        )
+
+    @pytest.mark.parametrize("start", [5.0, 11.0])
+    def test_window_lands_whatever_the_frame_size(self, clip, start):
+        _, blob, full = clip
+        window = _read_webm(blob, start, start + 2.0).array
+        assert window.shape[0] == pytest.approx(2 * SR, abs=SR // 100)
+
+        reference = full[int(start * SR):int((start + 2.0) * SR), 0]
+        lag = best_lag(window[:, 0], reference, max_lag=10 * SR // 1000)
+        assert abs(lag) <= self.TOL, (
+            f"window at {start}s is {lag} samples ({lag / SR * 1000:+.2f} ms) off"
+        )
+        # Same content once that lag is taken out. Compared at the lag, not at zero: on
+        # noise two slices a few samples apart are uncorrelated, so rel_rms at zero reads
+        # sqrt(2) for a window that is only slightly off and says nothing.
+        aligned = window[lag:, 0] if lag >= 0 else window[:, 0]
+        against = reference if lag >= 0 else reference[-lag:]
+        assert rel_rms(aligned, against) < 0.05
+
+
 class TestEdgeCases:
     @pytest.mark.parametrize("start,end", [(11.0, 12.0), (LADDER_SECONDS + 0.5, None)])
     def test_window_past_eof_is_empty(self, mono_blob, start, end):
@@ -527,8 +640,11 @@ class FakeFrame:
 
 
 class FakePacket:
-    def __init__(self, pts, frames):
+    def __init__(self, pts, frames, duration=None, pos=None):
         self.pts = pts
+        self.duration = duration            # the span the packet codes, in ticks
+        self.pos = pos                      # byte offset it was read from, as PyAV reports
+        self.size = 0 if pts is None else 1  # only the flush packet is the empty one
         self._frames = frames
 
     def decode(self):
@@ -554,7 +670,8 @@ class FakeContainer:
     start_time_is_first_frame = False
 
     def __init__(self, samples, rate=SR, frame=960, delay=312, cluster_frames=100,
-                 start_time=7, tick=Fraction(1, 1000), gap_after=None, gap_frames=0):
+                 start_time=7, tick=Fraction(1, 1000), gap_after=None, gap_frames=0,
+                 clamp_head_pts=False, seek_falls_back=False):
         self.rate = rate
         self.frame = frame
         self.delay = delay
@@ -562,6 +679,14 @@ class FakeContainer:
         self.tick = tick
         self.gap_after = gap_after          # index of the frame the gap follows
         self.gap_frames = gap_frames        # frames dropped from the stream (DTX-like)
+        # A head packet written as starting at zero although its audio starts before it,
+        # the way ffmpeg 5.1 writes WebM/Opus beside a video track ("failed to avoid
+        # negative pts"). The payload is unchanged; only the timestamp is.
+        self.clamp_head_pts = clamp_head_pts
+        # No Cue entries for this track, so a seek goes back to the start of the file --
+        # and hands the first packet back stamped with the seek target.
+        self.seek_falls_back = seek_falls_back
+        self._restamp = None
         self.signal = np.arange(samples, dtype=np.float64)[None, :]
         self.n_frames = (samples + delay + frame - 1) // frame
         self._base = start_time                 # pts of the first packet
@@ -584,9 +709,14 @@ class FakeContainer:
         """Frame k's timestamp: the frame's position in time, quantised to the tick."""
         base = self._base or 0
         if k == 0:
-            return base
+            return max(base, 0) if self.clamp_head_pts else base
         emitted = k - self.gap_frames if self.gap_after is not None and k > self.gap_after else k
         return base + int(round((emitted * self.frame / self.rate) / float(self.tick)))
+
+    def _pos(self, k):
+        """Byte offset of frame k's packet: unique and increasing, which is all the reader
+        asks of it."""
+        return 1000 + 100 * k
 
     def _dropped(self, k):
         return (
@@ -597,6 +727,10 @@ class FakeContainer:
     # --- the container API the reader uses ---------------------------------------------
     def seek(self, timestamp, stream=None, **kwargs):
         self.seeks.append(timestamp)
+        if self.seek_falls_back:
+            self._cursor = 0
+            self._restamp = timestamp
+            return
         base = self._base or 0
         target = max(0, timestamp - base)
         frames_in = int(target * float(self.tick) * self.rate) // self.frame
@@ -606,13 +740,17 @@ class FakeContainer:
         """Packets from the cursor on, each decoding to at most one frame, then the flush
         packet PyAV appends. The packet's pts is the frame's position in the stream; the
         frame's pts is the same unless `advance_trimmed_pts` says the decoder moved it."""
+        span = int(round(self.frame / self.rate / float(self.tick)))
         for k in range(self._cursor, self.n_frames):
             if self._dropped(k):
                 continue
             pts = self._pts(k)
             lo, hi = self._span(k)
             if hi <= lo:
-                yield FakePacket(pts, [])      # swallowed whole by the codec delay
+                # Swallowed whole by the codec delay: the priming packet AAC in MP4 opens
+                # with. The reader skips it by its span ending at or before pts 0, so the
+                # packet has to carry one.
+                yield FakePacket(pts, [], span, pos=self._pos(k))
                 continue
             frame_pts = pts
             # After a seek onto frame k > 0, the decoder drops the codec delay again.
@@ -622,7 +760,10 @@ class FakeContainer:
                 if self.advance_trimmed_pts:
                     frame_pts = pts + int(round(trimmed / self.rate / float(self.tick)))
             frames = [FakeFrame(frame_pts, self.signal[:, lo:hi].copy())] if hi > lo else []
-            yield FakePacket(pts, frames)
+            if self._restamp is not None:
+                pts = self._restamp          # the timestamp the seek asked for, not its own
+                self._restamp = None
+            yield FakePacket(pts, frames, span, pos=self._pos(k))
         yield FakePacket(None, [])
         self._cursor = self.n_frames
 
@@ -761,6 +902,40 @@ class TestSyntheticStreams:
             5.0, 5.25, monkeypatch,
         )
         assert list(result.array[:, 0]) == list(range(5 * SR, 5 * SR + SR // 4))
+
+    def test_seek_that_falls_back_to_the_start_is_not_believed(self, monkeypatch):
+        """A Matroska file can carry Cue entries for its video track only. A seek on the
+        audio stream then has no index to use, libavformat goes back to the start of the
+        file, and it hands the stream's first packet back stamped with the seek target
+        instead of its own pts -- measured on a 40 s WebM muxed by ffmpeg 5.1, on every
+        PyAV build tried. Believing that timestamp puts the run seconds late and the
+        window silently returns audio from the start of the file.
+        """
+        result, opened = fake_read(
+            b"", lambda: FakeContainer(10 * SR, seek_falls_back=True), 5.0, 6.0, monkeypatch
+        )
+        assert opened[0].seeks, "the fixture must seek for this to mean anything"
+        assert list(result.array[:, 0]) == list(range(5 * SR, 6 * SR))
+
+    def test_head_packet_clamped_to_zero_does_not_shift_the_window(self, monkeypatch):
+        """A muxer that writes a head packet starting before zero as starting at zero
+        moves the origin every other timestamp is measured from. The packet after it still
+        says where its audio really begins."""
+        result, _ = fake_read(
+            b"",
+            lambda: FakeContainer(10 * SR, start_time=-13, clamp_head_pts=True),
+            5.0, 6.0, monkeypatch,
+        )
+        assert list(result.array[:, 0]) == list(range(5 * SR, 6 * SR))
+
+    def test_both_defects_of_a_clamped_webm_at_once(self, monkeypatch):
+        """Both of the above, as the measured file has them."""
+        def factory():
+            return FakeContainer(10 * SR, start_time=-13, clamp_head_pts=True,
+                                 seek_falls_back=True)
+
+        result, _ = fake_read(b"", factory, 5.0, 6.0, monkeypatch)
+        assert list(result.array[:, 0]) == list(range(5 * SR, 6 * SR))
 
     def test_timestamps_with_a_gap_follow_the_timeline(self, monkeypatch):
         """Frames missing from the stream (DTX, dropped packets) shift what a timestamp

@@ -172,7 +172,11 @@ def _is_opus_frame_size(n: int, sr: int) -> bool:
 
 
 def _decode_packets(container, stream):
-    """Decode `stream` from the container's current position, yielding (packet pts, frame).
+    """Decode `stream` from the container's current position, yielding (packet, frame).
+
+    The packet itself, because the caller needs both its pts and -- to tell a seek that
+    came back to the start of the stream from one that did not -- the byte position it was
+    read from.
 
     The packet's pts rather than the frame's. After a seek the decoder discards the codec
     delay from the first frame again, and a PyAV that sets the decoder's packet time base
@@ -184,24 +188,67 @@ def _decode_packets(container, stream):
     """
     for packet in container.demux(stream):
         for frame in packet.decode():
-            yield packet.pts, frame
+            yield packet, frame
 
 
-def _first_packet_pts(container, stream) -> Optional[int]:
-    """pts of the stream's first packet: the origin of the timeline the anchor is on.
+def _first_output_packet(container, stream) -> Tuple[Optional[int], Optional[int]]:
+    """(pts, byte position) of the stream's first packet that carries output.
+
+    Its pts is the origin of the timeline the anchor is on, i.e. where a full decode's
+    sample 0 sits. Its byte position identifies the packet itself, which is how
+    `_webm_frames` recognises a seek that has come back to the start of the stream even
+    when the demuxer hands that packet back under a different timestamp.
 
     Not ``stream.start_time``. PyAV 16 and earlier report the first packet's pts there;
     PyAV 17 and later (newer libavformat) report the first *frame's* presentation time,
     which is the packet's pts plus the codec delay, rounded to the tick -- so an anchor
-    measured from ``start_time`` is off by the delay on those builds. The first packet's
-    own pts is the same number everywhere.
+    measured from ``start_time`` is off by the delay on those builds. A packet's own pts
+    is the same number everywhere.
+
+    Leading packets that end at or before pts 0 are skipped. They are priming: their
+    content lies entirely before the stream's own zero, so the decoder consumes them and
+    emits nothing, and a full decode's sample 0 belongs to the packet after them. AAC in
+    MP4 writes exactly one such packet, at pts -1024 with duration 1024 (the encoder
+    delay ``codec_context.delay`` also reports), and anchoring on it puts every seeked
+    window a whole AAC frame -- 21 ms at 48 kHz -- early. WebM/Opus has no such packet:
+    its head packet starts before zero (pts -7 ms here) but runs past it, so it is
+    trimmed rather than dropped and stays the anchor, which is why this reads exactly as
+    it did before for WebM.
+
+    The test is on the packets alone. Decoding one to see whether it yields a frame would
+    answer the same question directly, but it leaves the decoder warm, and a warm decoder
+    does not re-apply the codec delay to the first frame after the seek below -- which is
+    the very thing the anchor assumes it does.
+
+    The pts returned is the earlier of that packet's own pts and where the packet after it
+    says its content must begin (that packet's pts less one packet's span). The two agree
+    on an ordinary file. They disagree where a muxer has written a head packet that starts
+    before the stream's zero as starting at zero -- libavformat says so, `failed to avoid
+    negative pts`, and writes it anyway; ffmpeg 5.1 does it to WebM/Opus with a video
+    track. The recorded pts is then later than the audio it carries by exactly the amount
+    clamped away (13 ms on the file this was measured on), and every window read through
+    that anchor is that much late. Taking the minimum can only move the origin earlier,
+    and only to where the following packet already places it, so a stream with a real gap
+    after its first packet keeps the pts it declares.
     """
+    first = None
     for packet in container.demux(stream):
-        if packet.pts is not None:
-            return packet.pts
-        if packet.size == 0:            # the flush packet: the stream had no packets
-            break
-    return None
+        if packet.pts is None:
+            if packet.size == 0:        # the flush packet: no more real packets
+                break
+            continue
+        if first is None:
+            if packet.duration and packet.pts + packet.duration <= 0:
+                continue                # priming: consumed whole, decodes to nothing
+            first = packet
+            continue
+        pts = first.pts
+        if first.duration:
+            pts = min(pts, packet.pts - first.duration)
+        return pts, getattr(first, "pos", None)
+    if first is not None:
+        return first.pts, getattr(first, "pos", None)
+    return None, None
 
 
 def _webm_frames(container, stream, seek_sample: Optional[int]):
@@ -221,6 +268,11 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
     frame, so the head's first surviving sample is stream sample P + delay, i.e. output
     sample P. The trimmed head therefore starts exactly at its packet's pts, whatever the
     codec delay is.
+
+    One case the pts cannot carry: a seek that falls back to the start of the stream may
+    hand the first packet back stamped with the seek target rather than its own pts. That
+    is recognised by the packet's byte position and the run is placed at sample 0, which
+    is where it really is; see the comment below.
     """
     sr = stream.rate
     time_base = stream.time_base
@@ -233,7 +285,7 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
             pos += arr.shape[1]
         return
 
-    start_pts = _first_packet_pts(container, stream)
+    start_pts, start_pos = _first_output_packet(container, stream)
     if start_pts is None:
         start_pts = stream.start_time or 0
     seek_s = max(0.0, seek_sample / sr - _OPUS_SEEK_MARGIN_S)
@@ -243,7 +295,7 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
     first = next(frames, None)
     if first is None:
         return
-    head_pts, head = first
+    head_packet, head = first
     head_arr = _frame_samples(head)
     # The frame after the first is a whole frame, which is the grid the run sits on. The
     # first frame is not: the decoder trims the codec delay off it after a seek.
@@ -251,10 +303,19 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
     nxt_arr = None if nxt is None else _frame_samples(nxt[1])
     grid = (nxt_arr if nxt_arr is not None else head_arr).shape[1]
 
-    pts = start_pts if head_pts is None else head_pts
-    pos = int(round(float((pts - start_pts) * time_base) * sr))
-    if _is_opus_frame_size(grid, sr):
-        pos = _snap_to_grid(pos, grid, int(sr * time_base / 2) + 1)
+    head_pos = getattr(head_packet, "pos", None)
+    if start_pos is not None and start_pos >= 0 and head_pos == start_pos:
+        # Back at the stream's first packet, so the run starts at sample 0 whatever
+        # timestamp the packet arrived with -- a seek that falls back to the start of the
+        # file can restamp it with the seek target. See CLAUDE.md, "Common Implementation
+        # Notes".
+        pos = 0
+    else:
+        head_pts = head_packet.pts
+        pts = start_pts if head_pts is None else head_pts
+        pos = int(round(float((pts - start_pts) * time_base) * sr))
+        if _is_opus_frame_size(grid, sr):
+            pos = _snap_to_grid(pos, grid, int(sr * time_base / 2) + 1)
 
     yield pos, head_arr
     pos += head_arr.shape[1]
