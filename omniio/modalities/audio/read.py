@@ -16,8 +16,7 @@ class PyAVCompatibilityWarning(UserWarning):
     been checked on this build (see README, "Windowed reads of WebM/Opus")."""
 
 
-# The range swept by tests/tools/sweep_pyav_webm.sh: PyAV 9.2-19.0 on ffmpeg 4.4-8.1 plus
-# the libavcodec 63.1 the PyAV 19.0 wheels bundle. The
+# The range swept by tests/tools/sweep_pyav_webm.sh: PyAV 9.2-19.0 on ffmpeg 4.4-9.0. The
 # package's dependency floor is av>=10.0.0 (the whole test suite passes there); 9.2 is
 # validated for windowed *reads* only, from a conda-forge build without an Opus encoder.
 # The upper edge is deliberately not a dependency cap, because a newer PyAV is untested
