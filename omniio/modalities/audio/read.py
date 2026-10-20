@@ -146,9 +146,9 @@ def _read_pcm(
     # One header parse: open the stream once, seek, read. (sf.info + sf.read parsed it twice.)
     with sf.SoundFile(buf) as snd:
         sr = snd.samplerate
-        start_frame = 0 if start_time is None else int(start_time * sr)
+        start_frame = 0 if start_time is None else min(int(start_time * sr), snd.frames)
         end_frame = snd.frames if end_time is None else min(int(end_time * sr), snd.frames)
-        if start_frame:
+        if start_frame:                       # a window past the end returns an empty array, as sf.read did
             snd.seek(start_frame)
         data = snd.read(max(end_frame - start_frame, 0), dtype="float32", always_2d=True)
 

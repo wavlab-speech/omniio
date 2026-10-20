@@ -49,6 +49,15 @@ def test_window_matches_full_decode(tmp_path, seconds, monkeypatch):
             np.testing.assert_array_equal(w, full[a:b])
 
 
+def test_window_past_end_is_empty(tmp_path):
+    raw, sr = _flac_bytes(2.0)
+    archive = tmp_path / "blob_0.bin"; archive.write_bytes(raw)
+    w = audio_read_local(str(archive), 0, len(raw), start_time=5.0, end_time=6.0).array
+    assert w.shape == (0, 1)
+    w = audio_read_local(str(archive), 0, len(raw), start_time=1.5, end_time=6.0).array
+    assert w.shape == (int(0.5 * sr), 1)
+
+
 def test_window_bytes_read_small_entry(tmp_path):
     """A 3 s window of a long entry through the in-place path reads far less than the entry."""
     raw, sr = _flac_bytes(120.0)
