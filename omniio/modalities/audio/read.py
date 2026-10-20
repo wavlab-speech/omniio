@@ -1,4 +1,5 @@
 import io
+import os
 import requests
 import warnings
 from typing import Optional, Tuple
@@ -8,6 +9,7 @@ import numpy as np
 import soundfile as sf
 
 from omniio.definitions import AudioRead
+from omniio.blob.handles import archive_fd, pread_all
 
 
 class PyAVCompatibilityWarning(UserWarning):
@@ -105,8 +107,8 @@ class _ArchiveWindow(io.RawIOBase):
     hundred KB of I/O rather than ~40 MB, which is what dominates random-window loading
     from a parallel filesystem."""
 
-    def __init__(self, f, offset: int, size: int):
-        self._f, self._offset, self._size, self._pos = f, int(offset), int(size), 0
+    def __init__(self, fd: int, offset: int, size: int):
+        self._fd, self._offset, self._size, self._pos = fd, int(offset), int(size), 0
 
     def readable(self) -> bool:
         return True
@@ -126,8 +128,7 @@ class _ArchiveWindow(io.RawIOBase):
         n = min(len(b), self._size - self._pos)
         if n <= 0:
             return 0
-        self._f.seek(self._offset + self._pos)
-        data = self._f.read(n)
+        data = os.pread(self._fd, n, self._offset + self._pos)
         b[: len(data)] = data
         self._pos += len(data)
         return len(data)
@@ -142,21 +143,14 @@ def _read_pcm(
     """Read FLAC/WAV/OGG via soundfile, with optional time slicing. `blob` is the entry's
     bytes or a seekable file object positioned over it."""
     buf = io.BytesIO(blob) if isinstance(blob, (bytes, bytearray, memoryview)) else blob
-    info = sf.info(buf)
-    sr = info.samplerate
-
-    start_frame = 0 if start_time is None else int(start_time * sr)
-    end_frame = info.frames if end_time is None else int(end_time * sr)
-    num_frames = end_frame - start_frame
-
-    buf.seek(0)
-    data, sr = sf.read(
-        buf,
-        start=start_frame,
-        stop=end_frame,
-        dtype="float32",
-        always_2d=True,
-    )
+    # One header parse: open the stream once, seek, read. (sf.info + sf.read parsed it twice.)
+    with sf.SoundFile(buf) as snd:
+        sr = snd.samplerate
+        start_frame = 0 if start_time is None else int(start_time * sr)
+        end_frame = snd.frames if end_time is None else min(int(end_time * sr), snd.frames)
+        if start_frame:
+            snd.seek(start_frame)
+        data = snd.read(max(end_frame - start_frame, 0), dtype="float32", always_2d=True)
 
     return AudioRead(
         file_type=fmt,
@@ -174,6 +168,12 @@ def _read_pcm(
 # of a window differ from the same samples of a full decode by 0.09 at 80 ms of margin
 # and by 2e-4 at 250 ms; the extra quarter second of decoding costs ~1 ms.
 _OPUS_SEEK_MARGIN_S = 0.25
+
+# Window reads: entries up to this size are read whole with one pread; larger ones are
+# decoded in place through a buffered view with this buffer (both overridable for tests
+# and benchmarks).
+_WINDOW_BUFFER_BYTES = int(os.environ.get("OMNIIO_WINDOW_BUFFER_BYTES", 1 << 18))
+_SMALL_ENTRY_BYTES = int(os.environ.get("OMNIIO_SMALL_ENTRY_BYTES", 4 * (1 << 18)))
 
 
 def _frame_samples(frame) -> np.ndarray:
@@ -482,21 +482,23 @@ def audio_read_local(
     Returns:
         AudioRead with sample_rate and float32 array (frames, channels).
     """
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        fmt = _detect_format(f.read(16))
-        if fmt != "webm" and (start_time is not None or end_time is not None):
-            # A time window of a seekable PCM/FLAC entry: decode in place, reading only
-            # what the decoder asks for.
-            window = io.BufferedReader(_ArchiveWindow(f, start_offset, file_size), 1 << 18)
+    fd = archive_fd(archive_path)
+    windowed = start_time is not None or end_time is not None
+    if windowed and file_size > _SMALL_ENTRY_BYTES:
+        fmt = _detect_format(os.pread(fd, 16, start_offset))
+        if fmt != "webm":
+            # A time window of a large seekable PCM/FLAC entry: decode in place, reading
+            # only what the decoder asks for (a few hundred KB of a 40 MB recording).
+            window = io.BufferedReader(_ArchiveWindow(fd, start_offset, file_size), _WINDOW_BUFFER_BYTES)
             return _read_pcm(window, fmt, start_time, end_time)
-        f.seek(start_offset)
-        blob = f.read(file_size)
-
+    # Whole entry in one pread: for an entry of a few window buffers the in-place path
+    # costs more in Python callbacks than the bytes it saves (0.312 vs 0.278 ms for a
+    # 333 KB entry), and the decoder then seeks in memory.
+    blob = pread_all(fd, file_size, start_offset)
+    fmt = _detect_format(blob[:16])
     if fmt == "webm":
         return _read_webm(blob, start_time, end_time)
-    else:
-        return _read_pcm(blob, fmt, start_time, end_time)
+    return _read_pcm(blob, fmt, start_time, end_time)
 
 def audio_read_remote(
     archive_url: str,

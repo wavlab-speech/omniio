@@ -7,6 +7,11 @@ from omniio.modalities.video.read import video_read_local, video_read_remote
 from omniio.modalities.image.read import image_read_local, image_read_remote
 from omniio.modalities.midi.read import midi_read_local, midi_read_remote
 
+
+def _is_url(path) -> bool:
+    """Local unless it is an http(s) URL: a stat per read was 2 of the 12 syscalls of a small read."""
+    return isinstance(path, str) and path.startswith(("http://", "https://"))
+
 def audio_read(
     archive_path: str, 
     start_offset: int, 
@@ -15,7 +20,7 @@ def audio_read(
     end_time: int = None
 ) -> AudioRead:
 
-    if os.path.exists(archive_path):
+    if not _is_url(archive_path):
         return audio_read_local(
             archive_path,
             start_offset,
@@ -39,7 +44,7 @@ def text_read(
     file_size: int,
 ) -> TextRead:
 
-    if os.path.exists(archive_path):
+    if not _is_url(archive_path):
         return text_read_local(
             archive_path,
             start_offset,
@@ -77,7 +82,7 @@ def video_read(
     Returns:
         VideoRead object with video and audio data
     """
-    if os.path.exists(archive_path):
+    if not _is_url(archive_path):
         return video_read_local(
             archive_path,
             start_offset,
@@ -103,7 +108,7 @@ def image_read(
     start_offset: int,
     file_size: int,
 ) -> ImageRead:
-    if os.path.exists(archive_path):
+    if not _is_url(archive_path):
         return image_read_local(archive_path, start_offset, file_size)
     else:
         return image_read_remote(archive_path, start_offset, file_size)
@@ -144,7 +149,7 @@ def midi_read(
     kwargs = dict(start_time=start_time, end_time=end_time, include_partial=include_partial,
                   synthesize=synthesize, sample_rate=sample_rate, channels=channels,
                   soundfont=soundfont, backend=backend)
-    if os.path.exists(archive_path):
+    if not _is_url(archive_path):
         return midi_read_local(archive_path, start_offset, file_size, **kwargs)
     else:
         return midi_read_remote(archive_path, start_offset, file_size, **kwargs)

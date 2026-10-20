@@ -141,9 +141,9 @@ def _decode_video(
         # --- Resolve frame / time boundaries -------------------------
         if video_stream and fps:
             if start_frame is None and start_time is not None:
-                start_frame = int(start_time * fps)
-            if end_frame is None and end_time is not None:
-                end_frame = int(end_time * fps)
+                start_frame = int(round(start_time * fps))     # nearest frame, not floor: a window
+            if end_frame is None and end_time is not None:     # just under a boundary began a frame early
+                end_frame = int(round(end_time * fps))
 
         if start_frame is None:
             start_frame = 0

@@ -13,7 +13,7 @@ class TestAudioRead:
     @patch('omniio.interface.os.path.exists')
     @patch('omniio.interface.audio_read_local')
     def test_audio_read_local_path(self, mock_local, mock_exists):
-        """Test audio_read routes to local when path exists."""
+        """Test audio_read routes to local for a filesystem path."""
         mock_exists.return_value = True
         mock_local.return_value = AudioRead(
             file_type="wav",
@@ -28,7 +28,7 @@ class TestAudioRead:
             file_size=1000
         )
 
-        mock_exists.assert_called_once_with("/path/to/local.bin")
+        # routing is by URL prefix now; the path is not stat-ed
         mock_local.assert_called_once_with(
             "/path/to/local.bin", 0, 1000, None, None
         )
@@ -37,7 +37,7 @@ class TestAudioRead:
     @patch('omniio.interface.os.path.exists')
     @patch('omniio.interface.audio_read_remote')
     def test_audio_read_remote_url(self, mock_remote, mock_exists):
-        """Test audio_read routes to remote when path doesn't exist."""
+        """Test audio_read routes to remote for an http(s) URL."""
         mock_exists.return_value = False
         mock_remote.return_value = AudioRead(
             file_type="flac",
@@ -54,7 +54,6 @@ class TestAudioRead:
             end_time=10.0
         )
 
-        mock_exists.assert_called_once_with("https://example.com/remote.bin")
         mock_remote.assert_called_once_with(
             "https://example.com/remote.bin", 100, 2000, 5.0, 10.0
         )
@@ -77,7 +76,7 @@ class TestTextRead:
     @patch('omniio.interface.os.path.exists')
     @patch('omniio.interface.text_read_local')
     def test_text_read_local_path(self, mock_local, mock_exists):
-        """Test text_read routes to local when path exists."""
+        """Test text_read routes to local for a filesystem path."""
         from omniio.definitions import TextRead
 
         mock_exists.return_value = True
@@ -96,14 +95,13 @@ class TestTextRead:
             file_size=100
         )
 
-        mock_exists.assert_called_once()
         mock_local.assert_called_once()
         assert result.text == "Sample text content"
 
     @patch('omniio.interface.os.path.exists')
     @patch('omniio.interface.text_read_remote')
     def test_text_read_remote_url(self, mock_remote, mock_exists):
-        """Test text_read routes to remote when path doesn't exist."""
+        """Test text_read routes to remote for an http(s) URL."""
         from omniio.definitions import TextRead
 
         mock_exists.return_value = False
@@ -122,6 +120,5 @@ class TestTextRead:
             file_size=200
         )
 
-        mock_exists.assert_called_once()
         mock_remote.assert_called_once()
         assert result.text == "Remote text content"
