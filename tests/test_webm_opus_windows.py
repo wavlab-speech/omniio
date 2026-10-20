@@ -823,12 +823,20 @@ class TestPyAVCompatibilityCheck:
         assert self._with(monkeypatch, "9.2.0", (58, 134, 100)) is None
 
     def test_pyav_outside_the_range(self, monkeypatch):
-        msg = self._with(monkeypatch, "19.0.0", (62, 28, 100))
-        assert msg and "PyAV 19.0.0" in msg and "libavcodec 62.28" not in msg
+        # Derived from the constant, not hardcoded: widening the swept range must not
+        # turn this case into an in-range one and make the test assert nothing.
+        over = f"{_TESTED_PYAV[1][0] + 1}.0.0"
+        inside_lavc = (*_TESTED_LIBAVCODEC[1], 100)
+        msg = self._with(monkeypatch, over, inside_lavc)
+        lavc_text = f"libavcodec {inside_lavc[0]}.{inside_lavc[1]}"
+        assert msg and f"PyAV {over}" in msg and lavc_text not in msg
 
     def test_libavcodec_outside_the_range(self, monkeypatch):
-        msg = self._with(monkeypatch, "18.1.0", (63, 2, 100))
-        assert msg and "libavcodec 63.2" in msg and "PyAV 18.1.0" not in msg
+        over = (_TESTED_LIBAVCODEC[1][0] + 1, 0, 100)
+        inside_pyav = f"{_TESTED_PYAV[1][0]}.{_TESTED_PYAV[1][1]}.0"
+        msg = self._with(monkeypatch, inside_pyav, over)
+        assert msg and f"libavcodec {over[0]}.{over[1]}" in msg
+        assert f"PyAV {inside_pyav}" not in msg
 
     def test_prerelease_version_string_is_parsed(self, monkeypatch):
         assert self._with(monkeypatch, "18.1.0rc1", (62, 28, 100)) is None
