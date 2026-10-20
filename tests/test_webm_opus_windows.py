@@ -311,6 +311,100 @@ class TestSourceRates:
         assert dominant_hz(result.array[:, 0]) == pytest.approx(3000, abs=25)
 
 
+class TestShortOpusFrames:
+    """Opus codes 2.5 to 60 ms per packet, and the encoder's pre-skip shrinks with the
+    frame size, so on short frames the head packet can be consumed by the pre-skip whole.
+
+    Measured on this encoder, feeding it one frame at a time: at 20 ms the head packet is
+    pts=-7, duration=20, delay=312 and decodes to 648 samples; at 5 ms it is pts=-3,
+    duration=5, delay=120 and decodes to 120; at 2.5 ms it is pts=-3, duration=2,
+    delay=120 and decodes to **nothing**, so a full decode's sample 0 belongs to the
+    packet after it and `_first_output_packet` skips it -- the same rule AAC in MP4 needs.
+
+    Review raised the opposite worry: that skipping a head packet is wrong for Opus,
+    because the decoder re-applies the pre-skip after a seek, and that a 5 ms stream would
+    be skipped and come back a packet late. Neither happens. 5 ms is not skipped -- its
+    pre-skip shrinks with it, so the packet still runs past zero -- and at 2.5 ms, where
+    the skip does fire, the windows land exactly, while not skipping puts them 2.5 to
+    3.5 ms early. This class pins that, so the rule cannot be narrowed back without the
+    numbers to justify it.
+    """
+
+    TOL = SR // 1000            # 1 ms: these all land inside one Matroska tick
+
+    @staticmethod
+    def encode_framewise(signal, frame_ms):
+        """WebM/Opus, encoded one `frame_ms` frame at a time with explicit timestamps.
+
+        How a real-time or streaming writer produces short frames, and what makes the
+        head packet carry its true negative pts: handing the encoder the whole signal at
+        once instead leaves ffmpeg clamping that pts to 0 (it says so, `failed to avoid
+        negative pts`), and then nothing is skipped and the case is not exercised.
+        """
+        n = int(round(SR * frame_ms / 1000))
+        pcm = (np.clip(signal, -1, 1) * 32767).astype(np.int16)[None, :]
+        buf = io.BytesIO()
+        with av.open(buf, mode="w", format="webm") as container:
+            stream = container.add_stream("libopus", rate=SR)
+            stream.layout = "mono"
+            stream.options = {"frame_duration": str(frame_ms)}
+            pts = 0
+            for i in range(0, pcm.shape[1], n):
+                block = np.ascontiguousarray(pcm[:, i:i + n])
+                frame = av.AudioFrame.from_ndarray(block, format="s16p", layout="mono")
+                frame.sample_rate = SR
+                frame.pts = pts
+                frame.time_base = Fraction(1, SR)
+                pts += block.shape[1]
+                container.mux(stream.encode(frame))
+            container.mux(stream.encode(None))
+        return buf.getvalue()
+
+    @pytest.fixture(scope="class", params=["20", "10", "5", "2.5"])
+    def clip(self, request):
+        """(blob, full decode) for one Opus frame size. Broadband noise, because a tone
+        localises only to its own period and the error guarded against here is 120 to 168
+        samples."""
+        rng = np.random.default_rng(4711)
+        signal = (0.3 * rng.standard_normal(SR * 15)).astype(np.float32)
+        try:
+            blob = self.encode_framewise(signal, float(request.param))
+        except Exception as exc:                 # pragma: no cover - build-dependent
+            pytest.skip(f"this build will not encode {request.param} ms Opus: {exc}")
+        return blob, _read_webm(blob, None, None).array
+
+    def test_the_fixture_really_has_a_negative_head_pts(self, clip):
+        """Guard on the fixture. The skip can only fire on a head packet that ends at or
+        before zero; if this build's muxer clamped that pts to 0, the test below would
+        pass without exercising anything."""
+        blob, _ = clip
+        with av.open(io.BytesIO(blob)) as container:
+            stream = container.streams.audio[0]
+            head = next(p for p in container.demux(stream) if p.pts is not None)
+        assert head.pts < 0, (
+            f"head packet is at pts {head.pts}, not before zero; this muxer clamped it "
+            "and the frame-size cases below prove nothing"
+        )
+
+    @pytest.mark.parametrize("start", [5.0, 11.0])
+    def test_window_lands_whatever_the_frame_size(self, clip, start):
+        blob, full = clip
+        window = _read_webm(blob, start, start + 2.0).array
+        assert window.shape[0] == pytest.approx(2 * SR, abs=SR // 100)
+
+        reference = full[int(start * SR):int((start + 2.0) * SR), 0]
+        lag = best_lag(window[:, 0], reference, max_lag=10 * SR // 1000)
+        assert abs(lag) <= self.TOL, (
+            f"window at {start}s is {lag} samples ({lag / SR * 1000:+.2f} ms) off"
+        )
+        # Same content once that lag is taken out. Compared at the lag, not at zero: on
+        # noise two slices a few samples apart are uncorrelated, so rel_rms at zero reads
+        # sqrt(2) for a window that is only slightly off and says nothing.
+        aligned = window[lag:, 0] if lag >= 0 else window[:, 0]
+        against = reference if lag >= 0 else reference[-lag:]
+        assert rel_rms(aligned, against) < 0.05
+
+
 class TestEdgeCases:
     @pytest.mark.parametrize("start,end", [(11.0, 12.0), (LADDER_SECONDS + 0.5, None)])
     def test_window_past_eof_is_empty(self, mono_blob, start, end):
