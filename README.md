@@ -83,6 +83,19 @@ window is the same samples a full decode has at that offset, with two documented
   the timestamps, a full decode concatenates frames, so the two disagree by the size of
   any gap before the window.
 
+Two things a WebM file can get wrong about its own timestamps are corrected rather than
+believed, because both were measured to move a window by more than the tolerance and
+neither depends on the PyAV build:
+
+- A head packet written as starting at zero although its audio starts before it (ffmpeg
+  5.1 does this to WebM/Opus muxed beside a video track, saying `failed to avoid negative
+  pts`). The origin is taken from the packet after it as well, so a window is not late by
+  the amount clamped away (13 ms on the file measured).
+- A seek that falls back to the start of the file because the audio track has no Cue
+  entries of its own, and hands the first packet back stamped with the seek target. The
+  packet is recognised by its byte position and the run placed at sample 0; believing the
+  timestamp returned the audio at 0.253 s for a window asked for at 5 s.
+
 Windowed WebM/Opus reads are validated against these PyAV / ffmpeg combinations
 (`tests/test_webm_opus_windows.py`, reproducible with `tests/tools/sweep_pyav_webm.sh`):
 

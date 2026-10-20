@@ -133,21 +133,39 @@ def _seek_lead_in(path, size):
     Measured by seeking, not read off keyframe flags: in Matroska every Opus packet is a
     sync point, so `is_keyframe` says nothing about where the clusters are, and a guard
     written that way would pass while measuring nothing.
+
+    The landing packet is identified by its byte position rather than by the pts it comes
+    back with, because that pts is the one thing a seek can get wrong: where the audio
+    track has no Cue entries of its own, libavformat falls back to the start of the file,
+    and on some WebM files it stamps the packet it hands back with the seek target. A
+    guard that believed it would report a 13 ms lead-in for a seek that had gone all the
+    way back to sample 0, and fail while measuring a fiction.
     """
-    lags = []
-    with open(path, "rb") as f:
-        blob = f.read(size)
     import io
 
+    with open(path, "rb") as f:
+        blob = f.read(size)
+
+    with av.open(io.BytesIO(blob)) as container:
+        stream = container.streams.audio[0]
+        true_pts = {}                   # byte position -> the packet's pts on a linear read
+        for packet in container.demux(stream):
+            if packet.pts is None:
+                break
+            true_pts.setdefault(packet.pos, packet.pts)
+
+    lags = []
     with av.open(io.BytesIO(blob)) as container:
         stream = container.streams.audio[0]
         for target in (12.0, 17.0, 23.0, 33.0):
             container.seek(int(target / stream.time_base), stream=stream)
-            pts = next(
-                (p.pts for p in container.demux(stream) if p.pts is not None), None
+            landed = next(
+                (p for p in container.demux(stream) if p.pts is not None), None
             )
-            if pts is not None:
-                lags.append(target - float(pts * stream.time_base))
+            if landed is None:
+                continue
+            pts = true_pts.get(landed.pos, landed.pts)
+            lags.append(target - float(pts * stream.time_base))
     return lags
 
 

@@ -527,9 +527,11 @@ class FakeFrame:
 
 
 class FakePacket:
-    def __init__(self, pts, frames, duration=None):
+    def __init__(self, pts, frames, duration=None, pos=None):
         self.pts = pts
         self.duration = duration            # the span the packet codes, in ticks
+        self.pos = pos                      # byte offset it was read from, as PyAV reports
+        self.size = 0 if pts is None else 1  # only the flush packet is the empty one
         self._frames = frames
 
     def decode(self):
@@ -555,7 +557,8 @@ class FakeContainer:
     start_time_is_first_frame = False
 
     def __init__(self, samples, rate=SR, frame=960, delay=312, cluster_frames=100,
-                 start_time=7, tick=Fraction(1, 1000), gap_after=None, gap_frames=0):
+                 start_time=7, tick=Fraction(1, 1000), gap_after=None, gap_frames=0,
+                 clamp_head_pts=False, seek_falls_back=False):
         self.rate = rate
         self.frame = frame
         self.delay = delay
@@ -563,6 +566,14 @@ class FakeContainer:
         self.tick = tick
         self.gap_after = gap_after          # index of the frame the gap follows
         self.gap_frames = gap_frames        # frames dropped from the stream (DTX-like)
+        # A head packet written as starting at zero although its audio starts before it,
+        # the way ffmpeg 5.1 writes WebM/Opus beside a video track ("failed to avoid
+        # negative pts"). The payload is unchanged; only the timestamp is.
+        self.clamp_head_pts = clamp_head_pts
+        # No Cue entries for this track, so a seek goes back to the start of the file --
+        # and hands the first packet back stamped with the seek target.
+        self.seek_falls_back = seek_falls_back
+        self._restamp = None
         self.signal = np.arange(samples, dtype=np.float64)[None, :]
         self.n_frames = (samples + delay + frame - 1) // frame
         self._base = start_time                 # pts of the first packet
@@ -585,9 +596,14 @@ class FakeContainer:
         """Frame k's timestamp: the frame's position in time, quantised to the tick."""
         base = self._base or 0
         if k == 0:
-            return base
+            return max(base, 0) if self.clamp_head_pts else base
         emitted = k - self.gap_frames if self.gap_after is not None and k > self.gap_after else k
         return base + int(round((emitted * self.frame / self.rate) / float(self.tick)))
+
+    def _pos(self, k):
+        """Byte offset of frame k's packet: unique and increasing, which is all the reader
+        asks of it."""
+        return 1000 + 100 * k
 
     def _dropped(self, k):
         return (
@@ -598,6 +614,10 @@ class FakeContainer:
     # --- the container API the reader uses ---------------------------------------------
     def seek(self, timestamp, stream=None, **kwargs):
         self.seeks.append(timestamp)
+        if self.seek_falls_back:
+            self._cursor = 0
+            self._restamp = timestamp
+            return
         base = self._base or 0
         target = max(0, timestamp - base)
         frames_in = int(target * float(self.tick) * self.rate) // self.frame
@@ -617,7 +637,7 @@ class FakeContainer:
                 # Swallowed whole by the codec delay: the priming packet AAC in MP4 opens
                 # with. The reader skips it by its span ending at or before pts 0, so the
                 # packet has to carry one.
-                yield FakePacket(pts, [], span)
+                yield FakePacket(pts, [], span, pos=self._pos(k))
                 continue
             frame_pts = pts
             # After a seek onto frame k > 0, the decoder drops the codec delay again.
@@ -627,7 +647,10 @@ class FakeContainer:
                 if self.advance_trimmed_pts:
                     frame_pts = pts + int(round(trimmed / self.rate / float(self.tick)))
             frames = [FakeFrame(frame_pts, self.signal[:, lo:hi].copy())] if hi > lo else []
-            yield FakePacket(pts, frames, span)
+            if self._restamp is not None:
+                pts = self._restamp          # the timestamp the seek asked for, not its own
+                self._restamp = None
+            yield FakePacket(pts, frames, span, pos=self._pos(k))
         yield FakePacket(None, [])
         self._cursor = self.n_frames
 
@@ -766,6 +789,40 @@ class TestSyntheticStreams:
             5.0, 5.25, monkeypatch,
         )
         assert list(result.array[:, 0]) == list(range(5 * SR, 5 * SR + SR // 4))
+
+    def test_seek_that_falls_back_to_the_start_is_not_believed(self, monkeypatch):
+        """A Matroska file can carry Cue entries for its video track only. A seek on the
+        audio stream then has no index to use, libavformat goes back to the start of the
+        file, and it hands the stream's first packet back stamped with the seek target
+        instead of its own pts -- measured on a 40 s WebM muxed by ffmpeg 5.1, on every
+        PyAV build tried. Believing that timestamp puts the run seconds late and the
+        window silently returns audio from the start of the file.
+        """
+        result, opened = fake_read(
+            b"", lambda: FakeContainer(10 * SR, seek_falls_back=True), 5.0, 6.0, monkeypatch
+        )
+        assert opened[0].seeks, "the fixture must seek for this to mean anything"
+        assert list(result.array[:, 0]) == list(range(5 * SR, 6 * SR))
+
+    def test_head_packet_clamped_to_zero_does_not_shift_the_window(self, monkeypatch):
+        """A muxer that writes a head packet starting before zero as starting at zero
+        moves the origin every other timestamp is measured from. The packet after it still
+        says where its audio really begins."""
+        result, _ = fake_read(
+            b"",
+            lambda: FakeContainer(10 * SR, start_time=-13, clamp_head_pts=True),
+            5.0, 6.0, monkeypatch,
+        )
+        assert list(result.array[:, 0]) == list(range(5 * SR, 6 * SR))
+
+    def test_both_defects_of_a_clamped_webm_at_once(self, monkeypatch):
+        """Both of the above, as the measured file has them."""
+        def factory():
+            return FakeContainer(10 * SR, start_time=-13, clamp_head_pts=True,
+                                 seek_falls_back=True)
+
+        result, _ = fake_read(b"", factory, 5.0, 6.0, monkeypatch)
+        assert list(result.array[:, 0]) == list(range(5 * SR, 6 * SR))
 
     def test_timestamps_with_a_gap_follow_the_timeline(self, monkeypatch):
         """Frames missing from the stream (DTX, dropped packets) shift what a timestamp
