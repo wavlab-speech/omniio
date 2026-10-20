@@ -360,35 +360,54 @@ class TestShortOpusFrames:
             container.mux(stream.encode(None))
         return buf.getvalue()
 
-    @pytest.fixture(scope="class", params=["20", "10", "5", "2.5"])
+    # The frame size at which the head packet is consumed by the pre-skip whole, and
+    # `_first_output_packet` therefore skips it. Asserted below, not assumed: it is the
+    # whole point of the fixture that exactly one of these takes that branch.
+    HEAD_CONSUMED = {"20": False, "10": False, "5": False, "2.5": True}
+
+    @pytest.fixture(scope="class", params=sorted(HEAD_CONSUMED, key=float))
     def clip(self, request):
-        """(blob, full decode) for one Opus frame size. Broadband noise, because a tone
-        localises only to its own period and the error guarded against here is 120 to 168
-        samples."""
+        """(frame size, blob, full decode) for one Opus frame size. Broadband noise,
+        because a tone localises only to its own period and the error guarded against
+        here is 120 to 168 samples."""
         rng = np.random.default_rng(4711)
         signal = (0.3 * rng.standard_normal(SR * 15)).astype(np.float32)
         try:
             blob = self.encode_framewise(signal, float(request.param))
-        except Exception as exc:                 # pragma: no cover - build-dependent
+        except av.FFmpegError as exc:            # pragma: no cover - build-dependent
+            # Only ffmpeg refusing the frame size. Anything else -- a PyAV API that moved
+            # under this fixture, say -- must fail, not quietly take the whole frame size
+            # out of the suite.
             pytest.skip(f"this build will not encode {request.param} ms Opus: {exc}")
-        return blob, _read_webm(blob, None, None).array
+        return request.param, blob, _read_webm(blob, None, None).array
 
-    def test_the_fixture_really_has_a_negative_head_pts(self, clip):
-        """Guard on the fixture. The skip can only fire on a head packet that ends at or
-        before zero; if this build's muxer clamped that pts to 0, the test below would
-        pass without exercising anything."""
-        blob, _ = clip
+    def test_the_fixture_takes_the_branch_it_claims(self, clip):
+        """Guard on the fixture, stated as the reader's own condition.
+
+        `_first_output_packet` skips a head packet when `pts + duration <= 0`. A head
+        packet can start before zero and still end after it -- that is exactly what 5 ms
+        does -- so asserting only a negative pts would let the 2.5 ms case pass without
+        ever reaching the branch it exists to cover, and a muxer that clamped the pts to
+        0 would take every case out of it silently.
+        """
+        frame_ms, blob, _ = clip
         with av.open(io.BytesIO(blob)) as container:
             stream = container.streams.audio[0]
             head = next(p for p in container.demux(stream) if p.pts is not None)
         assert head.pts < 0, (
             f"head packet is at pts {head.pts}, not before zero; this muxer clamped it "
-            "and the frame-size cases below prove nothing"
+            "and this frame size proves nothing"
+        )
+        assert head.duration, "head packet carries no duration; the skip cannot be judged"
+        consumed = head.pts + head.duration <= 0
+        assert consumed is self.HEAD_CONSUMED[frame_ms], (
+            f"at {frame_ms} ms the head packet is pts={head.pts} duration={head.duration},"
+            f" so it is {'' if consumed else 'not '}consumed whole; expected the opposite"
         )
 
     @pytest.mark.parametrize("start", [5.0, 11.0])
     def test_window_lands_whatever_the_frame_size(self, clip, start):
-        blob, full = clip
+        _, blob, full = clip
         window = _read_webm(blob, start, start + 2.0).array
         assert window.shape[0] == pytest.approx(2 * SR, abs=SR // 100)
 
