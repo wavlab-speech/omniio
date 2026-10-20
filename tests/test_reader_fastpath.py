@@ -54,6 +54,15 @@ def test_window_past_end_is_empty(tmp_path):
     archive = tmp_path / "blob_0.bin"; archive.write_bytes(raw)
     w = audio_read_local(str(archive), 0, len(raw), start_time=5.0, end_time=6.0).array
     assert w.shape == (0, 1)
+    monkey = audio_read_mod._SMALL_ENTRY_BYTES
+    audio_read_mod._SMALL_ENTRY_BYTES = 1                     # the in-place path too
+    try:
+        w = audio_read_local(str(archive), 0, len(raw), start_time=5.0, end_time=6.0).array
+        assert w.shape == (0, 1)
+        w = audio_read_local(str(archive), 0, len(raw), start_time=2.0, end_time=3.0).array
+        assert w.shape == (0, 1)
+    finally:
+        audio_read_mod._SMALL_ENTRY_BYTES = monkey
     w = audio_read_local(str(archive), 0, len(raw), start_time=1.5, end_time=6.0).array
     assert w.shape == (int(0.5 * sr), 1)
 
