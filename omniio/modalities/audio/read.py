@@ -16,7 +16,7 @@ class PyAVCompatibilityWarning(UserWarning):
     been checked on this build (see README, "Windowed reads of WebM/Opus")."""
 
 
-# The range swept by tests/tools/sweep_pyav_webm.sh: PyAV 9.2-18.1 on ffmpeg 4.4-8.1. The
+# The range swept by tests/tools/sweep_pyav_webm.sh: PyAV 9.2-19.0 on ffmpeg 4.4-9.0. The
 # package's dependency floor is av>=10.0.0 (the whole test suite passes there); 9.2 is
 # validated for windowed *reads* only, from a conda-forge build without an Opus encoder.
 # The upper edge is deliberately not a dependency cap, because a newer PyAV is untested
@@ -26,8 +26,8 @@ class PyAVCompatibilityWarning(UserWarning):
 # again. libavcodec cannot be expressed as a dependency at all: it is inside the PyAV
 # wheel, and conda-forge builds pair one PyAV with several ffmpegs. Widen after
 # rerunning the sweep, not before.
-_TESTED_PYAV = ((9, 2), (18, 1))
-_TESTED_LIBAVCODEC = ((58, 134), (62, 28))
+_TESTED_PYAV = ((9, 2), (19, 0))
+_TESTED_LIBAVCODEC = ((58, 134), (63, 1))
 
 
 def _version_tuple(text: str) -> Tuple[int, ...]:

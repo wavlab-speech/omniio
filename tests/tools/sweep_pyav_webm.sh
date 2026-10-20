@@ -33,8 +33,11 @@ with av.open(io.BytesIO(blob)) as c:
 with av.open(io.BytesIO(blob)) as c:
     s = c.streams.audio[0]
     first = next(p.pts for p in c.demux(s) if p.pts is not None)
+    # read inside the with: PyAV 19 raises "Container is not open" on a closed stream,
+    # where older builds still answered, which left this row blank instead of reporting
+    start_time = s.start_time
 lavc = ".".join(map(str, getattr(av, "library_versions", {}).get("libavcodec", ("?",))[:2]))
-print(f"libavcodec {lavc} | first packet pts {first} | stream.start_time {s.start_time} | "
+print(f"libavcodec {lavc} | first packet pts {first} | stream.start_time {start_time} | "
       f"after seek: packet pts {head[0]}, frame pts {head[1]}, {head[2]} samples")
 '
 installed_version() {   # the av that PYTHONPATH=$1 actually imports, or empty
