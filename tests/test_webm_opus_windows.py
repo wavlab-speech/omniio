@@ -527,8 +527,9 @@ class FakeFrame:
 
 
 class FakePacket:
-    def __init__(self, pts, frames):
+    def __init__(self, pts, frames, duration=None):
         self.pts = pts
+        self.duration = duration            # the span the packet codes, in ticks
         self._frames = frames
 
     def decode(self):
@@ -606,13 +607,17 @@ class FakeContainer:
         """Packets from the cursor on, each decoding to at most one frame, then the flush
         packet PyAV appends. The packet's pts is the frame's position in the stream; the
         frame's pts is the same unless `advance_trimmed_pts` says the decoder moved it."""
+        span = int(round(self.frame / self.rate / float(self.tick)))
         for k in range(self._cursor, self.n_frames):
             if self._dropped(k):
                 continue
             pts = self._pts(k)
             lo, hi = self._span(k)
             if hi <= lo:
-                yield FakePacket(pts, [])      # swallowed whole by the codec delay
+                # Swallowed whole by the codec delay: the priming packet AAC in MP4 opens
+                # with. The reader skips it by its span ending at or before pts 0, so the
+                # packet has to carry one.
+                yield FakePacket(pts, [], span)
                 continue
             frame_pts = pts
             # After a seek onto frame k > 0, the decoder drops the codec delay again.
@@ -622,7 +627,7 @@ class FakeContainer:
                 if self.advance_trimmed_pts:
                     frame_pts = pts + int(round(trimmed / self.rate / float(self.tick)))
             frames = [FakeFrame(frame_pts, self.signal[:, lo:hi].copy())] if hi > lo else []
-            yield FakePacket(pts, frames)
+            yield FakePacket(pts, frames, span)
         yield FakePacket(None, [])
         self._cursor = self.n_frames
 

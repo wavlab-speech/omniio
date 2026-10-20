@@ -117,6 +117,18 @@ print(f"Video shape: {result.video_array.shape}")  # (frames, height, width, 3)
 print(f"Audio shape: {result.audio_array.shape}")  # (samples, channels)
 ```
 
+The audio track of a windowed video read goes through the same machinery as a windowed
+audio read, so it lands where it was asked for in MP4 and WebM alike, and the limits above
+("not bit-exact after a seek", "streams with timestamp gaps") apply to it as well.
+
+The window's audio is cut on the **video frame grid**, not at the raw `start_time` /
+`end_time`: `video_array` begins at `start_frame`, so the audio begins at
+`start_frame / fps` and the two arrays describe the same span. With a fractional frame
+rate that is up to one frame period away from the time you asked for; use
+`omniio.audio.read` when you want sample-exact audio bounds instead. A container with no
+video stream, or none that declares a frame rate, has no grid and is cut at the requested
+times.
+
 #### Text
 
 ```python

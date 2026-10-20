@@ -188,16 +188,34 @@ def _decode_packets(container, stream):
 
 
 def _first_packet_pts(container, stream) -> Optional[int]:
-    """pts of the stream's first packet: the origin of the timeline the anchor is on.
+    """pts of the stream's first packet that carries output: the origin of the timeline
+    the anchor is on, i.e. where a full decode's sample 0 sits.
 
     Not ``stream.start_time``. PyAV 16 and earlier report the first packet's pts there;
     PyAV 17 and later (newer libavformat) report the first *frame's* presentation time,
     which is the packet's pts plus the codec delay, rounded to the tick -- so an anchor
-    measured from ``start_time`` is off by the delay on those builds. The first packet's
-    own pts is the same number everywhere.
+    measured from ``start_time`` is off by the delay on those builds. A packet's own pts
+    is the same number everywhere.
+
+    Leading packets that end at or before pts 0 are skipped. They are priming: their
+    content lies entirely before the stream's own zero, so the decoder consumes them and
+    emits nothing, and a full decode's sample 0 belongs to the packet after them. AAC in
+    MP4 writes exactly one such packet, at pts -1024 with duration 1024 (the encoder
+    delay ``codec_context.delay`` also reports), and anchoring on it puts every seeked
+    window a whole AAC frame -- 21 ms at 48 kHz -- early. WebM/Opus has no such packet:
+    its head packet starts before zero (pts -7 ms here) but runs past it, so it is
+    trimmed rather than dropped and stays the anchor, which is why this reads exactly as
+    it did before for WebM.
+
+    The test is on the packets alone. Decoding one to see whether it yields a frame would
+    answer the same question directly, but it leaves the decoder warm, and a warm decoder
+    does not re-apply the codec delay to the first frame after the seek below -- which is
+    the very thing the anchor assumes it does.
     """
     for packet in container.demux(stream):
         if packet.pts is not None:
+            if packet.duration and packet.pts + packet.duration <= 0:
+                continue                # priming: consumed whole, decodes to nothing
             return packet.pts
         if packet.size == 0:            # the flush packet: the stream had no packets
             break
