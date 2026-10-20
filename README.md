@@ -83,19 +83,6 @@ window is the same samples a full decode has at that offset, with two documented
   the timestamps, a full decode concatenates frames, so the two disagree by the size of
   any gap before the window.
 
-Two things a WebM file can get wrong about its own timestamps are corrected rather than
-believed, because both were measured to move a window by more than the tolerance and
-neither depends on the PyAV build:
-
-- A head packet written as starting at zero although its audio starts before it (ffmpeg
-  5.1 does this to WebM/Opus muxed beside a video track, saying `failed to avoid negative
-  pts`). The origin is taken from the packet after it as well, so a window is not late by
-  the amount clamped away (13 ms on the file measured).
-- A seek that falls back to the start of the file because the audio track has no Cue
-  entries of its own, and hands the first packet back stamped with the seek target. The
-  packet is recognised by its byte position and the run placed at sample 0; believing the
-  timestamp returned the audio at 0.253 s for a window asked for at 5 s.
-
 Windowed WebM/Opus reads are validated against these PyAV / ffmpeg combinations
 (`tests/test_webm_opus_windows.py`, reproducible with `tests/tools/sweep_pyav_webm.sh`):
 
@@ -129,18 +116,6 @@ print(f"FPS: {result.fps}")
 print(f"Video shape: {result.video_array.shape}")  # (frames, height, width, 3)
 print(f"Audio shape: {result.audio_array.shape}")  # (samples, channels)
 ```
-
-The audio track of a windowed video read goes through the same machinery as a windowed
-audio read, so it lands where it was asked for in MP4 and WebM alike, and the limits above
-("not bit-exact after a seek", "streams with timestamp gaps") apply to it as well.
-
-The window's audio is cut on the **video frame grid**, not at the raw `start_time` /
-`end_time`: `video_array` begins at `start_frame`, so the audio begins at
-`start_frame / fps` and the two arrays describe the same span. With a fractional frame
-rate that is up to one frame period away from the time you asked for; use
-`omniio.audio.read` when you want sample-exact audio bounds instead. A container with no
-video stream, or none that declares a frame rate, has no grid and is cut at the requested
-times.
 
 #### Text
 

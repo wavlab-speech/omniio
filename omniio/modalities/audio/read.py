@@ -305,17 +305,10 @@ def _webm_frames(container, stream, seek_sample: Optional[int]):
 
     head_pos = getattr(head_packet, "pos", None)
     if start_pos is not None and start_pos >= 0 and head_pos == start_pos:
-        # The seek came back to the stream's first packet, so this run is the stream from
-        # its beginning and starts at sample 0 -- whatever timestamp that packet arrived
-        # with. It can arrive with the wrong one. A Matroska file whose Cues index only
-        # the video track leaves libavformat with no index for the audio stream; the seek
-        # then falls back to the start of the file, and on some such files it stamps the
-        # packet it hands back with the seek target instead of the packet's own pts (the
-        # packets after it keep their real timestamps, so the run's pts sequence jumps
-        # backwards at the second packet). Believing that pts places the whole run
-        # seconds late: measured on a 40 s WebM muxed by ffmpeg 5.1, a window asked for at
-        # 5 s came back holding the audio at 0.253 s, on every PyAV build tried. The byte
-        # position is not rewritten that way -- it is where the packet was read from.
+        # Back at the stream's first packet, so the run starts at sample 0 whatever
+        # timestamp the packet arrived with -- a seek that falls back to the start of the
+        # file can restamp it with the seek target. See CLAUDE.md, "Common Implementation
+        # Notes".
         pos = 0
     else:
         head_pts = head_packet.pts
