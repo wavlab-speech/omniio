@@ -175,7 +175,9 @@ _OPUS_SEEK_MARGIN_S = 0.25
 # Window reads: entries up to this size are read whole with one pread; larger ones are
 # decoded in place through a buffered view with this buffer (both overridable for tests
 # and benchmarks).
-_WINDOW_BUFFER_BYTES = int(os.environ.get("OMNIIO_WINDOW_BUFFER_BYTES", 1 << 18))
+_WINDOW_BUFFER_BYTES = int(os.environ.get("OMNIIO_WINDOW_BUFFER_BYTES", 1 << 16))   # 64 KB: a 3 s window of a 44 MB
+                                                                                   # FLAC reads ~330 KB instead of ~520 KB
+                                                                                   # with 256 KB, at the same latency
 _SMALL_ENTRY_BYTES = int(os.environ.get("OMNIIO_SMALL_ENTRY_BYTES", 4 * (1 << 18)))
 
 
