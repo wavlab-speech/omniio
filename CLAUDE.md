@@ -58,6 +58,9 @@ the real directory.
 
 **blob/write.py**: Registry mapping modalities to their write functions
 - `modality_writer` dict: {'audio': audio_write, 'text': text_write, 'video': video_write, 'image': image_write, 'midi': midi_write}
+- `writer_for(modality, fast_mode)`: what `Blob.append` calls; the modality's writer, or the raw byte copy for `fast_mode=True` and for a modality with no writer
+
+**modalities/base.py**: `Modality`, the modality-agnostic entry type. The base stores an item's bytes as they are (`write_raw`, no transcode, no metadata) and reads them back as bytes (`BytesRead` via `interface.bytes_read`); `AudioModality`, `TextModality`, ... subclass it and override `write` (the transcoding, metadata-producing writer) and `read` (the decoder). `MODALITIES` is the registry; `get_modality(name)` returns a bytes-only `Modality(name)` for any other name, so `Blob(modality="parquet")` works with no decoder (`blob.generic` is True). `Blob.append(fast_mode=True)` uses `write_raw` for every modality and rejects write options; its rows carry only the index columns (`INDEX_COLUMNS`: id, start_byte, end_byte, bin_index, path), and `pa.concat_tables(promote_options="default")` fills the other columns with nulls when fast and transcoding appends share an archive
 
 ### Key Design Patterns
 

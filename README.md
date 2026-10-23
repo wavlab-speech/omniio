@@ -219,6 +219,31 @@ print(f"Compressed size: {len(raw_bytes)} bytes")
 ```
 
 
+#### Fast mode and unknown file types
+
+`fast_mode=True` stores every item's bytes exactly as given (a path, raw bytes, or a binary
+file object): no transcode and no per-item metadata beyond the index columns. It is the
+same for every modality, so an archive can also hold files omniio has no decoder for; a
+`modality` name omniio does not know is served by the bytes-only base modality
+(`omniio.modalities.base.Modality`). An entry is read back with `bytes_read`:
+
+```python
+from omniio.blob.blob import Blob
+from omniio.interface import bytes_read
+
+blob = Blob(archive_dir="./flac_as_is", modality="audio")
+blob.append(items=flac_paths, ids=ids, num_workers=8, fast_mode=True)   # byte copies; audio_read still decodes them
+
+blob = Blob(archive_dir="./parquet_shards", modality="parquet")          # no writer for "parquet": bytes in, bytes out
+blob.append(items=[b"...", "/data/x.parquet"], ids=["a", "b"])
+
+raw = bytes_read(archive_path, start_byte, end_byte - start_byte).data    # local path or URL
+```
+
+Each supported modality is a subclass of `Modality` that overrides `write` with its
+transcoding, metadata-producing writer (`audio_write`, ...) and `read` with its decoder;
+`write_raw`, the byte copy, is shared.
+
 #### MIDI Archives
 
 ```python

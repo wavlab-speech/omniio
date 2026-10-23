@@ -8,6 +8,12 @@ class ArchiveRead:
     modality: str = None
 
 @dataclass
+class BytesRead(ArchiveRead):
+    """An entry read back as the bytes that were stored: the modality-agnostic read
+    (``bytes_read``), and what an archive of a modality omniio has no decoder for returns."""
+    data: bytes = None
+
+@dataclass
 class AudioRead(ArchiveRead):
     sample_rate: int = None
     array: np.ndarray = None

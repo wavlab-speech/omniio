@@ -1,6 +1,6 @@
 import os
 from typing import Optional
-from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead, ImageRead, MidiRead
+from omniio.definitions import ArchiveRead, AudioRead, BytesRead, TextRead, VideoRead, ImageRead, MidiRead
 from omniio.modalities.audio.read import audio_read_local, audio_read_remote
 from omniio.modalities.text.read import text_read_local, text_read_remote
 from omniio.modalities.video.read import video_read_local, video_read_remote
@@ -148,3 +148,35 @@ def midi_read(
         return midi_read_local(archive_path, start_offset, file_size, **kwargs)
     else:
         return midi_read_remote(archive_path, start_offset, file_size, **kwargs)
+
+
+def bytes_read(
+    archive_path: str,
+    start_offset: int,
+    file_size: int,
+) -> BytesRead:
+    """
+    Read one entry back as the bytes that were stored, local or remote. The
+    modality-agnostic read: what ``fast_mode`` wrote, an archive of a modality omniio has
+    no decoder for, or any entry whose decoding the caller wants to do itself.
+
+    Args:
+        archive_path: Path or URL to the archive bin file
+        start_offset: Byte offset where the entry begins
+        file_size:    Number of bytes for the entry
+
+    Returns:
+        BytesRead with ``data`` (bytes)
+    """
+    if os.path.exists(archive_path):
+        with open(archive_path, "rb") as f:
+            f.seek(start_offset)
+            data = f.read(file_size)
+    else:
+        import requests
+        resp = requests.get(archive_path, headers={"Range": f"bytes={start_offset}-{start_offset + file_size - 1}"})
+        resp.raise_for_status()
+        if resp.status_code != 206:                          # a server that ignores Range sends the whole file
+            raise IOError(f"{archive_path}: range request answered with HTTP {resp.status_code}, not 206 Partial Content")
+        data = resp.content
+    return BytesRead(file_type=None, modality="bytes", data=data)

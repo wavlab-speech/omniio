@@ -19,7 +19,8 @@ from tqdm import tqdm
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from omniio.blob.write import modality_writer
+from omniio.blob.write import modality_writer, writer_for
+from omniio.modalities.base import MODALITIES
 
 
 class SkippedItemsWarning(UserWarning):
@@ -42,6 +43,7 @@ def _worker_process(
     max_bin_size: int,
     progress_file: Optional[str] = None,
     skip_errors: bool = False,
+    fast_mode: bool = False,
 ) -> Tuple[int, List[Tuple[str, str, int]], List[Tuple[str, str]]]:
     """
     Worker function that runs in a separate process.
@@ -55,10 +57,12 @@ def _worker_process(
     With ``skip_errors`` an item whose write_fn raises is logged and skipped instead of
     aborting the worker (which would lose every item the worker had already written).
 
+    With ``fast_mode`` the item's bytes are stored as they are (no transcode, no metadata).
+
     Returns:
         (worker_id, [(bin_path, meta_path, n_rows), ...], [(item_id, error), ...])
     """
-    write_fn = modality_writer[modality]
+    write_fn = writer_for(modality, fast_mode)
     failed: List[Tuple[str, str]] = []
 
     def _make_paths(bid: int) -> Tuple[str, str]:
@@ -167,10 +171,12 @@ class Blob:
                     metadata.parquet
         """
 
-        supported_modalities = modality_writer.keys()
-        assert modality in supported_modalities, f"{modality} not in {supported_modalities}"
-
+        if not isinstance(modality, str) or not modality:
+            raise ValueError(f"modality must be a non-empty string, got {modality!r}")
+        # A name omniio has no writer for is served by the bytes-only base modality: items
+        # are stored as they are and read back as bytes (omniio.modalities.base).
         self.modality = modality
+        self.generic = modality not in MODALITIES
         self.max_bin_size = max_bin_size
 
         base_path = Path(archive_dir)
@@ -307,6 +313,7 @@ class Blob:
         progress: bool = True,
         reshard: bool = False,
         skip_errors: bool = False,
+        fast_mode: bool = False,
         **modality_kwargs,
     ):
         """
@@ -339,13 +346,21 @@ class Blob:
                          error aborts that worker and is re-raised after the other
                          workers' shards have been merged. Skipped ids are returned
                          and also recorded on `self.last_failed`.
+            fast_mode:   If True, every item's bytes are stored exactly as given (a path,
+                         bytes, or a binary file object): no transcode, and no metadata
+                         beyond the index columns (`id`, `start_byte`, `end_byte`,
+                         `bin_index`, `path`). The same for every modality, so the archive can hold
+                         files omniio cannot decode; the modality's reader still works on
+                         entries it can parse (a FLAC stored in fast mode reads as audio).
+                         Modality write options are not accepted with it.
+            **modality_kwargs: Forwarded to the modality write_fn.
 
         Returns:
             List of (item_id, error_message) for the items skipped. Empty unless
             `skip_errors` is set.
-
-            **modality_kwargs: Forwarded to the modality write_fn.
         """
+        if fast_mode and modality_kwargs:
+            raise ValueError(f"fast_mode stores items as they are; write options do not apply: {sorted(modality_kwargs)}")
         if ids is None:
             ids = [f"{self.name}_{i}" for i in range(len(self), len(self) + len(items))]
         else:
@@ -379,7 +394,7 @@ class Blob:
 
             if num_workers <= 0:
                 # ---- single-process path (per-item progress) ----
-                write_fn = modality_writer[self.modality]
+                write_fn = writer_for(self.modality, fast_mode)
 
                 def _sp_paths(bid: int) -> Tuple[str, str]:
                     return (
@@ -489,6 +504,7 @@ class Blob:
                             self.max_bin_size,
                             progress_file if wid == 0 else None,
                             skip_errors,
+                            fast_mode,
                         )
                         futures[fut] = wid
 

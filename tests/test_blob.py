@@ -31,12 +31,15 @@ class TestBlobInit:
 
         assert blob.name == "custom_name"
 
-    def test_invalid_modality(self, temp_dir):
-        """Test creating blob with invalid modality raises error."""
+    def test_unknown_modality_is_generic(self, temp_dir):
+        """A modality omniio has no writer for is served by the bytes-only base modality."""
         archive_dir = temp_dir / "test_archive"
 
-        with pytest.raises(AssertionError):
-            Blob(archive_dir=str(archive_dir), modality="invalid")
+        blob = Blob(archive_dir=str(archive_dir), modality="parquet")
+        assert blob.modality == "parquet" and blob.generic
+        assert not Blob(archive_dir=str(archive_dir), modality="audio").generic
+        with pytest.raises(ValueError):
+            Blob(archive_dir=str(archive_dir), modality="")
 
     def test_open_existing_blob(self, temp_dir, sample_audio_wav):
         """Test opening existing blob archive."""
