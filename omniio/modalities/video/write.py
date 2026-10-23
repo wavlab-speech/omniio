@@ -3,6 +3,7 @@ video/write.py — Encode video (+ optional audio) to MP4 H.264+AAC bytes.
 """
 
 import io
+from fractions import Fraction
 from typing import Optional, Tuple, Union
 from pathlib import Path
 
@@ -152,10 +153,15 @@ def video_write(
 
             # -- set up audio stream --
             out_audio = None
+            resampler = None
             if in_audio:
                 out_audio = out_container.add_stream("aac", rate=in_audio.rate)
                 out_audio.layout = in_audio.layout.name
                 out_audio.bit_rate = audio_bitrate
+                # the AAC encoder wants fltp frames with timestamps: a resampler converts the
+                # source format (mp3float, s16, ...) and keeps the pts; nulling pts makes the
+                # muxer reject the packets on current PyAV ("Invalid argument")
+                resampler = av.AudioResampler(format="fltp", layout=in_audio.layout.name, rate=in_audio.rate)
 
             # -- decode / encode loop --
             streams_to_decode = []
@@ -164,6 +170,7 @@ def video_write(
             if in_audio:
                 streams_to_decode.append(in_audio)
 
+            audio_samples, n_video = 0, 0
             for packet in in_container.demux(streams_to_decode):
                 if packet.stream == in_video and out_video:
                     for frame in packet.decode():
@@ -177,21 +184,35 @@ def video_write(
                             )
                         elif frame.format.name != "yuv420p":
                             frame = frame.reformat(format="yuv420p")
+                        # Re-time the (reformatted) frame onto the output grid as its frame index
+                        # at target_fps (constant frame rate): decoded frames carry the source
+                        # time base and offsets, which the muxer rejects for AVI sources (EINVAL).
+                        frame.pts = n_video
+                        frame.time_base = Fraction(1, int(target_fps))
+                        n_video += 1
 
                         for out_packet in out_video.encode(frame):
                             out_container.mux(out_packet)
 
                 elif packet.stream == in_audio and out_audio:
                     for frame in packet.decode():
-                        frame.pts = None  # let encoder set pts
-                        for out_packet in out_audio.encode(frame):
-                            out_container.mux(out_packet)
+                        for rframe in resampler.resample(frame):
+                            # timestamps in samples: some containers (AVI/MP3) carry frame-count
+                            # timestamps in an odd time base that the AAC muxer rejects
+                            rframe.pts = audio_samples; rframe.time_base = Fraction(1, in_audio.rate)
+                            audio_samples += rframe.samples
+                            for out_packet in out_audio.encode(rframe):
+                                out_container.mux(out_packet)
 
             # Flush encoders
             if out_video:
                 for out_packet in out_video.encode(None):
                     out_container.mux(out_packet)
             if out_audio:
+                for rframe in resampler.resample(None):
+                    rframe.pts = audio_samples; rframe.time_base = Fraction(1, in_audio.rate); audio_samples += rframe.samples
+                    for out_packet in out_audio.encode(rframe):
+                        out_container.mux(out_packet)
                 for out_packet in out_audio.encode(None):
                     out_container.mux(out_packet)
 
