@@ -109,3 +109,21 @@ def test_handle_cache_is_per_process(tmp_path):
     assert handles.pread_all(fd1, 10, 90) == b"0" * 10
     handles.close_all()
 
+def test_lookahead_preserves_order_and_overlaps(tmp_path):
+    """Lookahead yields results in request order while keeping `depth` fetches in flight."""
+    import time
+    from omniio.blob.prefetch import Lookahead, local_fetch
+    archive = tmp_path / "blob_0.bin"; data = bytes(range(256)) * 64; archive.write_bytes(data)
+    reqs = [(str(archive), o, 16) for o in [4000, 16, 8192, 0, 1024, 16368, 512, 2048]]
+    got = list(Lookahead(local_fetch, depth=3)(reqs))
+    assert got == [data[o:o + 16] for _, o, _ in reqs]
+    lat = 0.05; calls = []
+
+    def slow(p, o, s):
+        calls.append(time.perf_counter()); time.sleep(lat); return o
+
+    t0 = time.perf_counter(); out = list(Lookahead(slow, depth=8)([("x", k, 1) for k in range(16)])); dt = time.perf_counter() - t0
+    assert out == list(range(16)) and dt < 16 * lat * 0.5          # overlapped: far below the serial 0.8 s
+    la = Lookahead(local_fetch, depth=4)
+    assert la.read_batch(reqs) == [data[o:o + 16] for _, o, _ in reqs]
+    la.close()
