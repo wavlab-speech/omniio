@@ -40,6 +40,15 @@ def image_write(
     else:
         img = Image.open(str(image_path))
         src_format = img.format.lower() if img.format else None
+        # Fast path: a file that is already in the target format is stored byte for byte
+        # (no decode, no lossy re-encode); the header gives the metadata.
+        if src_format == target_format or (src_format == "jpeg" and target_format == "jpeg"):
+            width, height = img.size
+            channels = len(img.getbands())
+            img.close()
+            with open(str(image_path), "rb") as fh:
+                raw_bytes = fh.read()
+            return raw_bytes, {"format": target_format, "height": height, "width": width, "channels": channels}
 
     # JPEG does not support alpha — drop alpha channel if present
     if target_format == "jpeg" and img.mode in ("RGBA", "LA", "PA"):
