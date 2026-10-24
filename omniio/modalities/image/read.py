@@ -4,6 +4,7 @@ import numpy as np
 import requests
 from PIL import Image
 
+from omniio.blob.handles import archive_fd, pread_all
 from omniio.definitions import ImageRead
 
 
@@ -60,9 +61,7 @@ def image_read_local(
     Returns:
         ImageRead with uint8 array (height, width, channels).
     """
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
+    blob = pread_all(archive_fd(archive_path), file_size, start_offset)   # one pread on a cached descriptor
 
     fmt = _detect_format(blob[:16])
     return _decode_image(blob, fmt)

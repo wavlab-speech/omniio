@@ -4,6 +4,7 @@ from typing import Optional
 import requests
 import zstandard as zstd
 
+from omniio.blob.handles import archive_fd, pread_all
 from omniio.definitions import TextRead
 
 def _decompress_blob(blob: bytes) -> str:
@@ -16,9 +17,7 @@ def text_read_local(
     start_offset: int,
     file_size: int,
 ) -> TextRead:
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
+    blob = pread_all(archive_fd(archive_path), file_size, start_offset)   # one pread on a cached descriptor
 
     return TextRead(
         file_type="text",
