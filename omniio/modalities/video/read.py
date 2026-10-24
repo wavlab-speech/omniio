@@ -3,13 +3,47 @@ video/read.py — Read video (+ audio) from binary archive blobs.
 """
 
 import io
-from typing import Optional
+import os
+from typing import Callable, Optional, Union
 
 import av
 import numpy as np
 import requests
 
+from omniio.blob.handles import ArchiveWindow, archive_fd, pread_all
 from omniio.definitions import VideoRead
+
+# A windowed read of an entry larger than this decodes in place through a seekable view of
+# the archive (the MP4 demuxer seeks to the index atom and then to the GOP the window needs),
+# smaller entries are read whole with one pread. The view is unbuffered on the Python side:
+# the demuxer's own I/O buffer (`buffer_size`) is the read granularity, and every seek costs
+# one such read, so it is kept at 64 KB (a 2 s GOP of a 720p film at 2 Mb/s is ~0.5 MB).
+_SMALL_ENTRY_BYTES = int(os.environ.get("OMNIIO_VIDEO_SMALL_ENTRY_BYTES", 8 << 20))
+_WINDOW_BUFFER_BYTES = int(os.environ.get("OMNIIO_VIDEO_WINDOW_BUFFER_BYTES", 64 << 10))
+
+# One container per entry: a video pass, then the audio pass over a fresh file object from
+# the same source (bytes in memory, or a view of the archive).
+Source = Union[bytes, Callable[[], io.IOBase]]
+
+
+def _open_source(source: Source) -> io.IOBase:
+    if isinstance(source, (bytes, bytearray, memoryview)):
+        return io.BytesIO(source)
+    return source()
+
+
+def _frame_into(frame, dst):
+    """Write a decoded VideoFrame as RGB into dst (H, W, 3) with one copy from the decoder's plane
+    (to_ndarray would allocate an intermediate array and then copy again into the slot)."""
+    fr = frame if frame.format.name == "rgb24" else frame.reformat(format="rgb24")
+    plane = fr.planes[0]
+    buf = np.frombuffer(plane, dtype=np.uint8)
+    ls = plane.line_size
+    if buf.size >= ls * fr.height and ls >= fr.width * 3:
+        rows = buf[: ls * fr.height].reshape(fr.height, ls)[:, : fr.width * 3]
+        dst[...] = rows.reshape(fr.height, fr.width, 3)
+    else:                                                      # unexpected plane layout: PyAV's own path
+        dst[...] = fr.to_ndarray()
 
 # The windowed-read machinery the audio reader already has: seek a little early, anchor
 # the decoded run on the landing packet's pts measured from the first packet's pts, place
@@ -29,10 +63,11 @@ from omniio.modalities.audio.read import (
 
 
 def _decode_audio_window(
-    buf: io.BytesIO,
+    source: Source,
     start_sample: int,
     end_sample: Optional[int],
     channels: int,
+    open_kw: Optional[dict] = None,
 ) -> np.ndarray:
     """Decode [start_sample, end_sample) of the container's first audio stream.
 
@@ -48,8 +83,8 @@ def _decode_audio_window(
 
     Returns (samples, channels) float32, integer sample formats scaled by their dtype max.
     """
-    buf.seek(0)
-    with av.open(buf, mode="r") as container:
+    open_kw = open_kw or {}
+    with av.open(_open_source(source), mode="r", **open_kw) as container:
         stream = container.streams.audio[0]
         # Seek only where it can skip real work and there is a timeline to seek against:
         # a window inside the first margin would seek to the start anyway, and decoding
@@ -74,8 +109,7 @@ def _decode_audio_window(
         # The seek landed after the window and nothing before it can be recovered from
         # that container: decode from the top in a fresh one, where the first decoded
         # sample is sample 0 by construction.
-        buf.seek(0)
-        with av.open(buf, mode="r") as container:
+        with av.open(_open_source(source), mode="r", **open_kw) as container:
             stream = container.streams.audio[0]
             chunks, _ = _gather_window(
                 _webm_frames(container, stream, None),
@@ -95,20 +129,27 @@ def _decode_audio_window(
 
 
 def _decode_video(
-    blob: bytes,
+    source: Source,
     start_frame: Optional[int] = None,
     end_frame: Optional[int] = None,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
+    buffer_size: Optional[int] = None,
+    decoder_threads: Optional[int] = None,
 ) -> VideoRead:
     """
-    Decode MP4 bytes into numpy arrays for video and audio.
+    Decode an MP4 entry into numpy arrays for video and audio.
 
     Seeking can be specified either by frame index or by time in seconds.
     If both are provided, frame indices take priority.
 
     Args:
-        blob:        Raw MP4 bytes.
+        source:      Raw MP4 bytes, or a callable returning a seekable file object over
+                     the entry (opened twice: a video pass, then the audio pass).
+        buffer_size: demuxer I/O buffer for a file-object source (PyAV default when None).
+        decoder_threads: threads the video decoder may use (libavcodec's choice when None,
+                     which is one per core: in a DataLoader with many workers set 1, or the
+                     workers oversubscribe the cores).
         start_frame: First frame to include (None = 0).
         end_frame:   Frame to stop at, exclusive (None = last).
         start_time:  Start time in seconds (used if start_frame is None).
@@ -118,11 +159,13 @@ def _decode_video(
         VideoRead with video_array (F, H, W, 3) uint8 and
         audio_array (samples, channels) float32.
     """
-    buf = io.BytesIO(blob)
+    open_kw = {"buffer_size": int(buffer_size)} if buffer_size else {}
 
-    with av.open(buf, mode="r") as container:
+    with av.open(_open_source(source), mode="r", **open_kw) as container:
         video_stream = container.streams.video[0] if container.streams.video else None
         audio_stream = container.streams.audio[0] if container.streams.audio else None
+        if video_stream is not None and decoder_threads:
+            video_stream.thread_count = int(decoder_threads)
 
         fps = None
         height = None
@@ -141,9 +184,9 @@ def _decode_video(
         # --- Resolve frame / time boundaries -------------------------
         if video_stream and fps:
             if start_frame is None and start_time is not None:
-                start_frame = int(round(start_time * fps))     # nearest frame, not floor: a window
-            if end_frame is None and end_time is not None:     # just under a boundary began a frame early
-                end_frame = int(round(end_time * fps))
+                start_frame = int(start_time * fps)
+            if end_frame is None and end_time is not None:
+                end_frame = int(end_time * fps)
 
         if start_frame is None:
             start_frame = 0
@@ -183,12 +226,23 @@ def _decode_video(
             container.seek(target_pts, stream=video_stream)
 
         # --- Decode video frames -------------------------------------
-        video_frames = []
+        # Frames are written straight into the output array: the window's frame count is known
+        # before decoding (end_frame - start_frame; the container's frame count for an open end),
+        # so the array is allocated once and each frame is copied exactly once, from the decoder's
+        # plane into its slot. Collecting frames in a list and stacking them at the end held two
+        # copies of the window at the stack (measured: 2x the raw-seek peak for a 30 s 720p window).
+        video_array = None
+        n_video = 0
         if video_stream:
             frame_idx = 0
             # After seeking, we need to count from decoded frames
             # and skip until we reach start_frame
             started = (start_frame == 0)
+            capacity = None
+            if end_frame is not None:
+                capacity = max(0, end_frame - start_frame)
+            elif total_frames:
+                capacity = max(0, total_frames - start_frame)
 
             for frame in container.decode(video=0):
                 # Estimate frame index from pts
@@ -196,7 +250,7 @@ def _decode_video(
                     frame_idx = int(
                         float(frame.pts * video_stream.time_base) * fps + 0.5
                     )
-                
+
                 if not started:
                     if frame_idx >= start_frame:
                         started = True
@@ -206,24 +260,32 @@ def _decode_video(
                 if end_frame is not None and frame_idx >= end_frame:
                     break
 
-                arr = frame.to_ndarray(format="rgb24")  # (H, W, 3)
-                video_frames.append(arr)
+                if video_array is None:
+                    h, w = frame.height, frame.width
+                    video_array = np.empty((capacity if capacity is not None else 64, h, w, 3), dtype=np.uint8)
+                elif n_video >= video_array.shape[0]:            # open end and the index under-counted: grow
+                    grown = np.empty((video_array.shape[0] * 2,) + video_array.shape[1:], dtype=np.uint8)
+                    grown[:n_video] = video_array[:n_video]
+                    video_array = grown
+                _frame_into(frame, video_array[n_video])
+                n_video += 1
 
-        if video_frames:
-            video_array = np.stack(video_frames, axis=0)  # (F, H, W, 3)
-        else:
+        if video_array is None:
             h = height or 0
             w = width or 0
             video_array = np.empty((0, h, w, 3), dtype=np.uint8)
+        elif n_video < video_array.shape[0]:
+            video_array = video_array[:n_video]                 # a view, no copy
 
         # --- Decode audio (separate pass) ----------------------------
         audio_array = None
         if audio_stream:
             audio_array = _decode_audio_window(
-                buf,
+                source,
                 audio_start_sample or 0,
                 audio_end_sample,
                 audio_stream.channels,
+                open_kw,
             )
 
     return VideoRead(
@@ -246,6 +308,7 @@ def video_read_local(
     end_frame: Optional[int] = None,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
+    decoder_threads: Optional[int] = None,
 ) -> VideoRead:
     """
     Read a single video entry from a local binary archive blob.
@@ -260,16 +323,20 @@ def video_read_local(
         end_frame:    Frame to stop at, exclusive (None = last).
         start_time:   Start time in seconds (alternative to start_frame).
         end_time:     End time in seconds (alternative to end_frame).
+        decoder_threads: threads for the video decoder (None = libavcodec's default, one per core).
 
     Returns:
         VideoRead with video_array (F,H,W,3) uint8,
         audio_array (samples, channels) float32.
     """
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
-
-    return _decode_video(blob, start_frame, end_frame, start_time, end_time)
+    fd = archive_fd(archive_path)
+    windowed = any(v is not None for v in (start_frame, end_frame, start_time, end_time))
+    if windowed and file_size > _SMALL_ENTRY_BYTES:
+        # Decode in place through a view of the archive: the demuxer seeks to the index atom
+        # and then to the GOP the window needs, instead of the whole entry being read first.
+        return _decode_video(lambda: ArchiveWindow(fd, start_offset, file_size), start_frame, end_frame, start_time, end_time,
+                             buffer_size=_WINDOW_BUFFER_BYTES, decoder_threads=decoder_threads)
+    return _decode_video(pread_all(fd, file_size, start_offset), start_frame, end_frame, start_time, end_time, decoder_threads=decoder_threads)
 
 
 def video_read_remote(
