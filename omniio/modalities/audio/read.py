@@ -9,7 +9,7 @@ import numpy as np
 import soundfile as sf
 
 from omniio.definitions import AudioRead
-from omniio.blob.handles import archive_fd, pread_all
+from omniio.blob.handles import ArchiveWindow, archive_fd, pread_all
 
 
 class PyAVCompatibilityWarning(UserWarning):
@@ -99,39 +99,7 @@ def _detect_format(header: bytes) -> str:
             return fmt
     raise ValueError(f"Unknown audio format (header bytes: {header[:8].hex()})")
 
-class _ArchiveWindow(io.RawIOBase):
-    """Bytes `[offset, offset + size)` of an open archive as a seekable read-only file.
-
-    Lets the decoder seek inside one entry and pull only the frames a time window needs,
-    instead of the whole entry being read first: a 3 s crop of a 15 min FLAC is a few
-    hundred KB of I/O rather than ~40 MB, which is what dominates random-window loading
-    from a parallel filesystem."""
-
-    def __init__(self, fd: int, offset: int, size: int):
-        self._fd, self._offset, self._size, self._pos = fd, int(offset), int(size), 0
-
-    def readable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return True
-
-    def tell(self) -> int:
-        return self._pos
-
-    def seek(self, pos: int, whence: int = io.SEEK_SET) -> int:
-        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}[whence]
-        self._pos = min(max(base + int(pos), 0), self._size)
-        return self._pos
-
-    def readinto(self, b) -> int:
-        n = min(len(b), self._size - self._pos)
-        if n <= 0:
-            return 0
-        data = os.pread(self._fd, n, self._offset + self._pos)
-        b[: len(data)] = data
-        self._pos += len(data)
-        return len(data)
+_ArchiveWindow = ArchiveWindow      # the window object moved to omniio.blob.handles (shared with video)
 
 
 def _read_pcm(
