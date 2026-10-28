@@ -61,9 +61,10 @@ the real directory.
 
 ### Key Design Patterns
 
-**Local vs Remote Reading**: All read functions check `os.path.exists()` and route to either:
-- Local: Direct file seek/read operations
+**Local vs Remote Reading**: `interface.py` routes by prefix: an `http(s)://` path is remote, anything else is local (no `stat` per read):
+- Local: one `os.pread` on a per-process cached descriptor (`omniio/blob/handles.py`: LRU keyed on (pid, path), so forked DataLoader workers never share one). A time window of a large audio or video entry decodes in place through `ArchiveWindow`, a seekable view of the entry, reading only what the decoder seeks to
 - Remote: HTTP range requests via `requests.get()` with `Range: bytes=start-end` headers
+- `omniio/blob/prefetch.py`: `Lookahead` keeps N reads in flight on a thread pool and yields them in request order (random-order epochs are latency-bound otherwise); `read_batch` is the `__getitems__` variant
 
 **Format Detection**: Uses magic bytes for audio format detection:
 - `b"fLaC"` → FLAC

@@ -117,6 +117,36 @@ print(f"Video shape: {result.video_array.shape}")  # (frames, height, width, 3)
 print(f"Audio shape: {result.audio_array.shape}")  # (samples, channels)
 ```
 
+A time window of a large entry (over 8 MB) is decoded in place: the demuxer seeks within a
+view of the archive, so only the index atom and the GOPs the window needs are read. Pass
+`decoder_threads=1` from a DataLoader worker; libavcodec's default is one thread per core,
+which many workers oversubscribe.
+
+#### Random access at scale
+
+Reads do not open the archive: each process keeps an LRU cache of read-only descriptors
+(`omniio.blob.handles`, 64 by default, `OMNIIO_MAX_OPEN_ARCHIVES`) and an entry is one
+`pread`. Local and remote are told apart by an `http(s)://` prefix, not a `stat`.
+
+One request per entry means throughput is in-flight requests over latency. When the order
+is known in advance (a sampler's index sequence, a shuffled epoch), `Lookahead` keeps
+`depth` reads in flight on a thread pool and yields them in request order:
+
+```python
+from omniio.blob.prefetch import Lookahead, local_fetch
+
+reads = [(path, start_byte, size) for path, start_byte, size in epoch_order]
+for raw in Lookahead(local_fetch, depth=8)(reads):
+    ...                                     # decode raw while the next reads are in flight
+
+# the batch-shaped variant for a DataLoader __getitems__: sorted by (file, offset), returned in batch order
+la = Lookahead(local_fetch, depth=8)
+chunks = la.read_batch(reads[:32])
+```
+
+`local_fetch` is the one-pread fetch; any `(path_or_url, offset, size) -> bytes` callable works,
+including an HTTP range request for a remote archive.
+
 #### Text
 
 ```python
