@@ -48,7 +48,7 @@ the real directory.
 **interface.py**: Main entry points that route to local or remote readers
 - `audio_read()`: Checks if path exists, routes to local or remote implementation
 - `text_read()`: Same pattern for text data
-- `midi_read()`: Same pattern, plus `start_time`/`end_time`, `include_partial`, and `synthesize` (+ `sample_rate`, `channels`, `soundfont`, `backend`)
+- `midi_read()`: Same pattern, plus `start_time`/`end_time`, `include_partial`, `frequency_shift` (semitones; shifts midi, notes and waveform; drums untouched), and `synthesize` (+ `sample_rate`, `channels`, `soundfont`, `backend`)
 
 **blob/blob.py**: Main `Blob` class for managing binary archives
 - Archive structure: `archive_dir/blob_0.bin`, `blob_1.bin`, ..., `metadata.parquet`
@@ -123,6 +123,7 @@ from omniio.interface import midi_read
 result = midi_read(archive_path, start_offset, file_size,
                    start_time=5.0, end_time=10.0,          # optional window (seconds)
                    include_partial=True,                   # keep notes held across start_time
+                   frequency_shift=0.0,                    # semitones; shifts midi, notes AND waveform
                    synthesize=True, sample_rate=24000)     # optional waveform
 # result.midi   -> pretty_midi.PrettyMIDI (times relative to start_time)
 # result.notes  -> np.ndarray[NOTE_DTYPE]: onset, offset, pitch, velocity, program, is_drum, instrument

@@ -5,7 +5,8 @@ import requests
 import zstandard as zstd
 
 from omniio.definitions import MidiRead
-from omniio.modalities.midi.common import MIDI_MAGIC, midi_from_bytes, notes_from_midi, slice_midi
+from omniio.modalities.midi.common import (MIDI_MAGIC, midi_from_bytes, notes_from_midi, slice_midi,
+                                           transpose_midi)
 from omniio.modalities.midi.synth import DEFAULT_SAMPLE_RATE, synthesize
 from omniio.modalities.midi.write import ZSTD_MAGIC
 
@@ -28,12 +29,17 @@ def _decode_midi(
     channels: int,
     soundfont: Optional[str],
     backend: str,
+    frequency_shift: float = 0.0,
 ) -> MidiRead:
     fmt = _detect_format(blob[:8])
     if fmt == "midi.zst":
         blob = zstd.ZstdDecompressor().decompress(blob)
 
     pm = midi_from_bytes(blob)
+    if frequency_shift:
+        # Before slicing and before the notes table, so every view of the entry -- the
+        # PrettyMIDI, `notes`, and the synthesized waveform -- is the shifted one.
+        pm = transpose_midi(pm, frequency_shift, copy=False)
     full_end = float(pm.get_end_time())
 
     if start_time is None and end_time is None:
@@ -52,6 +58,7 @@ def _decode_midi(
         duration=duration,
         start_time=start,
         end_time=end,
+        frequency_shift=float(frequency_shift),
     )
     if synthesize_audio:
         result.sample_rate = int(sample_rate)
@@ -72,6 +79,7 @@ def midi_read_local(
     channels: int = 1,
     soundfont: Optional[str] = None,
     backend: str = "auto",
+    frequency_shift: float = 0.0,
 ) -> MidiRead:
     """
     Read a single MIDI entry from a binary archive blob.
@@ -89,6 +97,10 @@ def midi_read_local(
         channels:        Synthesis channels, 1 or 2.
         soundfont:       ``.sf2`` for the fluidsynth backend.
         backend:         ``"auto"`` | ``"fluidsynth"`` | ``"sine"``.
+        frequency_shift: Transpose by this many semitones (fractional allowed) before
+                         anything else: the returned ``midi``, ``notes`` and waveform are
+                         all shifted. Drums are untouched; notes leaving 0..127 are
+                         dropped. See `common.transpose_midi`.
 
     Returns:
         MidiRead with ``midi`` (PrettyMIDI, re-zeroed to the window), a ``notes`` table,
@@ -99,7 +111,7 @@ def midi_read_local(
         f.seek(start_offset)
         blob = f.read(file_size)
     return _decode_midi(blob, start_time, end_time, include_partial, synthesize,
-                        sample_rate, channels, soundfont, backend)
+                        sample_rate, channels, soundfont, backend, frequency_shift)
 
 
 def midi_read_remote(
@@ -114,6 +126,7 @@ def midi_read_remote(
     channels: int = 1,
     soundfont: Optional[str] = None,
     backend: str = "auto",
+    frequency_shift: float = 0.0,
 ) -> MidiRead:
     """Same as `midi_read_local`, over an HTTP range request."""
     end_byte = start_offset + file_size - 1
@@ -122,4 +135,4 @@ def midi_read_remote(
     resp = requests.get(archive_url, headers=headers)
     resp.raise_for_status()
     return _decode_midi(resp.content, start_time, end_time, include_partial, synthesize,
-                        sample_rate, channels, soundfont, backend)
+                        sample_rate, channels, soundfont, backend, frequency_shift)

@@ -167,6 +167,61 @@ def midi_from_notes(
     return pm
 
 
+BEND_RANGE_SEMITONES = 2.0      # the MIDI default and fluidsynth's: 8192 bend units = 2 semitones
+BEND_UNITS = 8192
+
+
+def transpose_midi(pm, semitones: float, *, drums: bool = False, copy: bool = True):
+    """Shift every pitched note by ``semitones`` (fractional allowed); returns a PrettyMIDI.
+
+    The whole-semitone part moves ``note.pitch``; notes that would leave 0..127 are
+    DROPPED rather than clamped, since clamping would pile them onto a false unison. The
+    fractional remainder becomes a pitch-bend offset on every pitched instrument
+    (added to the bends already there and clamped to the wheel's range, so the bend must
+    stay within ±2 semitones of any existing bend). Drum tracks are left alone by default:
+    a drum "pitch" selects a sound, and moving it changes the instrument, not the
+    frequency; pass ``drums=True`` to shift them as well.
+
+    Synthesis then produces audio at the shifted pitch. FluidSynth honours the bend, so a
+    fractional shift is audible there; the sine fallback ignores pitch bends.
+    """
+    pretty_midi = load_pretty_midi()
+    shift = float(semitones)
+    if copy:
+        pm = _copy_midi(pm)
+    if shift == 0.0:
+        return pm
+    whole = int(round(shift))
+    frac = shift - whole
+    if abs(frac) < 1e-9:
+        frac = 0.0
+    bend_offset = int(round(frac / BEND_RANGE_SEMITONES * BEND_UNITS))
+    for inst in pm.instruments:
+        if inst.is_drum and not drums:
+            continue
+        kept = []
+        for n in inst.notes:
+            pitch = int(n.pitch) + whole
+            if 0 <= pitch <= 127:
+                n.pitch = pitch
+                kept.append(n)
+        inst.notes = kept
+        if bend_offset:
+            bends = sorted(inst.pitch_bends, key=lambda b: b.time)
+            if not bends or bends[0].time > 0.0:
+                bends.insert(0, pretty_midi.PitchBend(0, 0.0))
+            for b in bends:
+                b.pitch = max(-BEND_UNITS, min(BEND_UNITS - 1, int(b.pitch) + bend_offset))
+            inst.pitch_bends = bends
+    return pm
+
+
+def _copy_midi(pm):
+    """A deep copy that keeps every attribute pretty_midi objects carry."""
+    import copy as _copy
+    return _copy.deepcopy(pm)
+
+
 def tempo_at(pm, t: float) -> float:
     """Tempo (BPM) in effect at second ``t``."""
     times, tempi = pm.get_tempo_changes()
