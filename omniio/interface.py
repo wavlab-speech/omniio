@@ -1,11 +1,12 @@
 import os
 from typing import Optional
-from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead, ImageRead, MidiRead
+from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead, ImageRead, MidiRead, DiscreteRead
 from omniio.modalities.audio.read import audio_read_local, audio_read_remote
 from omniio.modalities.text.read import text_read_local, text_read_remote
 from omniio.modalities.video.read import video_read_local, video_read_remote
 from omniio.modalities.image.read import image_read_local, image_read_remote
 from omniio.modalities.midi.read import midi_read_local, midi_read_remote
+from omniio.modalities.discrete.read import discrete_read_local, discrete_read_remote
 
 def audio_read(
     archive_path: str, 
@@ -148,3 +149,40 @@ def midi_read(
         return midi_read_local(archive_path, start_offset, file_size, **kwargs)
     else:
         return midi_read_remote(archive_path, start_offset, file_size, **kwargs)
+
+
+def discrete_read(
+    archive_path: str,
+    start_offset: int,
+    file_size: int,
+    streams: Optional[list] = None,
+    start_level: Optional[int] = None,
+    end_level: Optional[int] = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+) -> DiscreteRead:
+    """
+    Read integer streams (VQ / RVQ codes, token ids) from an archive, local or remote.
+    Partial reads fetch only the bytes they need: a level window is one contiguous read,
+    a frame window is one small read per stream (zstd-wrapped entries read the payload).
+
+    Args:
+        archive_path: Path or URL to the archive bin file
+        start_offset: Byte offset where the entry begins
+        file_size:    Number of bytes for this entry
+        streams:      Explicit stream indices to decode (default all); or
+        start_level / end_level: window of stream (RVQ level) indices, [start, end)
+        start_frame / end_frame: window in elements (frames); wins over the time window
+        start_time / end_time:   window in seconds through each stream's own rate
+
+    Returns:
+        DiscreteRead with `streams` (list of 1-D arrays), `array` ((n, T) when regular),
+        `lengths`, `vocab_sizes`, `rates`, `frame_windows`, `bytes_read`
+    """
+    kwargs = dict(streams=streams, start_level=start_level, end_level=end_level,
+                  start_frame=start_frame, end_frame=end_frame, start_time=start_time, end_time=end_time)
+    if os.path.exists(archive_path):
+        return discrete_read_local(archive_path, start_offset, file_size, **kwargs)
+    return discrete_read_remote(archive_path, start_offset, file_size, **kwargs)
