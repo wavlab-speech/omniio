@@ -11,7 +11,6 @@ class ArchiveRead:
 class AudioRead(ArchiveRead):
     sample_rate: int = None
     array: np.ndarray = None
-    frequency_shift: float = 0.0
 
 @dataclass
 class TextRead(ArchiveRead):
