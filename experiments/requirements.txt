@@ -1,0 +1,24 @@
+# the experiments of the paper; install omniio itself first (pip install -e . from the repository root)
+numpy>=1.24
+scipy>=1.10
+pyarrow>=14.0
+pandas>=1.5
+matplotlib>=3.8
+tqdm>=4.65
+torch>=2.1
+torchvision>=0.16          # ResNet-18 (ImageNet)
+torchaudio>=2.1            # resampling in data/prep_cls.py
+transformers>=4.38         # frozen CLIP and CLAP encoders
+datasets>=2.18             # ESC-50 and Flickr8k from the Hugging Face Hub
+huggingface_hub>=0.23      # ImageNet-1k, PG-19 and UCF101 sources
+webdataset>=0.2.100        # the WebDataset baseline
+Pillow>=10.0
+soundfile>=0.12
+librosa>=0.10              # ESC-50 resampling to 48 kHz at ingestion
+av>=10.0                   # video decoding (PyAV)
+h5py>=3.11                 # the HDF5 baseline
+pylance>=0.20              # the Lance baseline
+deeplake>=4.0              # the Deep Lake baseline
+mosaicml-streaming>=0.8    # the MosaicML MDS baseline
+anndata>=0.10              # the single-cell corpora (.h5ad)
+psutil>=5.9

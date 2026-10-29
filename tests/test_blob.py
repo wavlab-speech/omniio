@@ -1,0 +1,651 @@
+"""Tests for Blob class functionality."""
+
+import pytest
+import pyarrow as pa
+
+from omniio.blob.blob import Blob, SkippedItemsWarning
+from pathlib import Path
+
+class TestBlobInit:
+    """Test Blob initialization."""
+
+    def test_create_new_blob(self, temp_dir):
+        """Test creating a new blob archive."""
+        archive_dir = temp_dir / "test_archive"
+
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        assert blob.modality == "audio"
+        assert blob.archive_path.parent.exists()  # Archive directory exists
+        assert blob.metadata_file.exists() or len(blob) == 0
+
+    def test_create_blob_with_name(self, temp_dir):
+        """Test creating blob with custom name."""
+        archive_dir = temp_dir / "test_archive"
+
+        blob = Blob(
+            archive_dir=str(archive_dir),
+            modality="text",
+            name="custom_name"
+        )
+
+        assert blob.name == "custom_name"
+
+    def test_unknown_modality_is_generic(self, temp_dir):
+        """A modality omniio has no writer for is served by the bytes-only base modality."""
+        archive_dir = temp_dir / "test_archive"
+
+        blob = Blob(archive_dir=str(archive_dir), modality="parquet")
+        assert blob.modality == "parquet" and blob.generic
+        assert not Blob(archive_dir=str(archive_dir), modality="audio").generic
+        with pytest.raises(ValueError):
+            Blob(archive_dir=str(archive_dir), modality="")
+
+    def test_open_existing_blob(self, temp_dir, sample_audio_wav):
+        """Test opening existing blob archive."""
+        archive_dir = temp_dir / "test_archive"
+
+        # Create and populate blob
+        blob1 = Blob(archive_dir=str(archive_dir), modality="audio")
+        audio_path, _, _ = sample_audio_wav
+        blob1.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        # Reopen blob
+        blob2 = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        assert len(blob2) == 1
+        assert blob2.data is not None
+
+
+class TestBlobAppend:
+    """Test Blob append operations."""
+
+    def test_append_single_audio(self, temp_dir, sample_audio_wav):
+        """Test appending single audio file."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="flac",
+            target_bit_depth=16
+        )
+
+        assert len(blob) == 1
+        metadata = blob.get_metadata()
+        assert "audio_001" in metadata.column("id").to_pylist()
+
+    def test_append_multiple_audio(self, temp_dir, sample_audio_wav, sample_audio_flac):
+        """Test appending multiple audio files."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        wav_path, _, _ = sample_audio_wav
+        flac_path, _, _ = sample_audio_flac
+
+        blob.append(
+            items=[str(wav_path), str(flac_path)],
+            ids=["audio_001", "audio_002"],
+            num_workers=0,
+            target_format="flac"
+        )
+
+        assert len(blob) == 2
+        metadata = blob.get_metadata()
+        ids = metadata.column("id").to_pylist()
+        assert "audio_001" in ids
+        assert "audio_002" in ids
+
+    def test_append_with_parallel_workers(self, temp_dir, sample_audio_wav, sample_audio_flac):
+        """Test appending with multiple workers."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        wav_path, _, _ = sample_audio_wav
+        flac_path, _, _ = sample_audio_flac
+
+        blob.append(
+            items=[str(wav_path), str(flac_path)],
+            ids=["audio_001", "audio_002"],
+            num_workers=2,
+            target_format="wav"
+        )
+
+        assert len(blob) == 2
+
+    def test_append_without_ids(self, temp_dir, sample_audio_wav):
+        """Test appending without explicit IDs."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+
+        blob.append(
+            items=[str(audio_path), str(audio_path)],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        assert len(blob) == 2
+        metadata = blob.get_metadata()
+        ids = metadata.column("id").to_pylist()
+        assert f"{blob.name}_0" in ids
+        assert f"{blob.name}_1" in ids
+
+    def test_append_duplicate_id_skipped_with_warning(self, temp_dir, sample_audio_wav):
+        """Test appending duplicate ID without allow_duplicate_ids skips and warns."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+
+        # First append
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        initial_len = len(blob)
+
+        # Second append with same ID should skip with a warning
+        with pytest.warns(UserWarning, match="audio_001"):
+            blob.append(
+                items=[str(audio_path)],
+                ids=["audio_001"],
+                num_workers=0,
+                allow_duplicate_ids=False,
+                target_format="wav"
+            )
+
+        # Length should not change
+        assert len(blob) == initial_len
+
+    def test_append_duplicate_id_allowed(self, temp_dir, sample_audio_wav):
+        """Test appending duplicate ID with allow_duplicate_ids=True writes the item."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+
+        # First append
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        initial_len = len(blob)
+
+        # Second append with same ID and allow_duplicate_ids=True should write
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            allow_duplicate_ids=True,
+            target_format="wav"
+        )
+
+        # Length should increase
+        assert len(blob) == initial_len + 1
+
+    def test_append_text(self, temp_dir, sample_text):
+        """Test appending text files."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="text")
+
+        text_path, _ = sample_text
+
+        blob.append(
+            items=[str(text_path)],
+            ids=["text_001"],
+            num_workers=0,
+            is_path=True,
+            compression_level=3
+        )
+
+        assert len(blob) == 1
+
+
+class TestBlobMetadata:
+    """Test Blob metadata operations."""
+
+    def test_get_metadata(self, temp_dir, sample_audio_wav):
+        """Test getting metadata table."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        metadata = blob.get_metadata()
+
+        assert isinstance(metadata, pa.Table)
+        assert "id" in metadata.column_names
+        assert "start_byte" in metadata.column_names
+        assert "end_byte" in metadata.column_names
+        assert "bin_index" in metadata.column_names
+
+    def test_existing_ids(self, temp_dir, sample_audio_wav):
+        """Test _existing_ids returns correct set."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        existing = blob._existing_ids()
+
+        assert "audio_001" in existing
+
+    def test_metadata_has_path_column(self, temp_dir, sample_audio_wav):
+        """Test that metadata includes path column pointing to bin files."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        metadata = blob.get_metadata()
+
+        # Check path column exists
+        assert "path" in metadata.column_names
+
+        # Check path points to actual bin file
+        path = metadata.column("path")[0].as_py()
+        assert path.endswith(".bin")
+        assert Path(path).exists()
+
+        # Verify we can use the path to read data
+        from omniio.interface import audio_read
+        row = metadata.to_pandas().iloc[0]
+        result = audio_read(
+            row['path'],
+            row['start_byte'],
+            row['end_byte'] - row['start_byte']
+        )
+        assert result.array is not None
+
+    def test_path_column_multiple_bins(self, temp_dir, sample_audio_wav):
+        """Test path column with multiple bin files."""
+        archive_dir = temp_dir / "test_archive"
+        # Small max_bin_size to force multiple bins
+        blob = Blob(
+            archive_dir=str(archive_dir),
+            modality="audio",
+            max_bin_size=1024  # Very small, will create multiple bins
+        )
+
+        audio_path, _, _ = sample_audio_wav
+        # Append multiple times to create multiple bins
+        for i in range(3):
+            blob.append(
+                items=[str(audio_path)],
+                ids=[f"audio_{i:03d}"],
+                num_workers=0,
+                target_format="wav"
+            )
+
+        metadata = blob.get_metadata()
+
+        # Should have multiple unique paths
+        paths = set(metadata.column("path").to_pylist())
+        assert len(paths) > 0  # At least one bin file
+
+        # All paths should exist
+        for path in paths:
+            assert Path(path).exists()
+            assert path.endswith(".bin")
+
+
+def _read_entry_bytes(blob: Blob, item_id: str) -> bytes:
+    """Read the raw bytes for a single entry from its bin file using metadata offsets."""
+    meta = blob.get_metadata().to_pydict()
+    idx = meta["id"].index(item_id)
+    bin_path = meta["path"][idx]
+    start = meta["start_byte"][idx]
+    end = meta["end_byte"][idx]
+    with open(bin_path, "rb") as f:
+        f.seek(start)
+        return f.read(end - start)
+
+
+class TestConcatShards:
+    """Verify _concat_shards and _concat_shards_fast produce identical stored bytes."""
+
+    def _build_blob(self, archive_dir, items, ids, num_workers, reshard, **kwargs):
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+        blob.append(
+            items=items,
+            ids=ids,
+            num_workers=num_workers,
+            reshard=reshard,
+            **kwargs,
+        )
+        return blob
+
+    def test_single_item_bytes_match(self, temp_dir, sample_audio_wav):
+        audio_path, _, _ = sample_audio_wav
+        items = [str(audio_path)]
+        ids = ["item_0"]
+        kwargs = dict(target_format="wav")
+
+        blob_reshard = self._build_blob(
+            temp_dir / "reshard", items, ids, num_workers=0, reshard=True, **kwargs
+        )
+        blob_fast = self._build_blob(
+            temp_dir / "fast", items, ids, num_workers=0, reshard=False, **kwargs
+        )
+
+        assert _read_entry_bytes(blob_reshard, "item_0") == _read_entry_bytes(blob_fast, "item_0")
+
+    def test_multiple_items_bytes_match(self, temp_dir, sample_audio_wav, sample_audio_flac):
+        wav_path, _, _ = sample_audio_wav
+        flac_path, _, _ = sample_audio_flac
+        items = [str(wav_path), str(flac_path), str(wav_path)]
+        ids = ["item_0", "item_1", "item_2"]
+        kwargs = dict(target_format="flac", target_bit_depth=16)
+
+        blob_reshard = self._build_blob(
+            temp_dir / "reshard", items, ids, num_workers=0, reshard=True, **kwargs
+        )
+        blob_fast = self._build_blob(
+            temp_dir / "fast", items, ids, num_workers=0, reshard=False, **kwargs
+        )
+
+        for item_id in ids:
+            assert _read_entry_bytes(blob_reshard, item_id) == _read_entry_bytes(blob_fast, item_id), \
+                f"Bytes differ for {item_id}"
+
+    def test_parallel_workers_bytes_match(self, temp_dir, sample_audio_wav, sample_audio_flac):
+        wav_path, _, _ = sample_audio_wav
+        flac_path, _, _ = sample_audio_flac
+        items = [str(wav_path), str(flac_path), str(wav_path), str(flac_path)]
+        ids = ["item_0", "item_1", "item_2", "item_3"]
+        kwargs = dict(target_format="wav")
+
+        blob_reshard = self._build_blob(
+            temp_dir / "reshard", items, ids, num_workers=2, reshard=True, **kwargs
+        )
+        blob_fast = self._build_blob(
+            temp_dir / "fast", items, ids, num_workers=2, reshard=False, **kwargs
+        )
+
+        for item_id in ids:
+            assert _read_entry_bytes(blob_reshard, item_id) == _read_entry_bytes(blob_fast, item_id), \
+                f"Bytes differ for {item_id}"
+
+    def test_multiple_appends_bytes_match(self, temp_dir, sample_audio_wav, sample_audio_flac):
+        """Two sequential appends: bytes from both methods should match across appends."""
+        wav_path, _, _ = sample_audio_wav
+        flac_path, _, _ = sample_audio_flac
+        kwargs = dict(target_format="flac", target_bit_depth=16)
+
+        for label, reshard in [("reshard", True), ("fast", False)]:
+            blob = Blob(archive_dir=str(temp_dir / label), modality="audio")
+            blob.append(
+                items=[str(wav_path)], ids=["item_0"], num_workers=0, reshard=reshard, **kwargs
+            )
+            blob.append(
+                items=[str(flac_path)], ids=["item_1"], num_workers=0, reshard=reshard, **kwargs
+            )
+
+        blob_reshard = Blob(archive_dir=str(temp_dir / "reshard"), modality="audio")
+        blob_fast = Blob(archive_dir=str(temp_dir / "fast"), modality="audio")
+
+        for item_id in ["item_0", "item_1"]:
+            assert _read_entry_bytes(blob_reshard, item_id) == _read_entry_bytes(blob_fast, item_id), \
+                f"Bytes differ for {item_id}"
+
+    def test_offsets_are_non_overlapping(self, temp_dir, sample_audio_wav, sample_audio_flac):
+        """Metadata offsets must be contiguous and non-overlapping within each bin."""
+        wav_path, _, _ = sample_audio_wav
+        flac_path, _, _ = sample_audio_flac
+        items = [str(wav_path), str(flac_path), str(wav_path)]
+        ids = ["item_0", "item_1", "item_2"]
+        kwargs = dict(target_format="wav")
+
+        for label, reshard in [("reshard", True), ("fast", False)]:
+            blob = self._build_blob(
+                temp_dir / label, items, ids, num_workers=0, reshard=reshard, **kwargs
+            )
+            meta = blob.get_metadata().to_pydict()
+            # Group by bin_index and verify no overlaps within each bin
+            by_bin = {}
+            for i in range(len(meta["id"])):
+                bi = meta["bin_index"][i]
+                by_bin.setdefault(bi, []).append(
+                    (meta["start_byte"][i], meta["end_byte"][i])
+                )
+            for bi, ranges in by_bin.items():
+                ranges.sort()
+                for j in range(1, len(ranges)):
+                    assert ranges[j][0] >= ranges[j - 1][1], \
+                        f"{label}: overlapping offsets in bin {bi}: {ranges[j-1]} vs {ranges[j]}"
+
+    def test_single_process_bin_split_within_append(self, temp_dir, sample_audio_wav):
+        """Single append() call with max_bin_size=1 forces a new bin after every item.
+
+        Specifically exercises the new rollover code path in the single-process path.
+        With 3 items and max_bin_size=1 each item lands in its own bin (the first item
+        always writes regardless; subsequent items trigger cur_bin_size > 0 check).
+        Verifies that:
+        - multiple bin files are created within one append() call
+        - start_byte resets to 0 in each new bin
+        - raw bytes for every item match a no-split reference
+        """
+        wav_path, _, _ = sample_audio_wav
+        items = [str(wav_path)] * 3
+        ids = ["item_0", "item_1", "item_2"]
+        kwargs = dict(target_format="wav")
+
+        # Reference: no splitting (large max_bin_size)
+        ref = Blob(archive_dir=str(temp_dir / "ref"), modality="audio")
+        ref.append(items=items, ids=ids, num_workers=0, **kwargs)
+
+        for label, reshard in [("reshard", True), ("fast", False)]:
+            blob = Blob(
+                archive_dir=str(temp_dir / label),
+                modality="audio",
+                max_bin_size=1,  # forces split after every item
+            )
+            blob.append(items=items, ids=ids, num_workers=0, reshard=reshard, **kwargs)
+
+            meta = blob.get_metadata().to_pydict()
+            assert len(meta["id"]) == 3
+
+            # Each item should be in its own bin
+            bin_indices = sorted(set(meta["bin_index"]))
+            assert len(bin_indices) == 3, \
+                f"{label}: expected 3 separate bins, got {bin_indices}"
+
+            # Every bin's first (and only) item must have start_byte == 0
+            by_bin = {}
+            for i in range(3):
+                by_bin.setdefault(meta["bin_index"][i], []).append(i)
+            for bin_rows in by_bin.values():
+                assert meta["start_byte"][bin_rows[0]] == 0, \
+                    f"{label}: start_byte should reset to 0 in new bin"
+
+            # Bytes must match the reference (no-split) blob exactly
+            for item_id in ids:
+                assert _read_entry_bytes(blob, item_id) == _read_entry_bytes(ref, item_id), \
+                    f"{label}: bytes differ from reference for {item_id}"
+
+    def test_parallel_workers_bin_split_within_append(self, temp_dir, sample_audio_wav):
+        """Multi-worker append() with max_bin_size=1 forces each worker to produce
+        multiple sub-bins (shard_<wid>_<bid> files).
+
+        With num_workers=2 and 4 items, each worker gets 2 items and produces 2
+        sub-bins.  Verifies that all 4 items land in separate bins and bytes match
+        a no-split reference.
+        """
+        wav_path, _, _ = sample_audio_wav
+        items = [str(wav_path)] * 4
+        ids = ["item_0", "item_1", "item_2", "item_3"]
+        kwargs = dict(target_format="wav")
+
+        # Reference: single worker, no splitting
+        ref = Blob(archive_dir=str(temp_dir / "ref"), modality="audio")
+        ref.append(items=items, ids=ids, num_workers=0, **kwargs)
+
+        for label, reshard in [("reshard", True), ("fast", False)]:
+            blob = Blob(
+                archive_dir=str(temp_dir / label),
+                modality="audio",
+                max_bin_size=1,
+            )
+            blob.append(
+                items=items, ids=ids, num_workers=2, reshard=reshard, **kwargs
+            )
+
+            meta = blob.get_metadata().to_pydict()
+            assert len(meta["id"]) == 4
+
+            bin_indices = set(meta["bin_index"])
+            assert len(bin_indices) == 4, \
+                f"{label}: expected 4 separate bins, got {sorted(bin_indices)}"
+
+            # Bytes must match the reference exactly
+            for item_id in ids:
+                assert _read_entry_bytes(blob, item_id) == _read_entry_bytes(ref, item_id), \
+                    f"{label}: bytes differ from reference for {item_id}"
+
+
+class TestBlobUtilities:
+    """Test Blob utility methods."""
+
+    def test_summary_empty(self, temp_dir, capsys):
+        """Test summary for empty blob."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        blob.summary()
+
+        captured = capsys.readouterr()
+        assert "empty" in captured.out.lower()
+
+    def test_summary_with_data(self, temp_dir, sample_audio_wav, capsys):
+        """Test summary with data."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        blob.summary()
+
+        captured = capsys.readouterr()
+        assert "Total files: 1" in captured.out
+
+    def test_clear_without_confirm(self, temp_dir):
+        """Test clear without confirmation raises error."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        with pytest.raises(ValueError, match="requires confirmation"):
+            blob.clear(confirm=False)
+
+    def test_clear_with_confirm(self, temp_dir, sample_audio_wav):
+        """Test clearing blob with confirmation."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        assert len(blob) == 1
+
+        blob.clear(confirm=True)
+
+        assert len(blob) == 0
+        assert not blob.metadata_file.exists()
+
+    def test_len(self, temp_dir, sample_audio_wav):
+        """Test __len__ method."""
+        archive_dir = temp_dir / "test_archive"
+        blob = Blob(archive_dir=str(archive_dir), modality="audio")
+
+        assert len(blob) == 0
+
+        audio_path, _, _ = sample_audio_wav
+        blob.append(
+            items=[str(audio_path)],
+            ids=["audio_001"],
+            num_workers=0,
+            target_format="wav"
+        )
+
+        assert len(blob) == 1
+
+
+class TestBlobSkipErrors:
+    """`skip_errors`: a bad item must not take the rest of the batch down with it."""
+
+    def _items(self, temp_dir, sample_audio_wav):
+        wav_path, _, _ = sample_audio_wav
+        bad = temp_dir / "bad.wav"
+        bad.write_bytes(b"this is not audio")
+        return [str(wav_path), str(bad), str(wav_path), str(bad), str(wav_path)]
+
+    def test_default_raises_and_keeps_good_shards(self, temp_dir, sample_audio_wav):
+        blob = Blob(archive_dir=str(temp_dir / "strict"), modality="audio")
+        with pytest.raises(RuntimeError):
+            blob.append(items=self._items(temp_dir, sample_audio_wav),
+                        ids=list("abcde"), num_workers=0, target_format="wav")
+        assert blob.last_failed == []
+
+    @pytest.mark.parametrize("num_workers", [0, 2])
+    def test_skip_errors_writes_the_rest(self, temp_dir, sample_audio_wav, num_workers):
+        blob = Blob(archive_dir=str(temp_dir / f"skip{num_workers}"), modality="audio")
+        with pytest.warns(SkippedItemsWarning, match="Skipped 2 item"):
+            failed = blob.append(items=self._items(temp_dir, sample_audio_wav),
+                                 ids=list("abcde"), num_workers=num_workers,
+                                 skip_errors=True, target_format="wav")
+        assert [i for i, _ in failed] == ["b", "d"]
+        assert all(msg for _, msg in failed)
+        assert blob.last_failed == failed
+        assert len(blob) == 3
+        assert sorted(blob.get_metadata().column("id").to_pylist()) == ["a", "c", "e"]
+
+    def test_no_failures_returns_empty(self, temp_dir, sample_audio_wav):
+        wav_path, _, _ = sample_audio_wav
+        blob = Blob(archive_dir=str(temp_dir / "clean"), modality="audio")
+        failed = blob.append(items=[str(wav_path)], ids=["a"], num_workers=0,
+                             skip_errors=True, target_format="wav")
+        assert failed == [] and blob.last_failed == [] and len(blob) == 1

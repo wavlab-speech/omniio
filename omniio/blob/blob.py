@@ -1,0 +1,715 @@
+#!/usr/bin/env python3
+"""
+Generic binary blob
+"""
+
+import collections
+import os
+import shutil
+import threading
+import time
+import traceback
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Union
+
+from tqdm import tqdm
+
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from omniio.blob.entries import Entries
+from omniio.blob.write import modality_writer, writer_for
+from omniio.modalities.base import MODALITIES
+
+
+class SkippedItemsWarning(UserWarning):
+    """Issued by :meth:`Blob.append` when ``skip_errors=True`` dropped one or more items.
+
+    A dedicated category so a multi-hour dataset build can filter for exactly this
+    data-integrity event (``warnings.filterwarnings("error", category=SkippedItemsWarning)``
+    to turn it fatal, or ``"ignore"`` to silence it) without touching other warnings.
+    """
+
+
+class _ShardWriter:
+    """One worker's output: shard_<worker>_<bin>.bin / .parquet pairs under ``shard_dir``,
+    rolling to a new bin when ``max_bin_size`` would be exceeded. ``write`` appends one
+    entry; ``close`` flushes and returns ``[(bin_path, meta_path, n_rows), ...]``."""
+
+    def __init__(self, shard_dir: str, worker_id: int, max_bin_size: int):
+        self.shard_dir = shard_dir
+        self.worker_id = worker_id
+        self.max_bin_size = max_bin_size
+        self.sub_results: List[Tuple[str, str, int]] = []
+        self.bin_id = 0
+        self.metadata_rows: list = []
+        self.offset = 0
+        self.cur_bin_size = 0
+        self.bin_path, self.meta_path = self._paths(0)
+        self.f = open(self.bin_path, "wb")
+
+    def _paths(self, bid: int) -> Tuple[str, str]:
+        return (os.path.join(self.shard_dir, f"shard_{self.worker_id}_{bid}.bin"),
+                os.path.join(self.shard_dir, f"shard_{self.worker_id}_{bid}.parquet"))
+
+    def _flush(self):
+        self.f.close()
+        if self.metadata_rows:
+            # the .parquet appears only once it is complete, after the bin is closed: a
+            # shard with both files on disk is whole, whatever happened to its worker
+            # the schema is the union of every row's keys: from_pylist alone infers it from the
+            # first row and silently drops a column a later row introduces (a writer's extra
+            # metadata on some items only)
+            keys = list(dict.fromkeys(k for row in self.metadata_rows for k in row))
+            table = pa.Table.from_pylist([{k: row.get(k) for k in keys} for row in self.metadata_rows])
+            pq.write_table(table, self.meta_path + ".tmp")
+            os.replace(self.meta_path + ".tmp", self.meta_path)
+            self.sub_results.append((self.bin_path, self.meta_path, len(self.metadata_rows)))
+        elif os.path.exists(self.bin_path):
+            os.remove(self.bin_path)
+
+    def write(self, entry_id: str, raw_bytes: bytes, meta_dict: dict):
+        n_bytes = len(raw_bytes)
+        # Roll over to a new bin when the current one is non-empty and full
+        if self.cur_bin_size > 0 and self.cur_bin_size + n_bytes > self.max_bin_size:
+            self._flush()
+            self.bin_id += 1
+            self.bin_path, self.meta_path = self._paths(self.bin_id)
+            self.f = open(self.bin_path, "wb")
+            self.metadata_rows = []
+            self.offset = 0
+            self.cur_bin_size = 0
+        self.f.write(raw_bytes)
+        meta_dict["id"] = entry_id
+        meta_dict["start_byte"] = self.offset
+        meta_dict["end_byte"] = self.offset + n_bytes
+        meta_dict["bin_index"] = -1  # placeholder, resolved during concat
+        self.metadata_rows.append(meta_dict)
+        self.offset += n_bytes
+        self.cur_bin_size += n_bytes
+
+    def close(self) -> List[Tuple[str, str, int]]:
+        if not self.f.closed:
+            self._flush()
+        return self.sub_results
+
+
+def _write_item(write_fn, item, item_id, modality_kwargs, shard: _ShardWriter, existing_ids: Set[str],
+                allow_duplicate_ids: bool, skip_errors: bool, failed: List[Tuple[str, str]]) -> None:
+    """Run the modality writer on one item and append what it returns to the shard: a
+    single ``(raw_bytes, metadata)`` entry, or every entry of an `Entries` iterator (one
+    item -> many entries, e.g. the cells of an .h5ad slice), each id checked against the
+    archive. With ``skip_errors`` a failing writer is recorded in ``failed`` instead of
+    raised; entries an `Entries` writer yielded before failing stay written."""
+    if item_id in existing_ids and not allow_duplicate_ids:
+        warnings.warn(
+            f"Skipping duplicate id already in archive: {item_id}. "
+            "Pass allow_duplicate_ids=True to write it anyway."
+        )
+        return
+    try:
+        result = write_fn(item, item_id, **modality_kwargs)
+        if isinstance(result, Entries):
+            for entry_id, raw_bytes, meta_dict in result:
+                if entry_id in existing_ids and not allow_duplicate_ids:
+                    warnings.warn(
+                        f"Skipping duplicate id already in archive: {entry_id}. "
+                        "Pass allow_duplicate_ids=True to write it anyway."
+                    )
+                    continue
+                shard.write(entry_id, raw_bytes, meta_dict)
+        else:
+            raw_bytes, meta_dict = result
+            shard.write(item_id, raw_bytes, meta_dict)
+    except Exception as exc:
+        if not skip_errors:
+            raise
+        failed.append((str(item_id), f"{type(exc).__name__}: {exc}"))
+
+
+def _worker_process(
+    worker_id: int,
+    items_with_ids: List[Tuple[Any, str]],
+    modality: str,
+    shard_dir: str,
+    existing_ids: Set[str],
+    allow_duplicate_ids: bool,
+    modality_kwargs: dict,
+    max_bin_size: int,
+    progress_file: Optional[str] = None,
+    skip_errors: bool = False,
+    fast_mode: bool = False,
+) -> Tuple[int, List[Tuple[str, str, int]], List[Tuple[str, str]]]:
+    """
+    Worker function that runs in a separate process.
+    Writes items to one or more shard bin files in shard_dir, splitting into a
+    new file when max_bin_size is exceeded.  Files are named
+    shard_<worker_id>_<bin_id>.bin / .parquet.
+
+    Worker 0 optionally writes its per-item count to progress_file so the
+    main process can approximate overall progress.
+
+    With ``skip_errors`` an item whose write_fn raises is logged and skipped instead of
+    aborting the worker (which would lose every item the worker had already written).
+
+    With ``fast_mode`` the item's bytes are stored as they are (no transcode, no metadata).
+
+    Returns:
+        (worker_id, [(bin_path, meta_path, n_rows), ...], [(item_id, error), ...])
+    """
+    write_fn = writer_for(modality, fast_mode)
+    failed: List[Tuple[str, str]] = []
+    shard = _ShardWriter(shard_dir, worker_id, max_bin_size)
+    # Items consumed from items_with_ids, written or not: it only drives the progress
+    # bar, which counts every item; shard row counts come from the shard writer.
+    n_processed = 0
+    _last_progress_write = 0.0
+
+    try:
+        for item, item_id in items_with_ids:
+            _write_item(write_fn, item, item_id, modality_kwargs, shard, existing_ids,
+                        allow_duplicate_ids, skip_errors, failed)
+            n_processed += 1
+            if progress_file is not None:
+                now = time.time()
+                if now - _last_progress_write >= 0.5:
+                    with open(progress_file, "w") as pf:
+                        pf.write(str(n_processed))
+                    _last_progress_write = now
+    finally:
+        sub_results = shard.close()
+
+    return worker_id, sub_results, failed
+
+
+class Blob:
+    """Creates and manages binary blobs"""
+
+    def __init__(
+        self,
+        archive_dir: str,
+        modality: str,
+        name: Optional[str] = None,
+        max_bin_size: int = 32 * 1024 * 1024 * 10,
+    ):
+        """
+        Initialize archive.
+
+        Args:
+            archive_dir: Path to the archive directory
+                archive_dir/
+                    blob_0.bin
+                    blob_1.bin (if over max_bin_size)
+                    ...
+                    metadata.parquet
+        """
+
+        if not isinstance(modality, str) or not modality:
+            raise ValueError(f"modality must be a non-empty string, got {modality!r}")
+        # A name omniio has no writer for is served by the bytes-only base modality: items
+        # are stored as they are and read back as bytes (omniio.modalities.base).
+        self.modality = modality
+        self.generic = modality not in MODALITIES
+        self.max_bin_size = max_bin_size
+
+        base_path = Path(archive_dir)
+        base_path.mkdir(parents=True, exist_ok=True)
+        self.archive_path = base_path / "blob"
+        self.metadata_file = base_path / "metadata.parquet"
+
+        self.data: Optional[pa.Table] = None
+        if self.metadata_file.exists():
+            self.data = self._read_metadata()
+        # (item_id, error) pairs skipped by the most recent append(skip_errors=True)
+        self.last_failed: List[Tuple[str, str]] = []
+
+        if name is not None:
+            self.name = name
+        else:
+            archive_dir = str(archive_dir)
+            self.name = archive_dir.rstrip("/").split("/")[-1]
+
+    # ------------------------------------------------------------------ #
+    # Metadata helpers (pyarrow)
+    # ------------------------------------------------------------------ #
+
+    def _read_metadata(self) -> pa.Table:
+        if not self.metadata_file.exists():
+            raise FileNotFoundError(f"Metadata file not found: {self.metadata_file}")
+        return pq.read_table(self.metadata_file)
+
+    def get_metadata(self) -> pa.Table:
+        """Return the metadata as a PyArrow Table."""
+        if self.data is None:
+            self.data = self._read_metadata()
+        return self.data
+
+    def _existing_ids(self) -> Set[str]:
+        """Return set of ids already in the archive."""
+        if self.data is None:
+            return set()
+        return set(self.data.column("id").to_pylist())
+
+    # ------------------------------------------------------------------ #
+    # Bin file helpers
+    # ------------------------------------------------------------------ #
+
+    def __len__(self):
+        if self.data is None:
+            return 0
+        return self.data.num_rows
+
+    def _get_bin_file_path(self, bin_index: int) -> Path:
+        return self.archive_path.with_name(f"{self.archive_path.stem}_{bin_index}.bin")
+
+    def _get_current_bin_info(self) -> Tuple[int, int]:
+        bin_index = 0
+        while True:
+            bin_path = self._get_bin_file_path(bin_index)
+            if not bin_path.exists():
+                if bin_index == 0:
+                    return 0, 0
+                else:
+                    prev = self._get_bin_file_path(bin_index - 1)
+                    return bin_index - 1, prev.stat().st_size
+            bin_index += 1
+
+    # ------------------------------------------------------------------ #
+    # Summary / clear
+    # ------------------------------------------------------------------ #
+
+    def summary(self):
+        if self.data is None:
+            print(f"\nArchive: {self.archive_path}")
+            print("Archive is empty (no metadata file found).")
+            return
+
+        table = self.data
+        num = table.num_rows
+        print(f"\nArchive: {self.archive_path}")
+        print(f"Total files: {num}")
+
+        if num == 0:
+            return
+
+        if "data_type" in table.column_names:
+            counts = collections.Counter(table.column("data_type").to_pylist())
+            for dtype, count in counts.items():
+                print(f"  {dtype}: {count} files")
+
+        bin_indices = set(table.column("bin_index").to_pylist())
+        total_size = 0
+        for idx in sorted(bin_indices):
+            p = self._get_bin_file_path(idx)
+            if p.exists():
+                total_size += p.stat().st_size
+        print(f"Total size: {total_size / (1024**3):.2f} GB")
+        print(f"Number of bin files: {len(bin_indices)}")
+
+    def clear(self, confirm: bool = False):
+        if not confirm:
+            raise ValueError(
+                "Archive clearing requires confirmation. "
+                "Call clear(confirm=True) to proceed. "
+                "This will delete all bin files and metadata!"
+            )
+
+        files_deleted = 0
+        if self.metadata_file.exists():
+            self.metadata_file.unlink()
+            files_deleted += 1
+
+        bin_index = 0
+        while True:
+            bin_path = self._get_bin_file_path(bin_index)
+            if bin_path.exists():
+                bin_path.unlink()
+                files_deleted += 1
+                bin_index += 1
+            else:
+                break
+
+        self.data = None
+        print(f"Archive '{self.archive_path.stem}' cleared successfully!")
+        print(f"Deleted {files_deleted} file(s) ({bin_index} bin file(s) + metadata).")
+
+    # ------------------------------------------------------------------ #
+    # Append (parallelized)
+    # ------------------------------------------------------------------ #
+
+    def append(
+        self,
+        items: List[Any],
+        ids: List[str] = None,
+        num_workers: int = 0,
+        allow_duplicate_ids: bool = False,
+        progress: bool = True,
+        reshard: bool = False,
+        skip_errors: bool = False,
+        fast_mode: bool = False,
+        **modality_kwargs,
+    ):
+        """
+        Append items to the archive in parallel.
+
+        Each worker writes to its own temp bin + metadata shard.  After all
+        workers finish (or on error, after all workers finish their current
+        item), the shards are merged into the main archive.
+
+        Duplicate-id checking against the existing archive happens inside
+        each worker process, so the full id set is serialized once to each
+        worker rather than requiring a synchronization step.
+
+        Args:
+            items:       List of raw items matching the modality.
+            ids:         Unique string id per item.  Must be same length as items.
+            num_workers: 0 means single-process (no pool). >0 spawns a pool.
+            allow_duplicate_ids: If False (default), items whose id already
+                         exists in the archive are skipped with a warning.
+                         If True, the item is written regardless.
+            reshard:     If True, shard bins are streamed and concatenated into
+                         the existing blob files (respecting max_bin_size).
+                         If False (default), each shard bin is simply moved into
+                         the archive as its own blob file — much faster, at the
+                         cost of producing more bin files.
+            skip_errors: If True, an item whose write_fn raises (corrupt file,
+                         unparsable bytes, ...) is skipped and the rest of the
+                         batch is written; a `SkippedItemsWarning` summarises the
+                         skipped items at the end. If False (default), the first
+                         error aborts that worker and is re-raised after the other
+                         workers' shards have been merged. Skipped ids are returned
+                         and also recorded on `self.last_failed`.
+            fast_mode:   If True, every item's bytes are stored exactly as given (a path,
+                         bytes, or a binary file object): no transcode, and no metadata
+                         beyond the index columns (`id`, `start_byte`, `end_byte`,
+                         `bin_index`, `path`). The same for every modality, so the archive can hold
+                         files omniio cannot decode; the modality's reader still works on
+                         entries it can parse (a FLAC stored in fast mode reads as audio).
+                         Modality write options are not accepted with it.
+            **modality_kwargs: Forwarded to the modality write_fn.
+
+        Returns:
+            List of (item_id, error_message) for the items skipped. Empty unless
+            `skip_errors` is set.
+        """
+        if fast_mode and modality_kwargs:
+            raise ValueError(f"fast_mode stores items as they are; write options do not apply: {sorted(modality_kwargs)}")
+        if ids is None:
+            ids = [f"{self.name}_{i}" for i in range(len(self), len(self) + len(items))]
+        else:
+            assert len(items) == len(ids), "items and ids must be the same length"
+
+        # --- Check uniqueness of incoming ids -------------------------
+        seen = set(ids)
+        if len(seen) != len(ids):
+            raise ValueError(f"Duplicate id in input")
+
+        # --- Snapshot existing ids for workers ------------------------
+        existing_ids = self._existing_ids()
+
+        # --- Partition work -------------------------------------------
+        effective_workers = max(num_workers, 1)
+        chunks: List[List[Tuple[Any, str]]] = [[] for _ in range(effective_workers)]
+        for i, (item, item_id) in enumerate(zip(items, ids)):
+            chunks[i % effective_workers].append((item, item_id))
+        chunks = [c for c in chunks if c]
+
+        log_dir = self.archive_path.parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+
+        failed: List[Tuple[str, str]] = []
+        try:
+            # Each entry: (worker_id, [(bin_path, meta_path, n_rows), ...])
+            completed_results: List[Tuple[int, List[Tuple[str, str, int]]]] = []
+            first_error: Optional[Exception] = None
+
+            pbar = tqdm(total=len(items), desc="appending", disable=not progress)
+
+            if num_workers <= 0:
+                # ---- single-process path (per-item progress) ----
+                write_fn = writer_for(self.modality, fast_mode)
+                shard = _ShardWriter(str(log_dir), 0, self.max_bin_size)
+                try:
+                    try:
+                        for item, item_id in zip(items, ids):
+                            _write_item(write_fn, item, item_id, modality_kwargs, shard, existing_ids,
+                                        allow_duplicate_ids, skip_errors, failed)
+                            pbar.update(1)
+                    finally:
+                        sub_results = shard.close()
+                    completed_results.append((0, sub_results))
+                except Exception as exc:
+                    first_error = exc
+            else:
+                # ---- multi-process path (worker-0 progress approximation) ----
+                progress_file = str(log_dir / "worker0_progress.txt")
+                num_chunks = len(chunks)
+
+                # Background thread polls worker 0's progress file and scales
+                # by num_chunks to approximate total progress.
+                stop_poll = threading.Event()
+                last_reported = [0]
+
+                def _poll_progress():
+                    while not stop_poll.is_set():
+                        try:
+                            with open(progress_file) as _pf:
+                                w0_count = int(_pf.read().strip())
+                            estimated = min(w0_count * num_chunks, len(items))
+                            delta = estimated - last_reported[0]
+                            if delta > 0:
+                                pbar.update(delta)
+                                last_reported[0] = estimated
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
+
+                poll_thread = threading.Thread(target=_poll_progress, daemon=True)
+                poll_thread.start()
+
+                futures = {}
+                with ProcessPoolExecutor(max_workers=num_workers) as pool:
+                    for wid, chunk in enumerate(chunks):
+                        fut = pool.submit(
+                            _worker_process,
+                            wid, chunk, self.modality, str(log_dir),
+                            existing_ids, allow_duplicate_ids, modality_kwargs,
+                            self.max_bin_size,
+                            progress_file if wid == 0 else None,
+                            skip_errors,
+                            fast_mode,
+                        )
+                        futures[fut] = wid
+
+                    for fut in as_completed(futures):
+                        try:
+                            wid, sub_results, w_failed = fut.result()
+                            completed_results.append((wid, sub_results))
+                            failed.extend(w_failed)
+                        except Exception as exc:
+                            if first_error is None:
+                                first_error = exc
+
+                stop_poll.set()
+                poll_thread.join()
+
+                # Bring pbar to 100% (approximation may not reach exactly total)
+                remaining = len(items) - last_reported[0]
+                if remaining > 0:
+                    pbar.update(remaining)
+
+            pbar.close()
+
+            # --- Recover shards whose worker never reported -----------
+            # A worker killed mid-way (OOM, node failure, a crash in a C extension)
+            # breaks the pool: every future raises, including those of workers that
+            # had already finished. Their shards are whole on disk (the .parquet is
+            # written last, atomically), so pick them up instead of losing them.
+            if first_error is not None:
+                completed_results.extend(self._orphan_shards(log_dir, completed_results))
+
+            # --- Concatenate shards onto the archive ------------------
+            if reshard:
+                self._concat_shards(completed_results)
+            else:
+                self._concat_shards_fast(completed_results)
+
+            if first_error is not None:
+                raise RuntimeError(
+                    "One or more workers failed. Successfully processed shards "
+                    "have been concatenated into the archive. Original error:\n"
+                    f"{first_error}"
+                ) from first_error
+
+        finally:
+            shutil.rmtree(log_dir, ignore_errors=True)
+
+        failed.sort()
+        self.last_failed = failed
+        if failed:
+            preview = "; ".join(f"{i}: {e}" for i, e in failed[:5])
+            more = f" (+{len(failed) - 5} more)" if len(failed) > 5 else ""
+            warnings.warn(
+                f"Skipped {len(failed)} item(s) that failed to write: {preview}{more}",
+                SkippedItemsWarning,
+                stacklevel=2,
+            )
+        return failed
+
+    # ------------------------------------------------------------------ #
+    # Shard concatenation
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _orphan_shards(log_dir: Path, completed: List[Tuple[int, List[Tuple[str, str, int]]]]):
+        """Complete ``shard_<w>_<b>.bin/.parquet`` pairs in ``log_dir`` that no worker
+        reported, grouped by worker -> ``[(worker_id, [(bin, meta, n_rows)]), ...]``."""
+        known = {meta for _w, subs in completed for _b, meta, _n in subs}
+        found: Dict[int, List[Tuple[str, str, int]]] = {}
+        for meta_path in sorted(log_dir.glob("shard_*_*.parquet")):
+            if str(meta_path) in known:
+                continue
+            bin_path = meta_path.with_suffix(".bin")
+            if not bin_path.exists():
+                continue
+            try:
+                n_rows = pq.read_metadata(meta_path).num_rows
+            except Exception:  # noqa: BLE001  -- half-written: the worker died inside the rename window
+                continue
+            wid = int(meta_path.stem.split("_")[1])
+            found.setdefault(wid, []).append((str(bin_path), str(meta_path), n_rows))
+        return sorted(found.items())
+
+    def _concat_shards(
+        self,
+        results: List[Tuple[int, List[Tuple[str, str, int]]]],
+    ):
+        """
+        Merge worker shard files into the main archive.
+
+        Bin data is concatenated via streaming copy (never fully in memory).
+        Metadata byte offsets are shifted by reading file sizes only.
+        """
+        if not results:
+            return
+
+        results.sort(key=lambda r: r[0])
+        # Flatten sub-bins in worker order
+        flat: List[Tuple[str, str, int]] = []
+        for _wid, sub_bins in results:
+            flat.extend(sub_bins)
+
+        cur_bin_index, cur_bin_size = self._get_current_bin_info()
+
+        meta_tables: List[pa.Table] = []
+
+        if self.data is not None and self.data.num_rows > 0:
+            meta_tables.append(self.data)
+
+        for shard_bin_path, shard_meta_path, n_rows in flat:
+            if n_rows == 0:
+                continue
+
+            shard_bin_size = os.path.getsize(shard_bin_path)
+
+            if cur_bin_size > 0 and (cur_bin_size + shard_bin_size) > self.max_bin_size:
+                cur_bin_index += 1
+                cur_bin_size = 0
+
+            byte_offset = cur_bin_size
+
+            dest_bin = self._get_bin_file_path(cur_bin_index)
+            with open(dest_bin, "ab") as dst, open(shard_bin_path, "rb") as src:
+                shutil.copyfileobj(src, dst)
+
+            shard_meta = pq.read_table(shard_meta_path)
+
+            start_col = shard_meta.column("start_byte")
+            end_col = shard_meta.column("end_byte")
+
+            shifted_start = pa.compute.add(start_col, byte_offset)
+            shifted_end = pa.compute.add(end_col, byte_offset)
+            bin_index_col = pa.array(
+                [cur_bin_index] * shard_meta.num_rows, type=pa.int64()
+            )
+
+            # Add path column with absolute path to bin file
+            bin_path = str(dest_bin.absolute())
+            path_col = pa.array(
+                [bin_path] * shard_meta.num_rows, type=pa.string()
+            )
+
+            shard_meta = shard_meta.set_column(
+                shard_meta.schema.get_field_index("start_byte"), "start_byte", shifted_start
+            )
+            shard_meta = shard_meta.set_column(
+                shard_meta.schema.get_field_index("end_byte"), "end_byte", shifted_end
+            )
+            shard_meta = shard_meta.set_column(
+                shard_meta.schema.get_field_index("bin_index"), "bin_index", bin_index_col
+            )
+
+            # Add or update path column
+            if "path" in shard_meta.column_names:
+                shard_meta = shard_meta.set_column(
+                    shard_meta.schema.get_field_index("path"), "path", path_col
+                )
+            else:
+                shard_meta = shard_meta.append_column("path", path_col)
+
+            meta_tables.append(shard_meta)
+            cur_bin_size += shard_bin_size
+
+        if meta_tables:
+            combined = pa.concat_tables(meta_tables, promote_options="default")
+            pq.write_table(combined, self.metadata_file)
+            self.data = combined
+
+    def _concat_shards_fast(
+        self,
+        results: List[Tuple[int, List[Tuple[str, str, int]]]],
+    ):
+        """
+        Merge worker shard files into the archive without resharding.
+
+        Each shard bin is moved (renamed) into the archive directory as its
+        own blob file.  Byte offsets within each shard are already correct
+        (0-based from the start of that shard), so no shifting is needed.
+        Only the parquet metadata tables are concatenated.
+        """
+        if not results:
+            return
+
+        results.sort(key=lambda r: r[0])
+        # Flatten sub-bins in worker order
+        flat: List[Tuple[str, str, int]] = []
+        for _wid, sub_bins in results:
+            flat.extend(sub_bins)
+
+        # Find the next available bin index
+        cur_bin_index, _ = self._get_current_bin_info()
+        # If a bin file already exists at cur_bin_index, next shard goes after it
+        if self._get_bin_file_path(cur_bin_index).exists():
+            cur_bin_index += 1
+
+        meta_tables: List[pa.Table] = []
+
+        if self.data is not None and self.data.num_rows > 0:
+            meta_tables.append(self.data)
+
+        for shard_bin_path, shard_meta_path, n_rows in flat:
+            if n_rows == 0:
+                continue
+
+            dest_bin = self._get_bin_file_path(cur_bin_index)
+            shutil.move(shard_bin_path, dest_bin)
+
+            shard_meta = pq.read_table(shard_meta_path)
+
+            bin_index_col = pa.array(
+                [cur_bin_index] * shard_meta.num_rows, type=pa.int64()
+            )
+            bin_path = str(dest_bin.absolute())
+            path_col = pa.array(
+                [bin_path] * shard_meta.num_rows, type=pa.string()
+            )
+
+            shard_meta = shard_meta.set_column(
+                shard_meta.schema.get_field_index("bin_index"), "bin_index", bin_index_col
+            )
+            if "path" in shard_meta.column_names:
+                shard_meta = shard_meta.set_column(
+                    shard_meta.schema.get_field_index("path"), "path", path_col
+                )
+            else:
+                shard_meta = shard_meta.append_column("path", path_col)
+
+            meta_tables.append(shard_meta)
+            cur_bin_index += 1
+
+        if meta_tables:
+            combined = pa.concat_tables(meta_tables, promote_options="default")
+            pq.write_table(combined, self.metadata_file)
+            self.data = combined

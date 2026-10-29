@@ -1,0 +1,185 @@
+from dataclasses import dataclass
+from typing import Any
+import numpy as np
+
+@dataclass
+class ArchiveRead:
+    file_type: str = None
+    modality: str = None
+
+@dataclass
+class BytesRead(ArchiveRead):
+    """An entry read back as the bytes that were stored: the modality-agnostic read
+    (``bytes_read``), and what an archive of a modality omniio has no decoder for returns."""
+    data: bytes = None
+
+@dataclass
+class AudioRead(ArchiveRead):
+    sample_rate: int = None
+    array: np.ndarray = None
+
+@dataclass
+class TextRead(ArchiveRead):
+    text: str = None
+
+@dataclass
+class VideoRead(ArchiveRead):
+    sample_rate: int = None
+    fps: float = None
+    height: int = None
+    width: int = None
+    audio_array: np.ndarray = None
+    video_array: np.ndarray = None
+
+@dataclass
+class ImageRead(ArchiveRead):
+    height: int = None
+    width: int = None
+    channels: int = None
+    array: np.ndarray = None
+
+@dataclass
+class MidiRead(ArchiveRead):
+    """A MIDI entry, optionally restricted to a time window and/or synthesized.
+
+    `midi` is a pretty_midi.PrettyMIDI whose times are relative to `start_time`;
+    `notes` is a structured array (see omniio.modalities.midi.common.NOTE_DTYPE) with onset/offset
+    in seconds on the same clock; `duration` is the seconds the window covers.
+    `sample_rate` / `array` (frames, channels) float32 are set only when synthesized.
+    `frequency_shift` records the transposition (semitones) applied on read, 0.0 if none.
+    """
+    midi: Any = None
+    notes: np.ndarray = None
+    duration: float = None
+    start_time: float = None
+    end_time: float = None
+    sample_rate: int = None
+    array: np.ndarray = None
+    frequency_shift: float = 0.0
+
+    def to_bytes(self) -> bytes:
+        """Serialize `midi` (i.e. the window that was read) to Standard MIDI File bytes."""
+        from omniio.modalities.midi.common import midi_to_bytes
+        return midi_to_bytes(self.midi)
+
+    def write(self, path: str) -> None:
+        """Write `midi` to a .mid file."""
+        with open(path, "wb") as f:
+            f.write(self.to_bytes())
+
+
+@dataclass
+class DiscreteRead(ArchiveRead):
+    """Integer streams (VQ / RVQ codes, token ids) from one entry, optionally a subset of
+    streams and a time / index window.
+
+    `streams` holds one 1-D unsigned array per requested stream (narrowest dtype for its
+    alphabet); `stream_indices` says which entry streams they are; `lengths`,
+    `vocab_sizes` and `rates` (units per second, or None) line up with them. `array`
+    stacks the streams into `(n, T)` when their lengths agree (RVQ) — use `to_array()`
+    to pad ragged streams.
+    """
+    streams: list = None
+    stream_indices: list = None
+    lengths: list = None
+    vocab_sizes: list = None
+    rates: list = None
+    n_streams: int = None
+    frame_windows: list = None        # [lo, hi) decoded frames per returned stream
+    start_time: float = None
+    end_time: float = None
+    start_frame: int = None
+    end_frame: int = None
+    bytes_read: int = None            # I/O actually done (header + the windows' bytes)
+    entry_size: int = None
+
+    @property
+    def ragged(self) -> bool:
+        return len(set(self.lengths or [])) > 1
+
+    @property
+    def array(self) -> np.ndarray:
+        """`(n, T)` stack of the streams; raises when the lengths differ."""
+        if self.ragged:
+            raise ValueError("streams have different lengths; use to_array(pad_value=...)")
+        return np.stack(self.streams) if self.streams else np.zeros((0, 0), dtype=np.uint8)
+
+    def to_array(self, pad_value: int = -1) -> np.ndarray:
+        """`(n, max_T)` int64 with `pad_value` past each stream's length."""
+        T = max(self.lengths) if self.lengths else 0
+        out = np.full((len(self.streams), T), pad_value, dtype=np.int64)
+        for i, s in enumerate(self.streams):
+            out[i, : s.size] = s
+        return out
+
+
+@dataclass
+class CellRead(ArchiveRead):
+    """One cell's sparse feature row (RNA counts, ATAC peaks, markers, dosages).
+
+    `indices` (uint32, strictly increasing) and `values` (the stored dtype) are the
+    non-zeros over the panel of `n_genes` columns the row was written against; what the
+    columns mean is the caller's (see examples/cell_h5ad.py). `dense()` expands to the
+    panel; `stored_dense` / `value_dtype` describe the entry as stored; `bytes_read` the
+    I/O done.
+    """
+    indices: np.ndarray = None
+    values: np.ndarray = None
+    n_genes: int = None
+    nnz: int = None
+    value_dtype: str = None
+    stored_dense: bool = False
+    bytes_read: int = None
+    entry_size: int = None
+
+    def dense(self, dtype=None) -> np.ndarray:
+        """`(n_genes,)` array with zeros where the cell has no value."""
+        out = np.zeros(self.n_genes, dtype=dtype or self.values.dtype)
+        out[self.indices] = self.values
+        return out
+
+    @property
+    def total_counts(self) -> float:
+        return float(self.values.sum()) if self.values is not None and self.values.size else 0.0
+
+    def to_csr(self):
+        """`(1, n_genes)` scipy CSR row."""
+        import scipy.sparse as sp
+        return sp.csr_matrix((self.values, self.indices.astype(np.int32), np.array([0, self.nnz])), shape=(1, self.n_genes))
+
+
+@dataclass
+class SeqRead(ArchiveRead):
+    """A window of a nucleotide sequence entry: `sequence` holds bases `[start, end)` of the
+    record (`length` bases long), uppercase ACGT with N for unknown bases and lowercase
+    where the source was soft-masked (unless `soft_mask=False`); `reverse_complement`
+    says the other strand was returned."""
+    sequence: str = None
+    start: int = None
+    end: int = None
+    length: int = None
+    reverse_complement: bool = False
+    bytes_read: int = None
+    entry_size: int = None
+
+    def __len__(self):
+        return len(self.sequence)
+
+
+@dataclass
+class TrackRead(ArchiveRead):
+    """A window of a binned genomic signal track: `array` (float32, NaN = no coverage) holds
+    one value per `bin` bp for bp `[start, end)` (snapped outwards to the bin grid);
+    `n_bins` / `length` describe the whole chromosome entry."""
+    array: np.ndarray = None
+    bin: int = None
+    start: int = None
+    end: int = None
+    n_bins: int = None
+    length: int = None
+    bytes_read: int = None
+    entry_size: int = None
+
+    def positions(self) -> np.ndarray:
+        """bp start of every returned bin."""
+        return self.start + self.bin * np.arange(self.array.size)
