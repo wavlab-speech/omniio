@@ -86,10 +86,10 @@ window is the same samples a full decode has at that offset, with two documented
 Windowed WebM/Opus reads are validated against these PyAV / ffmpeg combinations
 (`tests/test_webm_opus_windows.py`, reproducible with `tests/tools/sweep_pyav_webm.sh`):
 
-- PyAV 12.0 to 18.1 PyPI wheels, which bundle ffmpeg 6.1 to 8.1
+- PyAV 12.0 to 19.0 PyPI wheels, which bundle ffmpeg 6.1 to 9.0 (libavcodec 58.134 to 63.1)
 - PyAV 9.2, 10.0 and 11.0 from conda-forge on ffmpeg 4.4, 5.1, 6.0 and 6.1
 
-In short: PyAV 9.2 through 18.1 on ffmpeg 4.4 through 8.1 (libavcodec 58.134 to 62.28).
+In short: PyAV 9.2 through 19.0 on ffmpeg 4.4 through 9.0 (libavcodec 58.134 to 63.1).
 The package's dependency floor stays at `av>=10.0.0`, where the whole test suite passes;
 9.2 is validated for windowed reads only (`tests/tools/webm_decode_check.py`), because its
 conda-forge builds lack an Opus encoder. A newer PyAV or ffmpeg is untested
