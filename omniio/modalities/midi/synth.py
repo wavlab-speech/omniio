@@ -248,6 +248,7 @@ def synthesize(
     reverb: bool = False,
     chorus: bool = False,
     normalize: bool = False,
+    frequency_shift: float = 0.0,
 ) -> np.ndarray:
     """Render ``pm`` to a ``(frames, channels)`` float32 waveform.
 
@@ -268,9 +269,16 @@ def synthesize(
         reverb / chorus: fluidsynth's built-in effects. Off by default so a render is a
                      pure function of the notes (and cheap); turn on for a wetter sound.
         normalize:   Peak-normalize the result to 1.0.
+        frequency_shift: Transpose by this many semitones before rendering (``pm`` is not
+                     modified). Fractional shifts ride on the pitch wheel, which the
+                     fluidsynth backend honours and the sine fallback ignores. See
+                     `common.transpose_midi`.
     """
     if channels not in (1, 2):
         raise ValueError(f"channels must be 1 or 2, got {channels}")
+    if frequency_shift:
+        from omniio.modalities.midi.common import transpose_midi
+        pm = transpose_midi(pm, frequency_shift, copy=True)
     sample_rate = int(sample_rate)
     total = (float(pm.get_end_time()) if duration is None else float(duration)) + float(tail_sec)
     n_samples = max(int(round(total * sample_rate)), 0)

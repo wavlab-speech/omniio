@@ -166,6 +166,18 @@ a synthesized window sounds as it would in the full file.
 `notes` is sorted by `(onset, is_drum, program, pitch)`, a deterministic order for chords
 that a sequence model can be trained against.
 
+`frequency_shift=<semitones>` transposes the entry on read: the returned `midi`, the `notes`
+table and any synthesized `array` are all shifted by that amount (fractional values ride on
+the pitch wheel, which FluidSynth honours). Drum tracks are left alone, since a drum
+"pitch" selects a sound rather than a frequency, and notes pushed outside 0..127 are
+dropped rather than clamped. `synthesize(pm, frequency_shift=...)` does the same for a
+PrettyMIDI you already hold, without modifying it.
+
+```python
+result = midi_read(archive_path, start_offset, file_size, start_time=5.0, end_time=10.0,
+                   synthesize=True, sample_rate=24000, frequency_shift=-3)   # down a minor third
+```
+
 Synthesis uses FluidSynth when available (`pip install omniio[synth]` plus the
 `libfluidsynth` shared library, e.g. `conda install -c conda-forge fluidsynth`) with the GM
 SoundFont bundled in `pretty_midi`, or the one named by `$OMNIIO_SOUNDFONT` / the
