@@ -204,9 +204,7 @@ class TestAudioReadBytes:
     @pytest.mark.parametrize("fixture", ["sample_audio_wav", "sample_audio_flac", "sample_audio_webm"])
     @pytest.mark.parametrize("window", [(None, None), (0.1, 0.3)])
     def test_same_as_audio_read_local(self, request, temp_dir, fixture, window):
-        """Bytes read with os.pread decode exactly like audio_read_local reads them."""
-        import os
-
+        """Bytes cut out of an archive decode exactly like audio_read_local reads them."""
         path, _, _ = request.getfixturevalue(fixture)
         payload = path.read_bytes()
         archive = temp_dir / "archive.bin"
@@ -214,11 +212,11 @@ class TestAudioReadBytes:
         start, end = window
 
         expected = audio_read_local(archive, 37, len(payload), start, end)
-        fd = os.open(archive, os.O_RDONLY)
-        try:
-            blob = os.pread(fd, len(payload), 37)
-        finally:
-            os.close(fd)
+        # how a caller fetches the entry itself (seek + read works on every OS;
+        # os.pread does not exist on Windows)
+        with open(archive, "rb") as f:
+            f.seek(37)
+            blob = f.read(len(payload))
         result = audio_read_bytes(blob, start, end)
 
         assert result.file_type == expected.file_type
