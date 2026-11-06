@@ -425,6 +425,36 @@ def _read_webm(
     )
 
 
+def audio_read_bytes(
+    blob: bytes,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
+) -> AudioRead:
+    """
+    Decode one audio entry that the caller has already read from an archive.
+
+    `audio_read_local` and `audio_read_remote` fetch the entry's bytes and then
+    call this. Use it directly when the bytes come from somewhere else, e.g. a
+    reader that keeps the bin files open and fetches entries with `os.pread`
+    instead of opening the file for every entry, which on shared file systems
+    costs a metadata request per read.
+
+    Args:
+        blob:       The entry's bytes (archive bytes start_offset .. start_offset + file_size).
+        start_time: Start time in seconds (None = beginning).
+        end_time:   End time in seconds (None = end of file).
+
+    Returns:
+        AudioRead with sample_rate and float32 array (frames, channels).
+    """
+    fmt = _detect_format(blob[:16])
+
+    if fmt == "webm":
+        return _read_webm(blob, start_time, end_time)
+    else:
+        return _read_pcm(blob, fmt, start_time, end_time)
+
+
 def audio_read_local(
     archive_path: str,
     start_offset: int,
@@ -449,13 +479,7 @@ def audio_read_local(
         f.seek(start_offset)
         blob = f.read(file_size)
 
-    header = blob[:16]
-    fmt = _detect_format(header)
-
-    if fmt == "webm":
-        return _read_webm(blob, start_time, end_time)
-    else:
-        return _read_pcm(blob, fmt, start_time, end_time)
+    return audio_read_bytes(blob, start_time, end_time)
 
 def audio_read_remote(
     archive_url: str,
@@ -485,10 +509,4 @@ def audio_read_remote(
 
     blob = resp.content
 
-    header = blob[:16]
-    fmt = _detect_format(header)
-
-    if fmt == "webm":
-        return _read_webm(blob, start_time, end_time)
-    else:
-        return _read_pcm(blob, fmt, start_time, end_time)
+    return audio_read_bytes(blob, start_time, end_time)

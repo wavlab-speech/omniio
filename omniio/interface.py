@@ -1,7 +1,7 @@
 import os
 from typing import Optional
 from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead, ImageRead, MidiRead
-from omniio.modalities.audio.read import audio_read_local, audio_read_remote
+from omniio.modalities.audio.read import audio_read_bytes, audio_read_local, audio_read_remote
 from omniio.modalities.text.read import text_read_local, text_read_remote
 from omniio.modalities.video.read import video_read_local, video_read_remote
 from omniio.modalities.image.read import image_read_local, image_read_remote

@@ -8,6 +8,7 @@ from omniio.audio.read import (
     _detect_format,
     _read_pcm,
     _read_webm,
+    audio_read_bytes,
     audio_read_local,
 )
 from omniio.definitions import AudioRead
@@ -195,3 +196,42 @@ class TestAudioReadWebM:
         expected_frames = int((end_time - start_time) * sample_rate)
         # Allow some tolerance due to frame boundaries
         assert abs(result.array.shape[0] - expected_frames) < sample_rate * 0.1
+
+
+class TestAudioReadBytes:
+    """audio_read_bytes decodes entry bytes the caller fetched itself."""
+
+    @pytest.mark.parametrize("fixture", ["sample_audio_wav", "sample_audio_flac", "sample_audio_webm"])
+    @pytest.mark.parametrize("window", [(None, None), (0.1, 0.3)])
+    def test_same_as_audio_read_local(self, request, temp_dir, fixture, window):
+        """Bytes read with os.pread decode exactly like audio_read_local reads them."""
+        import os
+
+        path, _, _ = request.getfixturevalue(fixture)
+        payload = path.read_bytes()
+        archive = temp_dir / "archive.bin"
+        archive.write_bytes(b"x" * 37 + payload + b"y" * 11)
+        start, end = window
+
+        expected = audio_read_local(archive, 37, len(payload), start, end)
+        fd = os.open(archive, os.O_RDONLY)
+        try:
+            blob = os.pread(fd, len(payload), 37)
+        finally:
+            os.close(fd)
+        result = audio_read_bytes(blob, start, end)
+
+        assert result.file_type == expected.file_type
+        assert result.sample_rate == expected.sample_rate
+        assert np.array_equal(result.array, expected.array)
+
+    def test_exported_from_interface(self):
+        """The public entry points expose it next to audio_read."""
+        from omniio.interface import audio_read_bytes as from_interface
+
+        assert from_interface is audio_read_bytes
+
+    def test_unknown_bytes_raise(self):
+        with pytest.raises(ValueError):
+            audio_read_bytes(b"not audio at all")
+
