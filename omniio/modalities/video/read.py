@@ -10,6 +10,7 @@ import numpy as np
 import requests
 
 from omniio.definitions import VideoRead
+from omniio.blob.rangeread import read_range
 
 def _decode_video(
     blob: bytes,
@@ -194,9 +195,7 @@ def video_read_local(
         VideoRead with video_array (F,H,W,3) uint8,
         audio_array (samples, channels) float32.
     """
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
+    blob = read_range(archive_path, start_offset, file_size)   # cached-fd pread (omniio.blob.rangeread)
 
     return _decode_video(blob, start_frame, end_frame, start_time, end_time)
 

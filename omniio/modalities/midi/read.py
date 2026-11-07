@@ -8,6 +8,7 @@ from omniio.definitions import MidiRead
 from omniio.modalities.midi.common import MIDI_MAGIC, midi_from_bytes, notes_from_midi, slice_midi
 from omniio.modalities.midi.synth import DEFAULT_SAMPLE_RATE, synthesize
 from omniio.modalities.midi.write import ZSTD_MAGIC
+from omniio.blob.rangeread import read_range
 
 
 def _detect_format(header: bytes) -> str:
@@ -95,9 +96,7 @@ def midi_read_local(
         ``duration``, and — when ``synthesize`` — ``sample_rate`` and a float32 ``array``
         of shape (frames, channels) covering exactly ``duration`` seconds.
     """
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
+    blob = read_range(archive_path, start_offset, file_size)   # cached-fd pread (omniio.blob.rangeread)
     return _decode_midi(blob, start_time, end_time, include_partial, synthesize,
                         sample_rate, channels, soundfont, backend)
 

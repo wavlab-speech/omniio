@@ -5,6 +5,7 @@ import requests
 import zstandard as zstd
 
 from omniio.definitions import TextRead
+from omniio.blob.rangeread import read_range
 
 def _decompress_blob(blob: bytes) -> str:
     dctx = zstd.ZstdDecompressor()
@@ -16,9 +17,7 @@ def text_read_local(
     start_offset: int,
     file_size: int,
 ) -> TextRead:
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
+    blob = read_range(archive_path, start_offset, file_size)   # cached-fd pread (omniio.blob.rangeread)
 
     return TextRead(
         file_type="text",

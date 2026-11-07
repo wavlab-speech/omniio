@@ -8,6 +8,7 @@ import numpy as np
 import soundfile as sf
 
 from omniio.definitions import AudioRead
+from omniio.blob.rangeread import read_range
 
 
 class PyAVCompatibilityWarning(UserWarning):
@@ -363,9 +364,7 @@ def audio_read_local(
     Returns:
         AudioRead with sample_rate and float32 array (frames, channels).
     """
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
+    blob = read_range(archive_path, start_offset, file_size)   # cached-fd pread (omniio.blob.rangeread)
 
     header = blob[:16]
     fmt = _detect_format(header)

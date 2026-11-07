@@ -5,6 +5,7 @@ import requests
 from PIL import Image
 
 from omniio.definitions import ImageRead
+from omniio.blob.rangeread import read_range
 
 
 # Magic bytes for format detection
@@ -60,9 +61,7 @@ def image_read_local(
     Returns:
         ImageRead with uint8 array (height, width, channels).
     """
-    with open(archive_path, "rb") as f:
-        f.seek(start_offset)
-        blob = f.read(file_size)
+    blob = read_range(archive_path, start_offset, file_size)   # cached-fd pread (omniio.blob.rangeread)
 
     fmt = _detect_format(blob[:16])
     return _decode_image(blob, fmt)
