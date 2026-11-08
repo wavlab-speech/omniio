@@ -13,7 +13,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The library is organized by data modality, with each supporting read and write operations:
 
 - **modalities/**: the per-modality packages below; imported through the short public paths (`omniio.audio`, `omniio.midi`, ...) via the aliases in `omniio/__init__.py`. New code and docs import from `omniio.<modality>`, never from `omniio.modalities.<modality>`
-- **modalities/audio/**: Audio file I/O (FLAC, WAV, WebM/Opus)
+- **modalities/audio/**: Audio file I/O (FLAC, WAV, WebM/Opus, OMAC)
 - **modalities/video/**: Video file I/O (MP4 with audio streams)
 - **modalities/text/**: Text file I/O (zstandard compressed)
 - **modalities/image/**: PNG/JPEG I/O
@@ -231,6 +231,36 @@ skips unless `kaldiio` happens to be installed, and then asserts byte-identical
 output in both directions. `kaldiio` must never become a dependency: its
 license forbids redistribution, which is the reason this module exists.
 
+## OMAC Multichannel Codec
+
+OMAC (Omniio Multichannel Audio Codec; unrelated to the cryptographic One-Key
+MAC) is omniio's own lossless codec for any number of channels. The bitstream
+is specified in `docs/omac.md`; the codec is a Rust crate in `rust/omac/`
+(Python module `omac`, PyPI distribution `omniio-omac`), and
+`omniio/modalities/audio/omac.py` is the omniio side.
+
+- Write: `audio_write(sources, id, target_format="omac", length_mismatch=...)`.
+  `sources` may be a list of paths or `(array, sr)` tuples; their channels are
+  concatenated into one entry. Sources of different lengths raise unless
+  `length_mismatch="truncate"` or `"pad"`; `pad` records each channel's real
+  length (`valid_frames`). Rows always carry `source_frames`.
+- Read: `audio_read(..., channels=[...])`. An OMAC entry reads the header and
+  block index, then only the window's blocks, and decodes only the requested
+  channels. Remote: two requests cold, one once the index is cached
+  (`_index_cache`, keyed by URL/offset/size; local keys include mtime).
+- `audio_read_remote` fetches entries up to 1 MiB whole (one request, as
+  before) and the first 512 KiB (`HEAD_FETCH`) of larger ones, so large
+  non-OMAC entries cost two requests. 512 KiB holds the OMAC index of entries
+  up to about 4.6 h at 16 kHz; longer ones cost one more request when cold.
+- No inter-channel prediction, by design: measured gains were about 2% on
+  CHiME-6 and AMI arrays, and it would make channels depend on each other.
+- `omac` is imported lazily; `tests/test_omac.py` skips without it. Build it
+  with `pip install ./rust/omac` (needs a Rust toolchain >= 1.85).
+- Rust tests: `cargo test --release` in `rust/omac`, and `cargo test --test
+  mutate` in debug (corrupt input must error, never panic, and overflow checks
+  are on). `tests/fuzz_regressions/` holds inputs `cargo +nightly fuzz run
+  decode` once crashed on.
+
 ## Dependencies
 
 Key libraries used throughout the codebase:
@@ -242,6 +272,7 @@ Key libraries used throughout the codebase:
 - **pyarrow/parquet**: Efficient metadata storage and operations
 - **pretty_midi** (+ mido; optional, `omniio[midi]`): MIDI parsing/serialization; ships the TimGM6mb GM SoundFont
 - **pyfluidsynth** (optional, `omniio[synth]`, needs libfluidsynth): MIDI synthesis backend
+- **omac** (optional, `pip install ./rust/omac`, PyPI `omniio-omac`): the OMAC codec extension; imported lazily
 
 ## Common Implementation Notes
 

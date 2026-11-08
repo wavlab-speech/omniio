@@ -11,6 +11,10 @@ class ArchiveRead:
 class AudioRead(ArchiveRead):
     sample_rate: int = None
     array: np.ndarray = None
+    # OMAC only: frames of real audio per returned channel, counted from the
+    # start of the entry (shorter than the entry when written with
+    # length_mismatch="pad").
+    valid_frames: list = None
 
 @dataclass
 class TextRead(ArchiveRead):

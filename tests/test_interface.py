@@ -30,7 +30,7 @@ class TestAudioRead:
 
         mock_exists.assert_called_once_with("/path/to/local.bin")
         mock_local.assert_called_once_with(
-            "/path/to/local.bin", 0, 1000, None, None
+            "/path/to/local.bin", 0, 1000, None, None, None
         )
         assert result.file_type == "wav"
 
@@ -56,7 +56,7 @@ class TestAudioRead:
 
         mock_exists.assert_called_once_with("https://example.com/remote.bin")
         mock_remote.assert_called_once_with(
-            "https://example.com/remote.bin", 100, 2000, 5.0, 10.0
+            "https://example.com/remote.bin", 100, 2000, 5.0, 10.0, None
         )
         assert result.file_type == "flac"
 

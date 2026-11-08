@@ -484,6 +484,7 @@ class TestArchiveEntryPoints:
     def test_remote_read_window(self, monkeypatch, mono_blob):
         class FakeResponse:
             content = mono_blob
+            status_code = 206  # a range reply; the reader checks for a full-file 200
 
             def raise_for_status(self):
                 pass

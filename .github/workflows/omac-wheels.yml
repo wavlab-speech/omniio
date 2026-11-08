@@ -1,0 +1,141 @@
+name: omac wheels
+
+# Builds the OMAC extension (rust/omac, PyPI distribution omniio-omac) as abi3
+# wheels, one per platform, covering every CPython >= 3.10.
+#
+# Pushing a tag omac-vX.Y.Z uploads to PyPI with Trusted Publishing; running
+# the workflow by hand uploads to TestPyPI. A tag, not a GitHub Release, so
+# that omniio's own publish.yml (which runs on releases) is not triggered.
+#
+# One-time setup by a maintainer: on PyPI and TestPyPI, add a trusted
+# publisher for project omniio-omac (owner wavlab-speech, repository omniio,
+# workflow omac-wheels.yml, environments pypi-omac / testpypi-omac), and create
+# those two environments in this repository's settings.
+
+on:
+  push:
+    tags: ["omac-v*"]
+  pull_request:
+    paths: ["rust/omac/**", ".github/workflows/omac-wheels.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: wheel (${{ matrix.os }}, ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: "2_28" }
+          - { os: ubuntu-24.04-arm, target: aarch64, manylinux: "2_28" }
+          - { os: macos-15-intel, target: x86_64, manylinux: "" }
+          - { os: macos-latest, target: aarch64, manylinux: "" }
+          - { os: windows-latest, target: x64, manylinux: "" }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: rust/omac
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist
+      # The installed wheel, outside the checkout, is what users get.
+      - name: Smoke-test the wheel
+        run: |
+          python -m venv "$RUNNER_TEMP/check"
+          PY="$RUNNER_TEMP/check/bin/python"; [ -x "$PY" ] || PY="$RUNNER_TEMP/check/Scripts/python"
+          "$PY" -m pip install numpy rust/omac/dist/*.whl
+          cd "$RUNNER_TEMP" && "$PY" -c "
+          import numpy as np, omac
+          x = (np.random.default_rng(0).standard_normal((50000, 12)) * 3000).astype(np.int32)
+          y, h = omac.decode(omac.encode(x, 16000, 16), dtype='int32')
+          assert np.array_equal(x, y) and h['channels'] == 12
+          print('ok', omac.__file__)
+          "
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: rust/omac/dist/
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          working-directory: rust/omac
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wheels-sdist
+          path: rust/omac/dist/
+
+  # A tag that does not match the declared version would upload the old
+  # version under a new tag.
+  check-tag:
+    if: startsWith(github.ref, 'refs/tags/omac-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: |
+          python - <<'PY'
+          import os, sys, tomllib
+          declared = tomllib.load(open("rust/omac/pyproject.toml", "rb"))["project"]["version"]
+          crate = tomllib.load(open("rust/omac/Cargo.toml", "rb"))["package"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"].removeprefix("omac-v")
+          if not tag == declared == crate:
+              sys.exit(f"tag {tag!r}, pyproject {declared!r} and Cargo.toml {crate!r} must agree")
+          print("version", declared)
+          PY
+
+  testpypi:
+    needs: [wheels, sdist]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: testpypi-omac
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  pypi:
+    needs: [wheels, sdist, check-tag]
+    if: startsWith(github.ref, 'refs/tags/omac-v')
+    runs-on: ubuntu-latest
+    environment: pypi-omac
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
