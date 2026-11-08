@@ -218,6 +218,7 @@ def audio_write(
             "samples": src_frames,
             "format": src_format,
             "bit_depth": src_bit_depth,
+            "duration": src_frames / src_sample_rate,
         }
         return raw_bytes, metadata
 

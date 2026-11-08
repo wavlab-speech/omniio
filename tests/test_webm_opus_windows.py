@@ -495,6 +495,11 @@ class TestArchiveEntryPoints:
             return FakeResponse()
 
         monkeypatch.setattr("omniio.audio.read.requests.get", fake_get)
+        # A windowed read goes through _RangeReader, which keeps a Session.
+        monkeypatch.setattr(
+            "omniio.audio.read.requests.Session.get",
+            lambda self, url, headers=None, **kwargs: fake_get(url, headers),
+        )
         result = audio_read_remote("http://example/a.bin", 0, len(mono_blob), 5.0, 7.0)
 
         assert captured["headers"]["Range"] == f"bytes=0-{len(mono_blob) - 1}"

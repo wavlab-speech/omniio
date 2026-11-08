@@ -646,3 +646,56 @@ class TestBlobSkipErrors:
         failed = blob.append(items=[str(wav_path)], ids=["a"], num_workers=0,
                              skip_errors=True, target_format="wav")
         assert failed == [] and blob.last_failed == [] and len(blob) == 1
+
+
+class TestBlobAppendMetadata:
+    """Per-item metadata becomes extra columns of metadata.parquet."""
+
+    @pytest.mark.parametrize("num_workers", [0, 2])
+    def test_extra_columns(self, temp_dir, sample_audio_wav, sample_audio_flac, num_workers):
+        wav, _, _ = sample_audio_wav
+        flac, _, _ = sample_audio_flac
+        blob = Blob(archive_dir=str(temp_dir / "a"), modality="audio")
+        blob.append(
+            items=[str(wav), str(flac), str(wav)],
+            ids=["x", "y", "z"],
+            num_workers=num_workers,
+            progress=False,
+            metadata=[
+                {"recording_id": "r1", "channel_ids": [0, 1]},
+                {"recording_id": "r2", "channel_ids": [0]},
+                None,
+            ],
+        )
+        rows = {r["id"]: r for r in Blob(str(temp_dir / "a"), "audio").get_metadata().to_pylist()}
+        assert rows["x"]["recording_id"] == "r1" and rows["x"]["channel_ids"] == [0, 1]
+        assert rows["y"]["recording_id"] == "r2" and rows["y"]["channel_ids"] == [0]
+        assert rows["z"]["recording_id"] is None
+        assert rows["x"]["sample_rate"] == 16000  # writer columns are kept
+
+    def test_key_first_seen_in_a_later_row_is_kept(self, temp_dir, sample_text):
+        """pa.Table.from_pylist alone takes its columns from the first row."""
+        blob = Blob(archive_dir=str(temp_dir / "t"), modality="text")
+        blob.append(
+            items=["a", "b"],
+            ids=["1", "2"],
+            progress=False,
+            metadata=[None, {"speaker": "S1"}],
+            is_path=False,
+            compression_level=3,
+        )
+        rows = {r["id"]: r for r in blob.get_metadata().to_pylist()}
+        assert rows["2"]["speaker"] == "S1" and rows["1"]["speaker"] is None
+
+    @pytest.mark.parametrize("key", ["id", "start_byte", "end_byte", "bin_index", "path"])
+    def test_reserved_column_rejected(self, temp_dir, sample_audio_wav, key):
+        wav, _, _ = sample_audio_wav
+        blob = Blob(archive_dir=str(temp_dir / "a"), modality="audio")
+        with pytest.raises(ValueError, match="reserved"):
+            blob.append(items=[str(wav)], ids=["x"], progress=False, metadata=[{key: 1}])
+
+    def test_length_mismatch(self, temp_dir, sample_audio_wav):
+        wav, _, _ = sample_audio_wav
+        blob = Blob(archive_dir=str(temp_dir / "a"), modality="audio")
+        with pytest.raises(ValueError, match="same length"):
+            blob.append(items=[str(wav)], ids=["x"], progress=False, metadata=[])
