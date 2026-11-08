@@ -3,7 +3,7 @@ import os
 import av
 import numpy as np
 import soundfile as sf
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 from pathlib import Path
 
 
@@ -94,10 +94,13 @@ def _get_webm_info(audio_path: str) -> dict:
 
 
 def audio_write(
-    audio_path: Union[str, Path, Tuple[np.ndarray, int]],
+    audio_path: Union[str, Path, Tuple[np.ndarray, int], List],
     item_id: str,
     target_format: Optional[str] = None,
     target_bit_depth: Optional[int] = None,
+    length_mismatch: str = "error",
+    omac_level: int = 5,
+    omac_block_size: int = 4096,
 ) -> Tuple[bytes, dict]:
     """
     Read an audio file (or in-memory array), optionally convert format/bit depth,
@@ -114,10 +117,28 @@ def audio_write(
                           If None, keeps the original format (flac for array input).
         target_bit_depth: Desired bit depth (e.g. 16, 24, 32).
                           Ignored when target format is webm/opus.
+        length_mismatch:  'omac' only: 'error' (default), 'truncate' or 'pad'
+                          when the sources of one entry differ in length.
+        omac_level:       'omac' only: compression level 0..8.
+        omac_block_size:  'omac' only: frames per block.
+
+    With ``target_format='omac'``, ``audio_path`` may also be a list of
+    sources (paths or arrays) whose channels form one entry; see
+    ``omniio.audio.omac.omac_write``.
 
     Returns:
         (raw_bytes, metadata_dict)
     """
+    if target_format is not None and target_format.lower() == "omac":
+        from omniio.modalities.audio.omac import omac_write
+
+        return omac_write(
+            audio_path, item_id, target_bit_depth=target_bit_depth,
+            length_mismatch=length_mismatch, level=omac_level,
+            block_size=omac_block_size,
+        )
+    if isinstance(audio_path, list):
+        raise ValueError("a list of audio sources needs target_format='omac'")
 
     # --- Handle in-memory (array, sample_rate) input -----------------
     if isinstance(audio_path, tuple):

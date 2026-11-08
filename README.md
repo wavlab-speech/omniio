@@ -13,6 +13,7 @@ Efficient Python library for reading and writing multimedia data (audio, video, 
 - **Streaming operations**: Memory-efficient handling of large multimedia files
 
 - **Kaldi ark/scp compatibility** via `omniio.kaldi`, an MIT-licensed drop-in for `kaldiio`
+- **OMAC**, a lossless codec for any number of channels (FLAC stops at 8), with random access in time and in channels
 
 ## Why Omni-IO?
 
@@ -256,6 +257,43 @@ raw_bytes, metadata = text_write(
 print(f"Original size: {metadata['original_size']} bytes")
 print(f"Compressed size: {metadata['compressed_size']} bytes")
 ```
+
+## Multichannel Audio (OMAC)
+
+FLAC cannot store more than 8 channels, and it cannot decode one channel
+without decoding the others. OMAC (Omniio Multichannel Audio Codec,
+[`docs/omac.md`](docs/omac.md)) is a lossless codec without either limit. It
+compresses like FLAC and indexes every block, so a reader fetches only the
+bytes of a time window and decodes only the channels it asks for.
+
+```bash
+pip install ./rust/omac        # needs a Rust toolchain (https://rustup.rs)
+```
+
+```python
+from omniio.blob.blob import Blob
+from omniio.interface import audio_read
+
+blob = Blob(archive_dir="chime6_arrays", modality="audio")
+blob.append(
+    items=[[f"S02_U0{u}.CH{c}.wav" for c in range(1, 5)] for u in range(1, 7)],
+    ids=[f"S02_U0{u}" for u in range(1, 7)],
+    target_format="omac",           # one 4-channel entry per array
+)
+
+row = blob.get_metadata().to_pylist()[0]
+wav = audio_read(row["path"], row["start_byte"], row["end_byte"] - row["start_byte"],
+                 start_time=120.0, end_time=180.0, channels=[0, 2])
+```
+
+Sources combined into one entry must have the same length. Otherwise the
+writer raises an error that lists them; pass `length_mismatch="truncate"` or
+`length_mismatch="pad"` to combine them anyway (`pad` keeps every sample and
+records each channel's real length).
+
+Measured on CHiME-6 and AMI arrays (16 kHz, 16-bit): within ±1% of FLAC's size
+(level 5), decoding one channel 5-8x faster than from a multichannel FLAC, and a
+remote read of a window costs two HTTP requests, one once the index is cached.
 
 ## Kaldi ark/scp Compatibility
 

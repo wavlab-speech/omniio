@@ -1,13 +1,21 @@
 import io
+import os
 import requests
 import warnings
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 
 import av
 import numpy as np
 import soundfile as sf
 
 from omniio.definitions import AudioRead
+from omniio.modalities.audio import omac as _omac
+
+# A remote read first fetches all of an entry up to this size (one request, as
+# before), and only the first _omac.HEAD_FETCH bytes of a larger one: enough
+# for an OMAC header and index, while a larger non-OMAC entry needs a second
+# request for the rest.
+_FIRST_FETCH = 1 << 20
 
 
 class PyAVCompatibilityWarning(UserWarning):
@@ -89,6 +97,7 @@ _MAGIC = {
     b"RIFF":        "wav",
     b"\x1aE\xdf\xa3": "webm",  # EBML header (Matroska/WebM)
     b"OggS":        "ogg",
+    b"OMAC":        "omac",
 }
 
 def _detect_format(header: bytes) -> str:
@@ -425,10 +434,17 @@ def _read_webm(
     )
 
 
+def _select(result: AudioRead, channels: Optional[Sequence[int]]) -> AudioRead:
+    if channels is not None:
+        result.array = result.array[:, list(channels)]
+    return result
+
+
 def audio_read_bytes(
     blob: bytes,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
+    channels: Optional[Sequence[int]] = None,
 ) -> AudioRead:
     """
     Decode one audio entry that the caller has already read from an archive.
@@ -439,20 +455,29 @@ def audio_read_bytes(
     instead of opening the file for every entry, which on shared file systems
     costs a metadata request per read.
 
+    For an OMAC entry, prefer `audio_read_local`/`audio_read_remote` with a time
+    window: they fetch only the window's blocks, while this needs the whole
+    entry in memory (it still decodes only the window and `channels`).
+
     Args:
         blob:       The entry's bytes (archive bytes start_offset .. start_offset + file_size).
         start_time: Start time in seconds (None = beginning).
         end_time:   End time in seconds (None = end of file).
+        channels:   Channel indices to return (None = all).
 
     Returns:
         AudioRead with sample_rate and float32 array (frames, channels).
     """
+    if blob[:4] == _omac.MAGIC:
+        return _omac.omac_read(lambda lo, hi: blob[lo:hi], len(blob), start_time, end_time, channels)
+
     fmt = _detect_format(blob[:16])
 
     if fmt == "webm":
-        return _read_webm(blob, start_time, end_time)
+        result = _read_webm(blob, start_time, end_time)
     else:
-        return _read_pcm(blob, fmt, start_time, end_time)
+        result = _read_pcm(blob, fmt, start_time, end_time)
+    return _select(result, channels)
 
 
 def audio_read_local(
@@ -461,6 +486,7 @@ def audio_read_local(
     file_size: int,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
+    channels: Optional[Sequence[int]] = None,
 ) -> AudioRead:
     """
     Read a single audio entry from a binary archive blob.
@@ -471,15 +497,40 @@ def audio_read_local(
         file_size:    Number of bytes for this entry.
         start_time:   Start time in seconds (None = beginning).
         end_time:     End time in seconds (None = end of file).
+        channels:     Channel indices to return (None = all). An OMAC entry
+                      decodes only these; other formats decode all and select.
 
     Returns:
         AudioRead with sample_rate and float32 array (frames, channels).
     """
     with open(archive_path, "rb") as f:
         f.seek(start_offset)
-        blob = f.read(file_size)
+        head = f.read(min(file_size, 16))
 
-    return audio_read_bytes(blob, start_time, end_time)
+        if head[:4] == _omac.MAGIC:
+            # Read only what the window needs: the header and index (once per
+            # entry, then cached) and the window's blocks.
+            def fetch(lo: int, hi: int) -> bytes:
+                f.seek(start_offset + lo)
+                return f.read(hi - lo)
+
+            key = (os.path.abspath(archive_path), os.stat(f.fileno()).st_mtime_ns,
+                   start_offset, file_size)
+            return _omac.omac_read(fetch, file_size, start_time, end_time, channels, key)
+
+        blob = head + f.read(file_size - len(head))
+
+    return audio_read_bytes(blob, start_time, end_time, channels)
+
+
+def _get_range(url: str, lo: int, hi: int) -> bytes:
+    """Bytes [lo, hi) of ``url``."""
+    resp = requests.get(url, headers={"Range": f"bytes={lo}-{hi - 1}"})
+    resp.raise_for_status()
+    if resp.status_code == 200:  # the server ignored Range and sent the whole file
+        return resp.content[lo:hi]
+    return resp.content[: hi - lo]
+
 
 def audio_read_remote(
     archive_url: str,
@@ -487,6 +538,7 @@ def audio_read_remote(
     file_size: int,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
+    channels: Optional[Sequence[int]] = None,
 ) -> AudioRead:
     """
     Read a single audio entry from a remote binary archive via HTTP range request.
@@ -497,16 +549,27 @@ def audio_read_remote(
         file_size:    Number of bytes for this entry.
         start_time:   Start time in seconds (None = beginning).
         end_time:     End time in seconds (None = end of file).
+        channels:     Channel indices to return (None = all).
 
     Returns:
         AudioRead with sample_rate and float32 array (frames, channels).
     """
-    end_byte = start_offset + file_size - 1
-    headers = {"Range": f"bytes={start_offset}-{end_byte}"}
+    key = (archive_url, start_offset, file_size)
 
-    resp = requests.get(archive_url, headers=headers)
-    resp.raise_for_status()
+    def fetch(lo: int, hi: int) -> bytes:
+        return _get_range(archive_url, start_offset + lo, start_offset + hi)
 
-    blob = resp.content
+    # A cached OMAC entry needs only its data read.
+    if _omac.is_cached(key):
+        return _omac.omac_read(fetch, file_size, start_time, end_time, channels, key)
 
-    return audio_read_bytes(blob, start_time, end_time)
+    first = fetch(0, file_size if file_size <= _FIRST_FETCH else _omac.HEAD_FETCH)
+
+    if first[:4] == _omac.MAGIC:
+        def fetch_first(lo: int, hi: int) -> bytes:
+            return first[lo:hi] if hi <= len(first) else fetch(lo, hi)
+
+        return _omac.omac_read(fetch_first, file_size, start_time, end_time, channels, key)
+
+    blob = first if len(first) >= file_size else first + fetch(len(first), file_size)
+    return audio_read_bytes(blob, start_time, end_time, channels)

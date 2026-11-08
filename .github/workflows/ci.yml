@@ -64,6 +64,43 @@ jobs:
       - name: Test
         run: python -m pytest tests -v
 
+  omac:
+    name: omac (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The codec is compiled, so every platform a wheel is built for
+        # (omac-wheels.yml) also runs its tests from source here.
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # rustup is preinstalled on GitHub-hosted runners; no third-party action.
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Rust tests (release)
+        working-directory: rust/omac
+        run: cargo test --release
+      # Debug build: integer overflow panics here, so the mutation test also
+      # proves that corrupt input cannot overflow the decoder's arithmetic.
+      - name: Mutation and fuzz-regression tests (debug)
+        working-directory: rust/omac
+        run: cargo test --test mutate
+      - name: Install omniio and the omac extension
+        run: python -m pip install -e ".[test]" ./rust/omac
+      - name: Test
+        run: python -m pytest tests/test_omac.py -v -o addopts=""
+
   kaldi-interop:
     name: kaldi interop (byte-identity)
     runs-on: ubuntu-latest

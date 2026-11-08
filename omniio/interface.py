@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, Sequence
 from omniio.definitions import ArchiveRead, AudioRead, TextRead, VideoRead, ImageRead, MidiRead
 from omniio.modalities.audio.read import audio_read_bytes, audio_read_local, audio_read_remote
 from omniio.modalities.text.read import text_read_local, text_read_remote
@@ -12,8 +12,11 @@ def audio_read(
     start_offset: int, 
     file_size: int, 
     start_time: int = None, 
-    end_time: int = None
+    end_time: int = None,
+    channels: Optional[Sequence[int]] = None,
 ) -> AudioRead:
+    """Read an audio entry, locally or over HTTP. ``channels`` selects channel
+    indices; an OMAC entry decodes only those."""
 
     if os.path.exists(archive_path):
         return audio_read_local(
@@ -21,7 +24,8 @@ def audio_read(
             start_offset,
             file_size,
             start_time,
-            end_time
+            end_time,
+            channels,
         )
 
     else:
@@ -30,7 +34,8 @@ def audio_read(
             start_offset,
             file_size,
             start_time,
-            end_time
+            end_time,
+            channels,
         )
 
 def text_read(
